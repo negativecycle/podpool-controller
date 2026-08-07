@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -97,13 +98,19 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups)
 
+	// Groups are reconciled independently: one that cannot be built or
+	// applied must not stop the others. Failures are collected and returned
+	// together at the end, each wrapped with %w so a later classifier can
+	// still reach the original error through errors.As.
+	var errs []error
+
 	for i, group := range pool.Spec.Groups {
 		if _, err := r.reconcileGroup(ctx, &pool, tmpl, group, result.Targets[i]); err != nil {
-			return ctrl.Result{}, fmt.Errorf("group %s: %w", group.Name, err)
+			errs = append(errs, fmt.Errorf("group %s: %w", group.Name, err))
 		}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, kerrors.NewAggregate(errs)
 }
 
 // SetupWithManager sets up the controller with the Manager.
