@@ -31,6 +31,10 @@ import (
 	"github.com/negativecycle/podpool-controller/internal/workload"
 )
 
+// managerName is this controller's field-manager identity for server-side
+// apply. Moves beside the label scheme once one exists.
+const managerName = "podpool-controller"
+
 // childObservation is what one pass learned about a group's child workload.
 // It grows as the controller learns to read more; for now the only fact worth
 // carrying is whether this pass created the object.
@@ -48,6 +52,10 @@ type PodPoolReconciler struct {
 // +kubebuilder:rbac:groups=podpools.dev,resources=podpools,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podpools.dev,resources=podpools/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podpools.dev,resources=podpools/finalizers,verbs=update
+// Server-side apply against an absent object checks create then patch; both are
+// required or the first reconcile of every child fails.
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;get;list;patch;watch
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=create;get;list;patch;watch
 
 // Reconcile moves the cluster toward the pool's desired state. Everything
 // starts from a fresh read of the pool: the request carries only a name, and
@@ -137,7 +145,7 @@ func (r *PodPoolReconciler) reconcileWorkload(
 
 	err := r.Get(ctx, key, existing)
 	if apierrors.IsNotFound(err) {
-		if err := r.Create(ctx, desired); err != nil {
+		if err := r.applyChild(ctx, desired); err != nil {
 			return childObservation{}, err
 		}
 
@@ -148,7 +156,22 @@ func (r *PodPoolReconciler) reconcileWorkload(
 		return childObservation{}, err
 	}
 
-	// Create-only: an existing child is left exactly as it was found. What
-	// that leaves unrepaired is the next commits' subject.
+	if err := r.applyChild(ctx, desired); err != nil {
+		return childObservation{}, err
+	}
+
 	return childObservation{}, nil
+}
+
+// applyChild writes the rendered child with server-side apply.
+//
+// ForceOwnership is deliberate. A conflict means another manager has taken a
+// field the pool renders, and the pool is the authority on those.
+func (r *PodPoolReconciler) applyChild(ctx context.Context, desired *unstructured.Unstructured) error {
+	desired.SetResourceVersion("")
+
+	return r.Apply(ctx, client.ApplyConfigurationFromUnstructured(desired),
+		client.FieldOwner(managerName),
+		client.ForceOwnership,
+	)
 }

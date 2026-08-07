@@ -10,6 +10,7 @@ package controller
 // pool name, and the envtest suite runs in the same binary.
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -18,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -81,4 +83,20 @@ func getPool(t *testing.T, cl client.Client, pool *podpoolsv1alpha1.PodPool) *po
 	}
 
 	return &got
+}
+
+func reconcilePool(t *testing.T, r *PodPoolReconciler, pool *podpoolsv1alpha1.PodPool) {
+	t.Helper()
+
+	if err := tryReconcilePool(r, pool); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+}
+
+func tryReconcilePool(r *PodPoolReconciler, pool *podpoolsv1alpha1.PodPool) error {
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace},
+	})
+
+	return err
 }
