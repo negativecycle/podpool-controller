@@ -19,10 +19,10 @@ package controller
 import (
 	"context"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
@@ -38,19 +38,21 @@ type PodPoolReconciler struct {
 // +kubebuilder:rbac:groups=podpools.dev,resources=podpools/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podpools.dev,resources=podpools/finalizers,verbs=update
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the PodPool object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.24.1/pkg/reconcile
+// Reconcile moves the cluster toward the pool's desired state. Everything
+// starts from a fresh read of the pool: the request carries only a name, and
+// the object may have changed, or vanished, since the event that queued it.
 func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	var pool podpoolsv1alpha1.PodPool
+	if err := r.Get(ctx, req.NamespacedName, &pool); err != nil {
+		// NotFound is not an error: the pool was deleted between the event
+		// and this pass, and there is nothing to do. Returning the error
+		// instead would requeue a name that will never resolve again.
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
 
-	// TODO(user): your logic here
+		return ctrl.Result{}, err
+	}
 
 	return ctrl.Result{}, nil
 }
