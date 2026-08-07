@@ -109,7 +109,7 @@ type PodPoolReconciler struct {
 	// goroutines at once. The mutex guards the map; the controller handle is
 	// what watches get attached to after Build.
 	ctrl        controller.Controller
-	watchedGVKs map[schema.GroupVersionKind]bool
+	watchPhases map[schema.GroupVersionKind]watchPhase
 	watchMu     sync.Mutex
 
 	// Which groups have already been reported as publishing a count we could
