@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,10 +38,23 @@ import (
 )
 
 // childObservation is what one pass learned about a group's child workload.
-// It grows as the controller learns to read more; for now the only fact worth
-// carrying is whether this pass created the object.
 type childObservation struct {
-	created bool
+	replicas, ready, updated int32
+	created                  bool
+	// readyFound means the readyReplicas key was present on the wire. The
+	// built-in types omit it when the count is zero, so false means "zero
+	// or unpublished"; only elapsed time can separate those two readings.
+	readyFound bool
+}
+
+func observeChild(child *unstructured.Unstructured) childObservation {
+	var obs childObservation
+
+	obs.replicas, _ = workload.ReadInt32(child, "status", "replicas")
+	obs.ready, obs.readyFound = workload.ReadInt32(child, "status", "readyReplicas")
+	obs.updated, _ = workload.ReadInt32(child, "status", "updatedReplicas")
+
+	return obs
 }
 
 // PodPoolReconciler reconciles a PodPool object.
@@ -89,9 +103,21 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Asked before any expensive work: a template that is not even
 	// addressable (no apiVersion or kind) cannot be rendered for any group.
+	// The error is the pool's own, not any group's, and no retry fixes a
+	// spec: report it through conditions and stop rather than backing off
+	// forever on an error only an edit can resolve.
 	gvk, err := workload.ExtractGVK(pool.Spec.WorkloadTemplate.Raw)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("extracting workload GVK: %w", err)
+		setConditions(&pool, conditionInputs{
+			desired:     pool.Spec.Replicas,
+			poolInvalid: true,
+		})
+
+		if err := r.Status().Patch(ctx, &pool, client.Merge); err != nil {
+			return ctrl.Result{}, fmt.Errorf("writing status: %w", err)
+		}
+
+		return ctrl.Result{}, nil
 	}
 
 	// Parse once per reconcile; BuildChildWorkload deep-copies per group.
@@ -110,20 +136,51 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// still reach the original error through errors.As.
 	var errs []error
 
+	var failedGroups, notOwnedGroups []string
+
 	reconciledGroups := make(map[string]bool, len(pool.Spec.Groups))
 
+	var sumReady int64
+
 	for i, group := range pool.Spec.Groups {
-		if _, err := r.reconcileGroup(ctx, &pool, tmpl, group, result.Targets[i]); err != nil {
+		obs, err := r.reconcileGroup(ctx, &pool, tmpl, group, result.Targets[i])
+		if err != nil {
 			errs = append(errs, fmt.Errorf("group %s: %w", group.Name, err))
+			failedGroups = append(failedGroups, group.Name)
+
+			var notOwned *workloadNotOwnedError
+			if errors.As(err, &notOwned) {
+				notOwnedGroups = append(notOwnedGroups, group.Name)
+			}
 
 			continue
 		}
 
 		reconciledGroups[group.Name] = true
+		sumReady += int64(obs.ready)
 	}
 
 	if sweepErrs := r.sweepAllOrphans(ctx, &pool, gvk, reconciledGroups); len(sweepErrs) > 0 {
 		errs = append(errs, sweepErrs...)
+	}
+
+	setConditions(&pool, conditionInputs{
+		targetDegraded: result.TargetDegraded,
+		unplaced:       result.Unplaced,
+		ready:          clampInt32(sumReady),
+		desired:        pool.Spec.Replicas,
+		failedGroups:   failedGroups,
+		notOwnedGroups: notOwnedGroups,
+	})
+
+	// A merge patch rather than an update: an update carries the object's
+	// resourceVersion and conflicts whenever anything else touched the pool
+	// mid-pass, including this controller's own previous write, and every
+	// conflict is a full retry of the pass. Status is this controller's to
+	// state, so last-writer-wins is correct here. The remaining sharp edges
+	// of this write are a dedicated commit later in the milestone.
+	if err := r.Status().Patch(ctx, &pool, client.Merge); err != nil {
+		errs = append(errs, fmt.Errorf("writing status: %w", err))
 	}
 
 	return ctrl.Result{}, kerrors.NewAggregate(errs)
@@ -198,7 +255,7 @@ func (r *PodPoolReconciler) reconcileWorkload(
 			return childObservation{created: true}, nil
 		}
 
-		return childObservation{}, nil
+		return observeChild(existing), nil
 	}
 
 	if err != nil {
@@ -217,7 +274,7 @@ func (r *PodPoolReconciler) reconcileWorkload(
 		return childObservation{}, err
 	}
 
-	return childObservation{}, nil
+	return observeChild(existing), nil
 }
 
 // sweepAllOrphans sweeps orphaned children across the current and any stale
