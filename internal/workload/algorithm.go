@@ -9,7 +9,8 @@ import (
 )
 
 type DistributionResult struct {
-	Targets []int32
+	Targets        []int32
+	TargetDegraded bool
 
 	// Unplaced counts replicas that no group's ceiling could accept. Non-zero
 	// only when every group is capped; see GroupCeiling. The pool then runs
@@ -108,7 +109,10 @@ func ComputeGroupTargets(
 	}
 
 	if remaining <= 0 {
-		return DistributionResult{Targets: targets}
+		return DistributionResult{
+			Targets:        targets,
+			TargetDegraded: checkTargetDegraded(total, targets, groups),
+		}
 	}
 
 	// Phase 2: chase percentage-based targets.
@@ -161,9 +165,58 @@ func ComputeGroupTargets(
 	}
 
 	return DistributionResult{
-		Targets:  targets,
-		Unplaced: remaining,
+		Targets:        targets,
+		TargetDegraded: checkTargetDegraded(total, targets, groups),
+		Unplaced:       remaining,
 	}
+}
+
+// targetTolerancePct is the slack allowed before a target counts as violated.
+//
+// Pods are integers and percentages are not, so a distribution that is as
+// correct as it can be still lands a fraction of a point off. One pod out of
+// three is 33.33%, and a target of 33% must not read as violated. Half a
+// percentage point is below the granularity of any pool small enough for
+// rounding to matter, and negligible on pools large enough that it is not.
+const targetTolerancePct = 0.5
+
+// checkTargetDegraded reports whether any target constraint ended up violated
+// by a hard bound.
+//
+// When max is absent the target is itself the ceiling, and only a min larger
+// than the target can push the group above it. When max is present the target
+// is a soft floor, and only the max can pin the group below it.
+func checkTargetDegraded(total int32, targets []int32, groups []podpoolsv1alpha1.GroupSpec) bool {
+	if total <= 0 {
+		return false
+	}
+
+	for i, g := range groups {
+		s := g.Scaling
+
+		pct, ok := TargetPercent(s.Target)
+		if !ok {
+			continue
+		}
+
+		// Float on purpose. This asks "how far is the outcome from the declared
+		// percentage", a tolerance check, not "how many pods is the percentage",
+		// a sizing rule. Rewriting it in the integer percentOf shape was tried
+		// and refuted with counterexamples: integer truncation eats the
+		// sub-point differences this tolerance exists to measure.
+		actualPct := float64(targets[i]) / float64(total) * 100.0
+		targetPct := float64(pct)
+
+		if s.Max == nil && actualPct > targetPct+targetTolerancePct {
+			return true
+		}
+
+		if s.Max != nil && actualPct < targetPct-targetTolerancePct {
+			return true
+		}
+	}
+
+	return false
 }
 
 // GroupCeiling reports the largest target a group may hold, and whether it is

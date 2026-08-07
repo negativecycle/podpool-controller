@@ -24,6 +24,7 @@ func TestComputeGroupTargets(t *testing.T) {
 		total        int32
 		groups       []podpoolsv1alpha1.GroupSpec
 		wantTargets  []int32
+		wantDegraded bool
 		wantUnplaced int32
 	}{
 		{
@@ -112,6 +113,45 @@ func TestComputeGroupTargets(t *testing.T) {
 				{Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(70)}},
 			},
 			wantTargets: []int32{2, 3},
+		},
+		{
+			name:  "max+target at high scale — max dominates, target violated",
+			total: 20,
+			groups: []podpoolsv1alpha1.GroupSpec{
+				{Scaling: podpoolsv1alpha1.ScalingConstraints{Max: ptr.To[int32](5), Target: pctTarget(30)}},
+				{Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(70)}},
+			},
+			// group 0 is capped at max=5 (25%, below its target of 30%).
+			// group 1's ceiling is floor(20 x 0.70) = 14, so the 20th replica
+			// has nowhere legal to go and stays unplaced.
+			wantTargets:  []int32{5, 14},
+			wantDegraded: true,
+			wantUnplaced: 1,
+		},
+		{
+			// A min larger than the target allows is the one remaining way to
+			// exceed a target, and it is deliberate: absolute beats percentage.
+			// 3 of 4 is 75%, well past the 50% ceiling, so TargetDegraded fires
+			// while nothing is unplaced.
+			name:  "an absolute min may still exceed a target",
+			total: 4,
+			groups: []podpoolsv1alpha1.GroupSpec{
+				{Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3), Target: pctTarget(50)}},
+				{Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)}},
+			},
+			wantTargets:  []int32{3, 1},
+			wantDegraded: true,
+		},
+		{
+			name:  "high replica count does not overflow int32 arithmetic",
+			total: 25_000_000,
+			groups: []podpoolsv1alpha1.GroupSpec{
+				{Scaling: podpoolsv1alpha1.ScalingConstraints{Max: ptr.To[int32](5_000_000), Target: pctTarget(30)}},
+				{Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(70)}},
+			},
+			wantTargets:  []int32{5_000_000, 17_500_000},
+			wantDegraded: true,
+			wantUnplaced: 2_500_000,
 		},
 		{
 			// Phase 2 hands out targets in list order and breaks the
@@ -239,6 +279,10 @@ func TestComputeGroupTargets(t *testing.T) {
 				if result.Targets[i] != tt.wantTargets[i] {
 					t.Errorf("group %d: got %d, want %d (all targets=%v)", i, result.Targets[i], tt.wantTargets[i], result.Targets)
 				}
+			}
+
+			if result.TargetDegraded != tt.wantDegraded {
+				t.Errorf("targetDegraded: got %v, want %v", result.TargetDegraded, tt.wantDegraded)
 			}
 
 			if result.Unplaced != tt.wantUnplaced {
