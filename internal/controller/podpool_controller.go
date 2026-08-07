@@ -45,16 +45,25 @@ type childObservation struct {
 	// built-in types omit it when the count is zero, so false means "zero
 	// or unpublished"; only elapsed time can separate those two readings.
 	readyFound bool
+	child      *unstructured.Unstructured
 }
 
 func observeChild(child *unstructured.Unstructured) childObservation {
 	var obs childObservation
 
+	obs.child = child
 	obs.replicas, _ = workload.ReadInt32(child, "status", "replicas")
 	obs.ready, obs.readyFound = workload.ReadInt32(child, "status", "readyReplicas")
 	obs.updated, _ = workload.ReadInt32(child, "status", "updatedReplicas")
 
 	return obs
+}
+
+// groupReconcileResult pairs the status row a group publishes with what this
+// pass observed of its child.
+type groupReconcileResult struct {
+	status podpoolsv1alpha1.GroupStatus
+	obs    childObservation
 }
 
 // PodPoolReconciler reconciles a PodPool object.
@@ -138,36 +147,99 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	var failedGroups, notOwnedGroups []string
 
-	reconciledGroups := make(map[string]bool, len(pool.Spec.Groups))
+	// The status this pass read, before anything below overwrites it. Failed
+	// groups carry their previous row forward from here.
+	prevGroups := pool.Status.Groups
 
-	var sumReady int64
+	reconciledGroups := make(map[string]bool, len(pool.Spec.Groups))
+	childByGroup := make(map[string]*unstructured.Unstructured, len(pool.Spec.Groups))
+	groupStatuses := make([]podpoolsv1alpha1.GroupStatus, 0, len(pool.Spec.Groups))
 
 	for i, group := range pool.Spec.Groups {
-		obs, err := r.reconcileGroup(ctx, &pool, tmpl, group, result.Targets[i])
+		grResult, err := r.reconcileGroup(ctx, &pool, tmpl, gvk, group, result.Targets[i])
 		if err != nil {
 			errs = append(errs, fmt.Errorf("group %s: %w", group.Name, err))
 			failedGroups = append(failedGroups, group.Name)
 
+			reason := ReasonGroupReconcileFailed
+
 			var notOwned *workloadNotOwnedError
 			if errors.As(err, &notOwned) {
 				notOwnedGroups = append(notOwnedGroups, group.Name)
+				reason = ReasonWorkloadNotOwned
+			}
+
+			// Carry the last observed counts and workloadRef forward. Dropping
+			// the group would report its replicas as lost while the child is
+			// still running them, and losing the workloadRef would blind the
+			// stale-kind sweep exactly when a broken replacement makes it
+			// matter.
+			if previous := findGroupStatus(prevGroups, group.Name); previous != nil {
+				carried := *previous
+				carried.Ready = false
+				carried.Reason = reason
+				carried.Message = ""
+				groupStatuses = append(groupStatuses, carried)
+			} else {
+				groupStatuses = append(groupStatuses, podpoolsv1alpha1.GroupStatus{
+					Name:           group.Name,
+					Ready:          false,
+					Reason:         reason,
+					TargetReplicas: result.Targets[i],
+				})
 			}
 
 			continue
 		}
 
+		grResult.status.TargetReplicas = result.Targets[i]
+
 		reconciledGroups[group.Name] = true
-		sumReady += int64(obs.ready)
+
+		if grResult.obs.child != nil {
+			childByGroup[group.Name] = grResult.obs.child
+		}
+
+		groupStatuses = append(groupStatuses, grResult.status)
 	}
 
 	if sweepErrs := r.sweepAllOrphans(ctx, &pool, gvk, reconciledGroups); len(sweepErrs) > 0 {
 		errs = append(errs, sweepErrs...)
 	}
 
+	assignGroupReasons(groupStatuses, nil, childByGroup)
+
+	// Sum in int64, then narrow once. Every group count is already bounded to
+	// int32 individually, but two groups each reporting a large valid count
+	// can sum past MaxInt32, and pool.Status.Replicas is this CRD's own scale
+	// statusReplicasPath, which the API server rejects when negative. 32
+	// groups (the schema cap) at MaxInt32 is 6.9e10, so the wide accumulator
+	// provably cannot overflow.
+	var sumReplicas, sumReady, sumUpdated int64
+
+	for _, gs := range groupStatuses {
+		sumReplicas += int64(gs.Replicas)
+		sumReady += int64(gs.ReadyReplicas)
+		sumUpdated += int64(gs.UpdatedReplicas)
+	}
+
+	totalReplicas := clampInt32(sumReplicas)
+
+	for i := range groupStatuses {
+		groupStatuses[i].SharePercent = shareOfTotal(groupStatuses[i].Replicas, totalReplicas)
+	}
+
+	pool.Status.Replicas = totalReplicas
+	pool.Status.ReadyReplicas = clampInt32(sumReady)
+	pool.Status.UpdatedReplicas = clampInt32(sumUpdated)
+	pool.Status.UnplacedReplicas = result.Unplaced
+	pool.Status.GroupCount = int32(len(pool.Spec.Groups)) //nolint:gosec // spec.groups carries MaxItems=32, so len() fits int32
+	pool.Status.Groups = groupStatuses
+
 	setConditions(&pool, conditionInputs{
 		targetDegraded: result.TargetDegraded,
 		unplaced:       result.Unplaced,
-		ready:          clampInt32(sumReady),
+		ready:          pool.Status.ReadyReplicas,
 		desired:        pool.Spec.Replicas,
 		failedGroups:   failedGroups,
 		notOwnedGroups: notOwnedGroups,
@@ -198,20 +270,121 @@ func (r *PodPoolReconciler) reconcileGroup(
 	ctx context.Context,
 	pool *podpoolsv1alpha1.PodPool,
 	tmpl map[string]any,
+	gvk schema.GroupVersionKind,
 	group podpoolsv1alpha1.GroupSpec,
 	target int32,
-) (childObservation, error) {
+) (groupReconcileResult, error) {
 	desired, err := workload.BuildChildWorkload(tmpl, group, pool, target)
 	if err != nil {
-		return childObservation{}, fmt.Errorf("building workload: %w", err)
+		return groupReconcileResult{}, fmt.Errorf("building workload: %w", err)
 	}
 
 	obs, err := r.reconcileWorkload(ctx, pool, desired)
 	if err != nil {
-		return childObservation{}, fmt.Errorf("reconciling workload: %w", err)
+		return groupReconcileResult{}, fmt.Errorf("reconciling workload: %w", err)
 	}
 
-	return obs, nil
+	return groupReconcileResult{
+		status: podpoolsv1alpha1.GroupStatus{
+			Name:            group.Name,
+			Replicas:        obs.replicas,
+			ReadyReplicas:   obs.ready,
+			UpdatedReplicas: obs.updated,
+			WorkloadRef: &podpoolsv1alpha1.WorkloadReference{
+				APIVersion: gvk.GroupVersion().String(),
+				Kind:       gvk.Kind,
+				Name:       workload.ChildName(pool.Name, group.Name),
+			},
+		},
+		obs: obs,
+	}, nil
+}
+
+func findGroupStatus(statuses []podpoolsv1alpha1.GroupStatus, name string) *podpoolsv1alpha1.GroupStatus {
+	for i := range statuses {
+		if statuses[i].Name == name {
+			return &statuses[i]
+		}
+	}
+
+	return nil
+}
+
+// assignGroupReasons fills Ready/Reason/Message on every group status that
+// was reconciled successfully. Failed groups already have their reason from
+// the error path.
+func assignGroupReasons(
+	statuses []podpoolsv1alpha1.GroupStatus,
+	stalledGroups map[string]bool,
+	childByGroup map[string]*unstructured.Unstructured,
+) {
+	for i := range statuses {
+		gs := &statuses[i]
+		if gs.Reason != "" {
+			continue
+		}
+
+		child := childByGroup[gs.Name]
+
+		var childReason, childMessage string
+		if child != nil {
+			childReason, childMessage, _ = workload.ChildDetail(child)
+		}
+
+		switch {
+		case stalledGroups[gs.Name]:
+			gs.Ready = false
+			gs.Reason = ReasonProgressDeadlineExceeded
+			gs.Message = formatChildMessage(child, childReason, childMessage)
+
+		case child != nil && !workload.GenerationCurrent(child):
+			gs.Ready = false
+			gs.Reason = ReasonWorkloadUpdating
+			gs.Message = ""
+
+		case gs.ReadyReplicas < gs.TargetReplicas:
+			gs.Ready = false
+			gs.Reason = ReasonReplicasUpdating
+			gs.Message = formatChildMessage(child, childReason, childMessage)
+
+		case gs.TargetReplicas == 0:
+			gs.Ready = true
+			gs.Reason = ReasonScaledToZero
+
+		default:
+			gs.Ready = true
+			gs.Reason = ReasonAllReplicasReady
+		}
+	}
+}
+
+const maxGroupMessageLen = 512
+
+// formatChildMessage projects a child's own explanation into the group's
+// message, prefixed with what the child is and bounded in runes rather than
+// bytes: truncating mid-rune would put invalid UTF-8 in a status field.
+func formatChildMessage(child *unstructured.Unstructured, reason, message string) string {
+	if reason == "" && message == "" {
+		return ""
+	}
+
+	var prefix string
+	if child != nil {
+		prefix = fmt.Sprintf("%s %s: ", child.GetKind(), child.GetName())
+	}
+
+	var detail string
+
+	switch {
+	case reason != "" && message != "":
+		detail = reason + ": " + message
+	case reason != "":
+		detail = reason
+	default:
+		detail = message
+	}
+
+	return workload.TruncateRunes(prefix+detail, maxGroupMessageLen)
 }
 
 func (r *PodPoolReconciler) reconcileWorkload(

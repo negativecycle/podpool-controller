@@ -32,6 +32,7 @@ const (
 	ReasonWorkloadNotOwned           = "WorkloadNotOwned"
 	ReasonProgressDeadlineExceeded   = "ProgressDeadlineExceeded"
 	ReasonPoolReady                  = "PoolReady"
+	ReasonWorkloadUpdating           = "WorkloadUpdating"
 )
 
 // retiredConditionTypes are condition types this controller used to publish
@@ -318,4 +319,24 @@ func formatGroupNames(groups []string) string {
 	default:
 		return fmt.Sprintf("%s, %s +%d more", groups[0], groups[1], len(groups)-2)
 	}
+}
+
+// shareOfTotal returns replicas as a whole-number percentage of total, clamped
+// to [0,100]. The clamp is load-bearing: total is the sum of child-reported
+// status.replicas, and a CRD workload's status is written by its own controller
+// against whatever schema that CRD declares. A negative or absurd count would
+// otherwise reach an int32(float64) conversion whose result the Go spec says is
+// implementation-dependent when the value does not fit. No nolint:gosec needed
+// because the replicas >= total early return keeps the final conversion provably
+// in range.
+func shareOfTotal(replicas, total int32) int32 {
+	if total <= 0 || replicas <= 0 {
+		return 0
+	}
+
+	if replicas >= total {
+		return 100
+	}
+
+	return int32(float64(replicas) / float64(total) * 100)
 }

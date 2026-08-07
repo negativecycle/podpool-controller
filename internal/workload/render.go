@@ -15,6 +15,27 @@ import (
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
 
+const (
+	fieldGeneration   = "generation"
+	condStatusFalse   = "False"
+	condStatusUnknown = "Unknown"
+)
+
+// GenerationCurrent reports whether a child's controller has observed its
+// current spec. Both fields absent (a fresh object, or a type that does not
+// publish observedGeneration) is treated as current: absence is not evidence
+// of staleness.
+func GenerationCurrent(child *unstructured.Unstructured) bool {
+	gen, genFound, _ := unstructured.NestedInt64(child.Object, "metadata", fieldGeneration)
+
+	obsGen, obsGenFound, _ := unstructured.NestedInt64(child.Object, "status", "observedGeneration")
+	if !genFound || !obsGenFound {
+		return true
+	}
+
+	return obsGen >= gen
+}
+
 // ChildName is the one definition of a child workload's name. The rule is
 // derived again by anyone who needs to find a child from its pool and group,
 // so it gets one home before a second derivation can exist.
@@ -155,7 +176,7 @@ func stripPastedMetadata(obj map[string]any) {
 	}
 
 	for _, key := range []string{
-		"uid", "resourceVersion", "generation", "generateName",
+		"uid", "resourceVersion", fieldGeneration, "generateName",
 		"creationTimestamp", "deletionTimestamp",
 		"finalizers", "managedFields", "selfLink",
 		"ownerReferences",
@@ -219,4 +240,87 @@ func MergeMaps(base, patch map[string]any) map[string]any {
 	}
 
 	return result
+}
+
+// ChildDetail extracts a best-effort explanation from a child workload's
+// conditions. Returns ok=false when the child publishes nothing usable,
+// which is the common case, not an error.
+//
+// Rules mirror sigs.k8s.io/cli-utils/pkg/kstatus without the dependency.
+// Generation is checked first: if the child has not observed its own current
+// spec, its conditions describe the previous one and are suppressed.
+func ChildDetail(child *unstructured.Unstructured) (reason, message string, ok bool) {
+	if !GenerationCurrent(child) {
+		return "", "", false
+	}
+
+	raw, found, _ := unstructured.NestedFieldNoCopy(child.Object, "status", "conditions")
+	if !found {
+		return "", "", false
+	}
+
+	conds, isList := raw.([]any)
+	if !isList || len(conds) == 0 {
+		return "", "", false
+	}
+
+	type probe struct {
+		condType  string
+		badStatus string // the status value that indicates a problem
+	}
+	// Ordered most specific first. ReplicaFailure (negative polarity: True
+	// is the problem) carries the API error verbatim. Ready and Available
+	// are positive polarity: False or Unknown is the problem.
+	probes := []probe{
+		{"ReplicaFailure", "True"},
+		{"Ready", condStatusFalse},
+		{"Ready", condStatusUnknown},
+		{"Available", condStatusFalse},
+		{"Available", condStatusUnknown},
+	}
+
+	for _, p := range probes {
+		for _, item := range conds {
+			c, isMap := item.(map[string]any)
+			if !isMap {
+				continue
+			}
+
+			cType, _ := c["type"].(string)
+
+			cStatus, _ := c["status"].(string)
+			if cType != p.condType || cStatus != p.badStatus {
+				continue
+			}
+
+			r, _ := c["reason"].(string)
+
+			m, _ := c["message"].(string)
+			if r == "" && m == "" {
+				continue
+			}
+
+			return r, m, true
+		}
+	}
+
+	return "", "", false
+}
+
+// TruncateRunes truncates s to at most maxLen runes, on a rune boundary.
+func TruncateRunes(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+
+	n := 0
+	for i := range s {
+		if n >= maxLen {
+			return s[:i]
+		}
+
+		n++
+	}
+
+	return s
 }
