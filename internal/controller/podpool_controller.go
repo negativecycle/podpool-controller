@@ -54,6 +54,14 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	// A terminating pool gets no writes: recreating a child the GC just
+	// deleted turns foreground deletion into a fight the GC cannot win once
+	// children carry blockOwnerDeletion, and any write to a dying object is
+	// noise. Cleanup happens on the NotFound pass once the object is gone.
+	if !pool.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
+
 	return ctrl.Result{}, nil
 }
 
