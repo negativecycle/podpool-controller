@@ -195,7 +195,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	// Registered before any child is written, so the first child of a kind is
 	// born observed: a child changing is the event a pool most needs to hear,
 	// and the pool watch alone cannot deliver it.
-	if err := r.ensureWatch(gvk); err != nil {
+	if err := r.ensureWatch(ctx, gvk); err != nil {
 		return ctrl.Result{}, err
 	}
 

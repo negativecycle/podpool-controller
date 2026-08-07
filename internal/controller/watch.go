@@ -1,12 +1,14 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -37,11 +39,37 @@ import (
 // at once with the same kind would otherwise race, and a concurrent map
 // write in Go does not merely lose an update: it panics and takes the
 // process down.
-func (r *PodPoolReconciler) ensureWatch(gvk schema.GroupVersionKind) error {
+func (r *PodPoolReconciler) ensureWatch(ctx context.Context, gvk schema.GroupVersionKind) error {
 	// Unit tests construct the reconciler without a manager. No controller
 	// means no watches to add, which is fine: they drive Reconcile directly.
 	if r.ctrl == nil {
 		return nil
+	}
+
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvk)
+
+	// GetInformer, with the unstructured object. Never GetInformerForKind,
+	// which takes a GVK and builds the object itself by calling scheme.New:
+	//
+	//   - For a CRD kind the scheme does not know, that call fails outright,
+	//     and CRD workloads are the entire reason this controller resolves
+	//     kinds at runtime.
+	//   - For a kind the scheme does know, it succeeds and is worse. The cache
+	//     keys informers by object *type* as well as GVK, so a typed object
+	//     lands in the structured map while source.Kind below registers our
+	//     handler on the unstructured one. Same kind, two informers, two
+	//     watches, and every check we make from here on would be interrogating
+	//     the one with no handler attached.
+	//
+	// It is also the only place a kind the API server does not serve can be
+	// detected synchronously: the informer is constructed inline, so a missing
+	// CRD surfaces as an error here rather than as silence.
+	//
+	// Not asked to block. The reconcile context has no deadline, so a blocking
+	// wait would park a worker indefinitely on a kind that may never sync.
+	if _, err := r.Cache.GetInformer(ctx, u, cache.BlockUntilSynced(false)); err != nil {
+		return fmt.Errorf("getting informer for %s: %w", gvk, err)
 	}
 
 	r.watchMu.Lock()
@@ -50,9 +78,6 @@ func (r *PodPoolReconciler) ensureWatch(gvk schema.GroupVersionKind) error {
 	if r.watchedGVKs[gvk] {
 		return nil
 	}
-
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(gvk)
 
 	if err := r.ctrl.Watch(
 		source.Kind(r.Cache, u,
