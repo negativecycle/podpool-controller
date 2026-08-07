@@ -229,3 +229,51 @@ func TestRenderDoesNotLeakBetweenGroups(t *testing.T) {
 		t.Errorf("group A replicas = %d, want 3 (group B's build leaked in)", replicasA)
 	}
 }
+
+// TestBuildChildWorkloadStripsPastedMetadata renders a template pasted from a
+// live object and checks nothing instance-specific survives into the child.
+func TestBuildChildWorkloadStripsPastedMetadata(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{
+		"apiVersion": "apps/v1",
+		"kind": "Deployment",
+		"metadata": {
+			"name": "pasted",
+			"uid": "pasted-uid",
+			"resourceVersion": "12345",
+			"generation": 7,
+			"creationTimestamp": "2026-01-01T00:00:00Z",
+			"managedFields": [{"manager": "kubectl"}],
+			"ownerReferences": [{"apiVersion": "v1", "kind": "Foo", "name": "x", "uid": "y"}],
+			"annotations": {
+				"kubectl.kubernetes.io/last-applied-configuration": "{}"
+			}
+		},
+		"spec": {
+			"template": {"spec": {"containers": [{"name": "app", "image": "nginx:latest"}]}}
+		},
+		"status": {"readyReplicas": 9}
+	}`)
+
+	child, err := BuildChildWorkload(mustParse(t, raw), podpoolsv1alpha1.GroupSpec{Name: testGroupBase}, testPool(), 2)
+	if err != nil {
+		t.Fatalf("BuildChildWorkload: %v", err)
+	}
+
+	md := child.Object["metadata"].(map[string]any)
+	for _, key := range []string{"uid", "resourceVersion", "generation", "creationTimestamp", "managedFields", "annotations"} {
+		if _, present := md[key]; present {
+			t.Errorf("metadata.%s survived the strip", key)
+		}
+	}
+
+	if _, present := child.Object["status"]; present {
+		t.Error("status survived the strip; the child would be created claiming another object's state")
+	}
+
+	refs := child.GetOwnerReferences()
+	if len(refs) != 1 || refs[0].Kind != KindPodPool {
+		t.Errorf("pasted ownerReferences were not replaced by the pool's: %+v", refs)
+	}
+}

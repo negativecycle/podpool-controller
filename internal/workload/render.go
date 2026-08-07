@@ -62,6 +62,8 @@ func BuildChildWorkload(
 ) (*unstructured.Unstructured, error) {
 	obj := runtime.DeepCopyJSON(tmpl)
 
+	stripPastedMetadata(obj)
+
 	child := &unstructured.Unstructured{Object: obj}
 
 	// obj is a fresh DeepCopyJSON and nothing else holds a reference, so
@@ -92,4 +94,35 @@ func BuildChildWorkload(
 	}})
 
 	return child, nil
+}
+
+// stripPastedMetadata removes the fields a template picks up when it is
+// copied from a live object, which is what `kubectl get -o yaml` hands you.
+// A template carrying metadata.uid fails apply with a uid mismatch, so the
+// child is never created, and being a 409 it retries forever.
+func stripPastedMetadata(obj map[string]any) {
+	delete(obj, "status")
+
+	md, ok := obj["metadata"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	for _, key := range []string{
+		"uid", "resourceVersion", "generation", "generateName",
+		"creationTimestamp", "deletionTimestamp",
+		"finalizers", "managedFields", "selfLink",
+		"ownerReferences",
+	} {
+		delete(md, key)
+	}
+
+	annotations, ok := md["annotations"].(map[string]any)
+	if ok {
+		delete(annotations, "kubectl.kubernetes.io/last-applied-configuration")
+
+		if len(annotations) == 0 {
+			delete(md, "annotations")
+		}
+	}
 }
