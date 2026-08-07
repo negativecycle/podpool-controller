@@ -466,14 +466,6 @@ func stampGroupProgress(gs *podpoolsv1alpha1.GroupStatus, prev *podpoolsv1alpha1
 	}
 }
 
-// SetupWithManager sets up the controller with the Manager.
-func (r *PodPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&podpoolsv1alpha1.PodPool{}).
-		Named("podpool").
-		Complete(r)
-}
-
 // patchStatus writes the pass's status exactly once, and only when it differs
 // from what the pass read. Writing unconditionally has two costs the naive
 // version paid: an identical write still round-trips to the API server on
