@@ -18,14 +18,25 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
+	"github.com/negativecycle/podpool-controller/internal/workload"
 )
+
+// childObservation is what one pass learned about a group's child workload.
+// It grows as the controller learns to read more; for now the only fact worth
+// carrying is whether this pass created the object.
+type childObservation struct {
+	created bool
+}
 
 // PodPoolReconciler reconciles a PodPool object.
 type PodPoolReconciler struct {
@@ -62,6 +73,28 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
+	// Asked before any expensive work: a template that is not even
+	// addressable (no apiVersion or kind) cannot be rendered for any group.
+	if _, err := workload.ExtractGVK(pool.Spec.WorkloadTemplate.Raw); err != nil {
+		return ctrl.Result{}, fmt.Errorf("extracting workload GVK: %w", err)
+	}
+
+	// Parse once per reconcile; BuildChildWorkload deep-copies per group.
+	// Unreachable for malformed JSON: ExtractGVK unmarshals the same bytes
+	// above.
+	tmpl, err := workload.ParseTemplate(pool.Spec.WorkloadTemplate.Raw)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("parsing workload template: %w", err)
+	}
+
+	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups)
+
+	for i, group := range pool.Spec.Groups {
+		if _, err := r.reconcileGroup(ctx, &pool, tmpl, group, result.Targets[i]); err != nil {
+			return ctrl.Result{}, fmt.Errorf("group %s: %w", group.Name, err)
+		}
+	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -71,4 +104,51 @@ func (r *PodPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&podpoolsv1alpha1.PodPool{}).
 		Named("podpool").
 		Complete(r)
+}
+
+func (r *PodPoolReconciler) reconcileGroup(
+	ctx context.Context,
+	pool *podpoolsv1alpha1.PodPool,
+	tmpl map[string]any,
+	group podpoolsv1alpha1.GroupSpec,
+	target int32,
+) (childObservation, error) {
+	desired, err := workload.BuildChildWorkload(tmpl, group, pool, target)
+	if err != nil {
+		return childObservation{}, fmt.Errorf("building workload: %w", err)
+	}
+
+	obs, err := r.reconcileWorkload(ctx, desired)
+	if err != nil {
+		return childObservation{}, fmt.Errorf("reconciling workload: %w", err)
+	}
+
+	return obs, nil
+}
+
+func (r *PodPoolReconciler) reconcileWorkload(
+	ctx context.Context,
+	desired *unstructured.Unstructured,
+) (childObservation, error) {
+	key := types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(desired.GroupVersionKind())
+
+	err := r.Get(ctx, key, existing)
+	if apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, desired); err != nil {
+			return childObservation{}, err
+		}
+
+		return childObservation{created: true}, nil
+	}
+
+	if err != nil {
+		return childObservation{}, err
+	}
+
+	// Create-only: an existing child is left exactly as it was found. What
+	// that leaves unrepaired is the next commits' subject.
+	return childObservation{}, nil
 }
