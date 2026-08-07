@@ -49,6 +49,8 @@ type PodPoolSpec struct {
 	// +required
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=32
+	// +listType=map
+	// +listMapKey=name
 	Groups []GroupSpec `json:"groups"`
 }
 

@@ -68,6 +68,17 @@ var _ = Describe("CRD schema validation", func() {
 		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
 	})
 
+	It("rejects duplicate group names via listType=map", func() {
+		pool := basePool("dup-names")
+		minOne := int32(1)
+		pool.Spec.Groups = []podpoolsv1alpha1.GroupSpec{
+			{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minOne}},
+			{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)}},
+		}
+		err := k8sClient.Create(ctx, pool)
+		Expect(err).To(HaveOccurred())
+	})
+
 	It("rejects replicas above 1000000", func() {
 		pool := basePool("too-many-replicas")
 		pool.Spec.Replicas = 1_000_001

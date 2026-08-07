@@ -131,6 +131,9 @@ spec:
                 maxItems: 32
                 minItems: 1
                 type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               replicas:
                 description: |-
                   Total number of pod replicas to distribute across all groups. Each
