@@ -523,3 +523,51 @@ func TestRenderPreservesUserLabelsOnChild(t *testing.T) {
 		t.Errorf("controller labels should be merged in beside them, got %v", labels)
 	}
 }
+
+func TestReadInt32ClampsOutOfRange(t *testing.T) {
+	t.Parallel()
+
+	child := &unstructured.Unstructured{Object: map[string]any{
+		fieldStatus: map[string]any{
+			"negative": int64(-1),
+			"huge":     int64(4294967296),
+		},
+	}}
+
+	// A negative count has no meaning downstream; it clamps to zero.
+	if got, ok := ReadInt32(child, fieldStatus, "negative"); got != 0 || !ok {
+		t.Errorf("negative: got (%d, %v), want (0, true)", got, ok)
+	}
+
+	// Clamping high to MaxInt32 rather than zero fails in the safe
+	// direction: the group reads as full, and nothing scales up on the
+	// strength of it.
+	if got, ok := ReadInt32(child, fieldStatus, "huge"); got != 2147483647 || !ok {
+		t.Errorf("huge: got (%d, %v), want (MaxInt32, true)", got, ok)
+	}
+}
+
+func TestReadInt32CheckedReportsClamping(t *testing.T) {
+	t.Parallel()
+
+	child := &unstructured.Unstructured{Object: map[string]any{
+		fieldStatus: map[string]any{
+			"sane": int64(4),
+			"huge": int64(1 << 40),
+		},
+	}}
+
+	if _, ok, clamped := ReadInt32Checked(child, fieldStatus, "sane"); !ok || clamped {
+		t.Errorf("sane: ok=%v clamped=%v, want true/false", ok, clamped)
+	}
+
+	if v, ok, clamped := ReadInt32Checked(child, fieldStatus, "huge"); v != 2147483647 || !ok || !clamped {
+		t.Errorf("huge: (%d, %v, %v), want (MaxInt32, true, true)", v, ok, clamped)
+	}
+
+	// Absent is not clamped: the field simply was not there, and reporting
+	// it as repaired would invent a corruption nobody published.
+	if _, ok, clamped := ReadInt32Checked(child, fieldStatus, "missing"); ok || clamped {
+		t.Errorf("missing: ok=%v clamped=%v, want false/false", ok, clamped)
+	}
+}

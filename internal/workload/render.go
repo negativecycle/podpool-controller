@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -194,21 +195,59 @@ func stripPastedMetadata(obj map[string]any) {
 	}
 }
 
-// ReadInt32 reads an integer status field from a child workload, returning
-// ok=false when the field is absent or unreadable.
+// ReadInt32 reads an integer status field from a child workload, clamped to
+// the range the PodPool API can actually store.
 //
-// Absent is also the ordinary state of a healthy child: these fields are
-// omitempty on the built-in types, so a count of zero and a field the kind
-// never publishes are the same wire state. Treat ok=false as "zero for now",
-// never as "this kind does not publish the field"; only elapsed time can
-// separate those readings.
+// The clamp is not defensive programming for its own sake. A child may be a
+// CRD this controller does not own, and a CRD's schema is written by its
+// author: a field declared `type: integer` with no `format: int32` accepts the
+// whole int64 range and the API server stores it. An unchecked int32
+// conversion reads 4294967295 back as -1, and 2^40 back as 0, which looks
+// like a healthy empty group.
+//
+// A negative then reaches status.groups[].replicas, whose Minimum=0 our own
+// CRD enforces, and the status patch 422s identically on every retry: the pool
+// wedges in permanent backoff. Clamping here is what keeps a lying child from
+// taking the pool down.
+//
+// ok=false still means "absent or unreadable" and is unchanged. A clamped
+// value is ok=true, because the field was genuinely present. Absent is also
+// the ordinary state of a healthy child: these fields are omitempty on the
+// built-in types, so a count of zero and a field the kind never publishes
+// are the same wire state. Treat ok=false as "zero for now", never as "this
+// kind does not publish the field"; only elapsed time can separate those
+// readings.
 func ReadInt32(obj *unstructured.Unstructured, fields ...string) (int32, bool) {
-	v, found, err := unstructured.NestedInt64(obj.Object, fields...)
+	v, ok, _ := ReadInt32Checked(obj, fields...)
+
+	return v, ok
+}
+
+// ReadInt32Checked is ReadInt32 plus whether the stored value was outside the
+// representable range.
+//
+// Clamping alone launders the corruption: an operator sees readyReplicas 0 and
+// a group that never becomes ready, with nothing anywhere saying the child
+// claimed 4294967296. Callers that can reach the operator use the third return
+// to say so. Callers that cannot use ReadInt32 and ignore it.
+func ReadInt32Checked(obj *unstructured.Unstructured, fields ...string) (v int32, ok, clamped bool) {
+	val, found, err := unstructured.NestedInt64(obj.Object, fields...)
 	if err != nil || !found {
-		return 0, false
+		return 0, false, false
 	}
 
-	return int32(v), true //nolint:gosec // counts are small in practice; revisited when a hostile child is considered
+	// Counts, so a negative has no meaning downstream. Clamping high to
+	// MaxInt32 rather than 0 fails in the safe direction: the group reads as
+	// full and nothing scales up on the strength of it.
+	if val < 0 {
+		return 0, true, true
+	}
+
+	if val > math.MaxInt32 {
+		return math.MaxInt32, true, true
+	}
+
+	return int32(val), true, false
 }
 
 // MergeMaps deep-merges patch into base following RFC 7386 semantics: maps

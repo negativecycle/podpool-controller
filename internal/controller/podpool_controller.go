@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,6 +46,10 @@ type childObservation struct {
 	// built-in types omit it when the count is zero, so false means "zero
 	// or unpublished"; only elapsed time can separate those two readings.
 	readyFound bool
+	// outOfRange means at least one count the child published could not be
+	// represented and was clamped. The numbers above are safe to use; this
+	// says they are not what the child claimed.
+	outOfRange bool
 	child      *unstructured.Unstructured
 }
 
@@ -52,11 +57,19 @@ func observeChild(child *unstructured.Unstructured) childObservation {
 	var obs childObservation
 
 	obs.child = child
-	obs.replicas, _ = workload.ReadInt32(child, "status", "replicas")
-	obs.ready, obs.readyFound = workload.ReadInt32(child, "status", "readyReplicas")
-	obs.updated, _ = workload.ReadInt32(child, "status", "updatedReplicas")
+	obs.readInto(child)
 
 	return obs
+}
+
+func (o *childObservation) readInto(child *unstructured.Unstructured) {
+	var replicasClamped, readyClamped, updatedClamped bool
+
+	o.replicas, _, replicasClamped = workload.ReadInt32Checked(child, "status", "replicas")
+	o.ready, o.readyFound, readyClamped = workload.ReadInt32Checked(child, "status", "readyReplicas")
+	o.updated, _, updatedClamped = workload.ReadInt32Checked(child, "status", "updatedReplicas")
+
+	o.outOfRange = replicasClamped || readyClamped || updatedClamped
 }
 
 // groupReconcileResult pairs the status row a group publishes with what this
@@ -76,6 +89,14 @@ type PodPoolReconciler struct {
 	// create path force-applies over an object the cache says is absent, the
 	// absence is confirmed against the API server itself.
 	APIReader client.Reader
+
+	// Which groups have already been reported as publishing a count we could
+	// not represent. Keyed per group, not per GVK: a child reporting nonsense
+	// is a property of that object, not of its kind, so gating on the kind
+	// would silence every pool after the first. In-memory, so a restart
+	// re-reports once, which is the right side to err on.
+	outOfRangeEmitted map[string]bool
+	outOfRangeMu      sync.Mutex
 }
 
 // +kubebuilder:rbac:groups=podpools.dev,resources=podpools,verbs=get;list;watch;create;update;patch;delete
@@ -193,6 +214,12 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 
 		grResult.status.TargetReplicas = result.Targets[i]
+
+		// The counts have already been clamped into something the API can
+		// store, so the pool is safe. Say so anyway: otherwise the operator
+		// sees a group pinned at an odd number with nothing explaining that
+		// its child is publishing figures we could not represent.
+		r.reportOutOfRange(ctx, &pool, group.Name, grResult.obs.outOfRange)
 
 		reconciledGroups[group.Name] = true
 
@@ -664,6 +691,37 @@ func staleWorkloadGVKs(prev []podpoolsv1alpha1.GroupStatus, current schema.Group
 	}
 
 	return result
+}
+
+// reportOutOfRange logs, once per group per process, that a child published a
+// count outside the representable range, and re-arms once the child recovers.
+// The stored values are already clamped and safe; this exists so the clamp
+// does not launder the corruption into silence.
+func (r *PodPoolReconciler) reportOutOfRange(ctx context.Context, pool *podpoolsv1alpha1.PodPool, groupName string, outOfRange bool) {
+	key := pool.Namespace + "/" + pool.Name + "/" + groupName
+
+	r.outOfRangeMu.Lock()
+	defer r.outOfRangeMu.Unlock()
+
+	if r.outOfRangeEmitted == nil {
+		r.outOfRangeEmitted = make(map[string]bool)
+	}
+
+	if !outOfRange {
+		delete(r.outOfRangeEmitted, key)
+
+		return
+	}
+
+	if r.outOfRangeEmitted[key] {
+		return
+	}
+
+	r.outOfRangeEmitted[key] = true
+
+	logf.FromContext(ctx).Info(
+		"Child workload published counts outside the representable range; stored values are clamped",
+		"group", groupName)
 }
 
 // applyChild writes the rendered child with server-side apply.
