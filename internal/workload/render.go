@@ -15,9 +15,6 @@ import (
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
 
-// KindPodPool is the owner kind every child's controller reference names.
-const KindPodPool = "PodPool"
-
 // ChildName is the one definition of a child workload's name. The rule is
 // derived again by anyone who needs to find a child from its pool and group,
 // so it gets one home before a second derivation can exist.

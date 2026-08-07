@@ -32,10 +32,6 @@ import (
 	"github.com/negativecycle/podpool-controller/internal/workload"
 )
 
-// managerName is this controller's field-manager identity for server-side
-// apply. Moves beside the label scheme once one exists.
-const managerName = "podpool-controller"
-
 // childObservation is what one pass learned about a group's child workload.
 // It grows as the controller learns to read more; for now the only fact worth
 // carrying is whether this pass created the object.
@@ -178,7 +174,7 @@ func (r *PodPoolReconciler) applyChild(ctx context.Context, desired *unstructure
 	desired.SetResourceVersion("")
 
 	return r.Apply(ctx, client.ApplyConfigurationFromUnstructured(desired),
-		client.FieldOwner(managerName),
+		client.FieldOwner(workload.ManagerName),
 		client.ForceOwnership,
 	)
 }
