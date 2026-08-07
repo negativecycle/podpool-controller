@@ -265,7 +265,7 @@ func TestComputeGroupTargets(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			result := ComputeGroupTargets(tt.total, tt.groups)
+			result := ComputeGroupTargets(tt.total, tt.groups, nil)
 
 			if tt.wantTargets == nil && result.Targets == nil {
 				return
@@ -416,7 +416,7 @@ func TestComputeGroupTargetsScalingTrace(t *testing.T) {
 		t.Run(fmt.Sprintf("total=%d", e.total), func(t *testing.T) {
 			t.Parallel()
 
-			result := ComputeGroupTargets(e.total, groups)
+			result := ComputeGroupTargets(e.total, groups, nil)
 
 			got := result.Targets
 			if got[0] != e.base || got[1] != e.scav || got[2] != e.burst {
@@ -451,7 +451,7 @@ func TestComputeGroupTargetsCappedTrace(t *testing.T) {
 		t.Run(fmt.Sprintf("total=%d", total), func(t *testing.T) {
 			t.Parallel()
 
-			r := ComputeGroupTargets(total, groups)
+			r := ComputeGroupTargets(total, groups, nil)
 
 			wantA := int32(float64(total) * 0.20)
 

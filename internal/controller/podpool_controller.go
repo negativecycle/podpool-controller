@@ -207,7 +207,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		return res, err
 	}
 
-	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups)
+	// The capacity map stays empty until the controller learns to observe it.
+	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups, nil)
 
 	// Groups are reconciled independently: one that cannot be built or
 	// applied must not stop the others. Failures are collected and returned

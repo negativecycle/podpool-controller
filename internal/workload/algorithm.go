@@ -19,6 +19,21 @@ type DistributionResult struct {
 	Unplaced int32
 }
 
+// The capacity map carries, per opportunistic group name, how many replicas
+// the scheduler has accepted. Groups absent from the map have never been
+// sized: the first pass offers them everything.
+//
+// This is the one input that does not come from the spec. ComputeGroupTargets
+// stays a pure function of its arguments, so it remains exhaustively testable
+// without a cluster; it is simply no longer a function of the PodPool alone.
+//
+// Probing (the act of asking whether *more* than this fits) deliberately
+// does not appear here. A probe is a temporal question ("am I currently
+// asking?") and this function answers a distributive one ("how is total
+// split, given what fits?"). The controller layers the probe on top of the
+// distribution, outside the total, so a probe can never be funded by taking
+// a replica from another group.
+
 // GroupFloor returns the cascade threshold (min) for a group, defaulting to 0.
 func GroupFloor(s podpoolsv1alpha1.ScalingConstraints) int32 {
 	if s.Min != nil {
@@ -85,12 +100,10 @@ func GroupTarget(total int32, s podpoolsv1alpha1.ScalingConstraints) (int32, boo
 // rather than being repaired on its next write, so "sanely" has to mean
 // "conservatively" — an input this function cannot read binds the group rather
 // than freeing it.
-//
-// It is a pure function of its arguments, so it remains exhaustively testable
-// without a cluster.
 func ComputeGroupTargets(
 	total int32,
 	groups []podpoolsv1alpha1.GroupSpec,
+	observed map[string]int32,
 ) DistributionResult {
 	n := len(groups)
 	if n == 0 {

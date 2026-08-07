@@ -243,7 +243,7 @@ func TestMalformedTargetDoesNotAbsorbTheOverflow(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := workload.ComputeGroupTargets(total, malformedTargetSpec(tt.baseMin, tt.baseTarget))
+			got := workload.ComputeGroupTargets(total, malformedTargetSpec(tt.baseMin, tt.baseTarget), nil)
 
 			if fmt.Sprint(got.Targets) != fmt.Sprint(tt.wantTargets) {
 				t.Errorf("targets = %v, want %v", got.Targets, tt.wantTargets)
