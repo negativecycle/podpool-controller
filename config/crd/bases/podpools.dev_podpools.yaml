@@ -53,6 +53,7 @@ spec:
                         DNS-label name that identifies this group within the pool. Becomes
                         part of the child workload's name (<pool>-<name>) and its label
                         selector, so renaming a group replaces its child entirely.
+                      maxLength: 53
                       minLength: 1
                       pattern: ^[a-z][a-z0-9-]*[a-z0-9]$
                       type: string
@@ -112,6 +113,7 @@ spec:
                   - name
                   - scaling
                   type: object
+                maxItems: 32
                 minItems: 1
                 type: array
               replicas:
@@ -120,6 +122,7 @@ spec:
                   group receives a share of this total according to its scaling
                   constraints.
                 format: int32
+                maximum: 1000000
                 minimum: 0
                 type: integer
               workloadTemplate:

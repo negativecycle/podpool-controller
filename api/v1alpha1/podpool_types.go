@@ -29,6 +29,7 @@ type PodPoolSpec struct {
 	// constraints.
 	// +required
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1000000
 	Replicas int32 `json:"replicas"`
 
 	// Template for the child workload each group creates. Accepts any
@@ -47,6 +48,7 @@ type PodPoolSpec struct {
 	// absorbs whatever remains.
 	// +required
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=32
 	Groups []GroupSpec `json:"groups"`
 }
 
@@ -58,6 +60,7 @@ type GroupSpec struct {
 	// +required
 	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9-]*[a-z0-9]$`
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=53
 	Name string `json:"name"`
 
 	// How many of the pool's total replicas this group should receive.
