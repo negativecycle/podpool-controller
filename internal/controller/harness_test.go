@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -66,7 +67,7 @@ func newFakeReconciler(t *testing.T, counter *statusPatches, objs ...client.Obje
 
 	cl := builder.Build()
 
-	return &PodPoolReconciler{Client: cl, Scheme: scheme, APIReader: cl}, cl
+	return &PodPoolReconciler{Client: cl, Scheme: scheme, APIReader: cl, Clock: clock.RealClock{}}, cl
 }
 
 func fakeTestPool() *podpoolsv1alpha1.PodPool {

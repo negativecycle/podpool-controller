@@ -53,6 +53,14 @@ type PodPoolSpec struct {
 	// +listType=map
 	// +listMapKey=name
 	Groups []GroupSpec `json:"groups"`
+
+	// How long a group may sit short of its target before the pool reports
+	// ProgressDeadlineExceeded. Mirrors a Deployment's
+	// progressDeadlineSeconds. Set to 2147483647 to disable the deadline.
+	// +optional
+	// +kubebuilder:default=600
+	// +kubebuilder:validation:Minimum=1
+	ProgressDeadlineSeconds *int32 `json:"progressDeadlineSeconds,omitempty"`
 }
 
 // GroupSpec defines a single group within a PodPool.
@@ -233,6 +241,11 @@ type GroupStatus struct {
 	// Calculated from observed replicas, not from the distribution target.
 	// +optional
 	SharePercent int32 `json:"sharePercent,omitempty"`
+
+	// When this group last made progress toward its target. Nil when
+	// the group is at target.
+	// +optional
+	LastProgressTime *metav1.Time `json:"lastProgressTime,omitempty"`
 
 	// Reference to the child workload this group owns.
 	// +optional

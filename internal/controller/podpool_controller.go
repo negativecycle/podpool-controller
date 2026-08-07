@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,7 +32,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -86,6 +89,11 @@ type PodPoolReconciler struct {
 	client.Client
 
 	Scheme *runtime.Scheme
+
+	// Clock is injected rather than read from the wall, because deadline
+	// behaviour is untestable against time.Now: a test cannot wait ten
+	// minutes to see a stall fire.
+	Clock clock.PassiveClock
 
 	// APIReader bypasses the cache for reads that must not lag it: before the
 	// create path force-applies over an object the cache says is absent, the
@@ -161,7 +169,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 			poolInvalid: true,
 		})
 
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: requeueAfter()}, nil
 	}
 
 	// Parse once per reconcile; BuildChildWorkload deep-copies per group.
@@ -249,7 +257,31 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		errs = append(errs, sweepErrs...)
 	}
 
-	assignGroupReasons(groupStatuses, nil, childByGroup)
+	now := r.Clock.Now()
+
+	// Stamp progress timestamps on freshly reconciled groups only. Failed
+	// groups keep their previous status, including timestamps, from the
+	// carry-forward above: a group whose applies are failing is not
+	// progressing, and a generation bump should not restart its clock.
+	genChanged := before.Status.ObservedGeneration != pool.Generation
+
+	for i := range groupStatuses {
+		gs := &groupStatuses[i]
+		if !reconciledGroups[gs.Name] {
+			continue
+		}
+
+		stampGroupProgress(gs, findGroupStatus(before.Status.Groups, gs.Name), genChanged, now)
+	}
+
+	stalledGroups := evaluateStalled(&pool, groupStatuses, now)
+
+	stalledSet := make(map[string]bool, len(stalledGroups))
+	for _, name := range stalledGroups {
+		stalledSet[name] = true
+	}
+
+	assignGroupReasons(groupStatuses, stalledSet, childByGroup)
 
 	// Sum in int64, then narrow once. Every group count is already bounded to
 	// int32 individually, but two groups each reporting a large valid count
@@ -284,10 +316,154 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		ready:          pool.Status.ReadyReplicas,
 		desired:        pool.Spec.Replicas,
 		failedGroups:   failedGroups,
+		stalledGroups:  stalledGroups,
 		notOwnedGroups: notOwnedGroups,
 	})
 
-	return ctrl.Result{}, kerrors.NewAggregate(errs)
+	// A deadline needs something to wake the pool, and a wedged pool is
+	// precisely the one that goes silent: ready < desired is byte-identical
+	// for a rollout four seconds old and a pool stuck forever, so only a
+	// requeue can turn elapsed time into a verdict.
+	return ctrl.Result{RequeueAfter: deadlineAwareRequeue(&pool, groupStatuses, now)}, kerrors.NewAggregate(errs)
+}
+
+// reconcileFloor is the base requeue interval for every pool. Without a floor
+// a converged pool is never looked at again until something changes it, and
+// the progress deadline could never fire on a pool that went quiet.
+const reconcileFloor = 10 * time.Minute
+
+// defaultProgressDeadlineSeconds matches the schema default; the in-code copy
+// covers objects stored before the default existed and structs built in tests
+// that never pass through admission.
+const defaultProgressDeadlineSeconds int32 = 600
+
+// requeueAfter returns the base requeue interval, jittered so a manager
+// restart does not herd every pool into lockstep forever.
+func requeueAfter() time.Duration {
+	return wait.Jitter(reconcileFloor, 0.1)
+}
+
+// progressDeadline returns the pool's progress deadline or the default.
+// math.MaxInt32 disables the deadline.
+func progressDeadline(pool *podpoolsv1alpha1.PodPool) time.Duration {
+	s := defaultProgressDeadlineSeconds
+	// The nil check survives the schema default: objects stored before the
+	// default existed are not re-defaulted on read, and structs built in
+	// tests never pass through admission.
+	if pool.Spec.ProgressDeadlineSeconds != nil {
+		s = *pool.Spec.ProgressDeadlineSeconds
+	}
+
+	return time.Duration(s) * time.Second
+}
+
+// hasProgressDeadline reports whether the pool's deadline is enabled.
+func hasProgressDeadline(pool *podpoolsv1alpha1.PodPool) bool {
+	s := defaultProgressDeadlineSeconds
+	if pool.Spec.ProgressDeadlineSeconds != nil {
+		s = *pool.Spec.ProgressDeadlineSeconds
+	}
+
+	return s < 2147483647
+}
+
+// evaluateStalled returns the names of groups whose shortfall has exceeded
+// the progress deadline.
+func evaluateStalled(pool *podpoolsv1alpha1.PodPool, groups []podpoolsv1alpha1.GroupStatus, now time.Time) []string {
+	if !hasProgressDeadline(pool) {
+		return nil
+	}
+
+	deadline := progressDeadline(pool)
+
+	var stalled []string
+
+	for i := range groups {
+		gs := &groups[i]
+
+		shortfall := max(int32(0), gs.TargetReplicas-gs.ReadyReplicas)
+		if shortfall > 0 && gs.LastProgressTime != nil {
+			if now.Sub(gs.LastProgressTime.Time) >= deadline {
+				stalled = append(stalled, gs.Name)
+			}
+		}
+	}
+
+	return stalled
+}
+
+// deadlineAwareRequeue returns the base requeue interval, shortened when a
+// group is short of target but not yet stalled, so the deadline fires
+// precisely rather than up to one floor interval late.
+func deadlineAwareRequeue(pool *podpoolsv1alpha1.PodPool, groups []podpoolsv1alpha1.GroupStatus, now time.Time) time.Duration {
+	base := requeueAfter()
+
+	if hasProgressDeadline(pool) {
+		deadline := progressDeadline(pool)
+
+		for _, gs := range groups {
+			shortfall := max(int32(0), gs.TargetReplicas-gs.ReadyReplicas)
+			if shortfall > 0 && gs.LastProgressTime != nil {
+				remaining := gs.LastProgressTime.Time.Add(deadline).Sub(now)
+				if remaining > 0 && remaining < base {
+					base = remaining
+				}
+			}
+		}
+	}
+
+	if base < time.Second {
+		base = time.Second
+	}
+
+	return base
+}
+
+// stampGroupProgress applies the progress timestamp rules.
+//
+// Stamp when: shortfall first appears, shortfall decreases (progress),
+// target increases (new work assigned), or generation changes (fresh
+// rollout). Clear when shortfall reaches zero. Do NOT stamp when
+// shortfall is unchanged or when it grows because ready fell. That is
+// a regression, and the deadline should run from the original shortfall.
+func stampGroupProgress(gs *podpoolsv1alpha1.GroupStatus, prev *podpoolsv1alpha1.GroupStatus, genChanged bool, now time.Time) {
+	shortfall := max(int32(0), gs.TargetReplicas-gs.ReadyReplicas)
+
+	if shortfall == 0 {
+		gs.LastProgressTime = nil
+
+		return
+	}
+
+	stamp := &metav1.Time{Time: now}
+
+	if prev == nil {
+		gs.LastProgressTime = stamp
+
+		return
+	}
+
+	prevShortfall := max(int32(0), prev.TargetReplicas-prev.ReadyReplicas)
+
+	switch {
+	case genChanged:
+		gs.LastProgressTime = stamp
+	case prevShortfall == 0:
+		// Shortfall first appeared.
+		gs.LastProgressTime = stamp
+	case shortfall < prevShortfall:
+		// Real progress.
+		gs.LastProgressTime = stamp
+	case gs.TargetReplicas > prev.TargetReplicas:
+		// Target rose (capacity shift between groups, not a generation
+		// change): new work assigned, fresh deadline.
+		gs.LastProgressTime = stamp
+	default:
+		// Shortfall unchanged or grew because ready fell. Keep the
+		// existing timestamp so the deadline runs from the original
+		// shortfall, not from the regression.
+		gs.LastProgressTime = prev.LastProgressTime
+	}
 }
 
 // SetupWithManager sets up the controller with the Manager.

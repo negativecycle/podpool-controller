@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -125,6 +126,7 @@ func (sv *splitView) reconciler(liveReader client.Reader) *PodPoolReconciler {
 		Client:    sv.cached,
 		Scheme:    sv.store.Scheme(),
 		APIReader: liveReader,
+		Clock:     clock.RealClock{},
 	}
 }
 

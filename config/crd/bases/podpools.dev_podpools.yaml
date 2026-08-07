@@ -161,6 +161,15 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
+              progressDeadlineSeconds:
+                default: 600
+                description: |-
+                  How long a group may sit short of its target before the pool reports
+                  ProgressDeadlineExceeded. Mirrors a Deployment's
+                  progressDeadlineSeconds. Set to 2147483647 to disable the deadline.
+                format: int32
+                minimum: 1
+                type: integer
               replicas:
                 description: |-
                   Total number of pod replicas to distribute across all groups. Each
@@ -263,6 +272,12 @@ spec:
                   description: GroupStatus reflects the observed state of a single
                     group.
                   properties:
+                    lastProgressTime:
+                      description: |-
+                        When this group last made progress toward its target. Nil when
+                        the group is at target.
+                      format: date-time
+                      type: string
                     message:
                       description: |-
                         Human-readable detail from the child workload's conditions.
