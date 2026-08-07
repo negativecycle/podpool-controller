@@ -28,7 +28,7 @@ var _ = Describe("CRD schema validation", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: podpoolsv1alpha1.PodPoolSpec{
 				Replicas:         2,
-				WorkloadTemplate: workloadTemplateWithSelector(labelKeyApp),
+				WorkloadTemplate: workloadTemplateJSON(testAppsV1, testDepKind, testContainer),
 				Groups: []podpoolsv1alpha1.GroupSpec{
 					{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minTwo}},
 				},

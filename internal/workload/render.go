@@ -80,8 +80,39 @@ func BuildChildWorkload(
 		return nil, errors.New("workload has no .spec.template")
 	}
 
-	if _, ok := templateRaw.(map[string]any); !ok {
+	templateMap, ok := templateRaw.(map[string]any)
+	if !ok {
 		return nil, errors.New("workload has no .spec.template")
+	}
+
+	controllerLabels := map[string]string{
+		LabelPool:      pool.Name,
+		LabelGroup:     group.Name,
+		LabelManagedBy: ManagerName,
+	}
+
+	mdRaw, _ := templateMap["metadata"].(map[string]any)
+	if mdRaw == nil {
+		mdRaw = make(map[string]any)
+		templateMap["metadata"] = mdRaw
+	}
+
+	labelsRaw, _ := mdRaw["labels"].(map[string]any)
+	if labelsRaw == nil {
+		labelsRaw = make(map[string]any)
+		mdRaw["labels"] = labelsRaw
+	}
+
+	for k, v := range controllerLabels {
+		labelsRaw[k] = v
+	}
+
+	matchLabels := map[string]any{
+		LabelPool:  pool.Name,
+		LabelGroup: group.Name,
+	}
+	if err := unstructured.SetNestedMap(child.Object, matchLabels, "spec", "selector", "matchLabels"); err != nil {
+		return nil, err
 	}
 
 	if err := unstructured.SetNestedField(child.Object, int64(replicas), "spec", "replicas"); err != nil {
@@ -90,6 +121,14 @@ func BuildChildWorkload(
 
 	child.SetName(ChildName(pool.Name, group.Name))
 	child.SetNamespace(pool.Namespace)
+
+	childLabels := child.GetLabels()
+	if childLabels == nil {
+		childLabels = make(map[string]string)
+	}
+
+	maps.Copy(childLabels, controllerLabels)
+	child.SetLabels(childLabels)
 
 	child.SetOwnerReferences([]metav1.OwnerReference{{
 		APIVersion:         podpoolsv1alpha1.SchemeGroupVersion.String(),

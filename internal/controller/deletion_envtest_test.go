@@ -42,7 +42,7 @@ var _ = Describe("Terminating pool", func() {
 			},
 			Spec: podpoolsv1alpha1.PodPoolSpec{
 				Replicas:         2,
-				WorkloadTemplate: workloadTemplateWithSelector("del-app"),
+				WorkloadTemplate: workloadTemplateJSON(testAppsV1, testDepKind, testContainer),
 				Groups: []podpoolsv1alpha1.GroupSpec{
 					{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minTwo}},
 				},

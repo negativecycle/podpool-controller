@@ -36,10 +36,7 @@ const (
 	fieldAPIVersion      = "apiVersion"
 	fieldKind            = "kind"
 	fieldMetadata        = "metadata"
-	fieldLabels          = "labels"
 	fieldSpec            = "spec"
-	fieldSelector        = "selector"
-	fieldMatchLabels     = "matchLabels"
 	fieldTemplate        = "template"
 	fieldContainers      = "containers"
 	fieldName            = "name"
@@ -47,11 +44,9 @@ const (
 	fieldUID             = "uid"
 	fieldResourceVersion = "resourceVersion"
 	fieldFinalizers      = "finalizers"
-
-	labelKeyApp = "app"
 )
 
-func workloadTemplateJSON(apiVersion, kind, containerName, image string) runtime.RawExtension {
+func workloadTemplateJSON(apiVersion, kind, containerName string) runtime.RawExtension {
 	tmpl := map[string]any{
 		fieldAPIVersion: apiVersion,
 		fieldKind:       kind,
@@ -61,41 +56,6 @@ func workloadTemplateJSON(apiVersion, kind, containerName, image string) runtime
 					fieldContainers: []any{
 						map[string]any{
 							fieldName:  containerName,
-							fieldImage: image,
-						},
-					},
-				},
-			},
-		},
-	}
-	raw, _ := json.Marshal(tmpl)
-
-	return runtime.RawExtension{Raw: raw}
-}
-
-// workloadTemplateWithSelector is workloadTemplateJSON plus a user-supplied
-// pod selector and matching template labels, always as an apps/v1 Deployment
-// because that is the kind whose schema demands a selector. The controller
-// does not manage selectors yet, so every template destined for a real API
-// server has to carry its own. Note what that costs: two groups rendered from
-// this one template get identical selectors and fight over the same pods,
-// which is exactly the gap the ownership milestone closes.
-func workloadTemplateWithSelector(appLabel string) runtime.RawExtension {
-	tmpl := map[string]any{
-		fieldAPIVersion: testAppsV1,
-		fieldKind:       testDepKind,
-		fieldSpec: map[string]any{
-			fieldSelector: map[string]any{
-				fieldMatchLabels: map[string]any{labelKeyApp: appLabel},
-			},
-			fieldTemplate: map[string]any{
-				fieldMetadata: map[string]any{
-					fieldLabels: map[string]any{labelKeyApp: appLabel},
-				},
-				fieldSpec: map[string]any{
-					fieldContainers: []any{
-						map[string]any{
-							fieldName:  testContainer,
 							fieldImage: testImageNginx,
 						},
 					},
