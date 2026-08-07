@@ -18,7 +18,7 @@ func conditionByType(pool *podpoolsv1alpha1.PodPool, condType string) *metav1.Co
 // reconciled, nothing available, still progressing.
 func TestConditionsOnFreshPool(t *testing.T) {
 	pool := fakeTestPool()
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	reconcilePool(t, r, pool)
 
@@ -50,7 +50,7 @@ func TestConditionsNameTheFailingGroup(t *testing.T) {
 	pool := fakeTestPool()
 	breakGroup(pool)
 
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	_ = tryReconcilePool(r, pool)
 
@@ -68,7 +68,7 @@ func TestConditionsPromoteOwnershipConflict(t *testing.T) {
 	pool := fakeTestPool()
 	dep := foreignDeployment(pool.Name+"-"+testGroupBase, testNamespace)
 
-	r, cl := newFakeReconciler(t, pool, dep)
+	r, cl := newFakeReconciler(t, nil, pool, dep)
 
 	_ = tryReconcilePool(r, pool)
 
@@ -87,7 +87,7 @@ func TestConditionsOnInvalidTemplate(t *testing.T) {
 	pool := fakeTestPool()
 	pool.Spec.WorkloadTemplate = runtime.RawExtension{Raw: []byte(`{"spec": {}}`)}
 
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	if err := tryReconcilePool(r, pool); err != nil {
 		t.Fatalf("Reconcile returned %v, want nil: a spec error is reported, not retried", err)
@@ -112,7 +112,7 @@ func TestConditionsOnFullyCappedPool(t *testing.T) {
 		{Name: testGroupSpot, Scaling: podpoolsv1alpha1.ScalingConstraints{Target: pctTarget(50)}},
 	}
 
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	reconcilePool(t, r, pool)
 
@@ -172,7 +172,7 @@ func TestReadyMessagesFitTheColumnBudget(t *testing.T) {
 // pool healthy?" and each gets it slightly wrong.
 func TestReadySummarisesTheFourConditions(t *testing.T) {
 	pool := fakeTestPool()
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	reconcilePool(t, r, pool)
 

@@ -12,7 +12,7 @@ import (
 // workloadRef that the stale-kind sweep depends on, and a share of the pool.
 func TestGroupStatusRowsPopulated(t *testing.T) {
 	pool := fakeTestPool()
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	reconcilePool(t, r, pool)
 
@@ -80,7 +80,7 @@ func TestGroupStatusRowsPopulated(t *testing.T) {
 // the reason its error path assigned.
 func TestGroupReasonsFollowReadiness(t *testing.T) {
 	pool := fakeTestPool()
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	reconcilePool(t, r, pool)
 
@@ -98,7 +98,7 @@ func TestFailedGroupRowKeepsErrorReason(t *testing.T) {
 	pool := fakeTestPool()
 	breakGroup(pool)
 
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	_ = tryReconcilePool(r, pool)
 

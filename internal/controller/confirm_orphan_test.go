@@ -43,7 +43,7 @@ func deleteAll(string) bool { return false }
 // until the next pass.
 func TestConfirmOrphanTreatsNotFoundAsAlreadyGone(t *testing.T) {
 	pool := fakeTestPool()
-	r, _ := newFakeReconciler(t, pool)
+	r, _ := newFakeReconciler(t, nil, pool)
 
 	fresh, err := r.confirmOrphan(t.Context(), pool, orphanCandidate("gone"), orphanGVK, deleteAll)
 	if err != nil {
@@ -98,7 +98,7 @@ func TestConfirmOrphanReturnsAConfirmedCandidate(t *testing.T) {
 		Controller: ptr.To(true),
 	}})
 
-	r, _ := newFakeReconciler(t, pool, child)
+	r, _ := newFakeReconciler(t, nil, pool, child)
 
 	fresh, err := r.confirmOrphan(t.Context(), pool, orphanCandidate("orphaned-child"), orphanGVK, deleteAll)
 	if err != nil {

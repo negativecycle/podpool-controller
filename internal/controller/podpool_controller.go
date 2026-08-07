@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"sync"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -110,7 +111,7 @@ type PodPoolReconciler struct {
 // Reconcile moves the cluster toward the pool's desired state. Everything
 // starts from a fresh read of the pool: the request carries only a name, and
 // the object may have changed, or vanished, since the event that queued it.
-func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reterr error) {
 	var pool podpoolsv1alpha1.PodPool
 	if err := r.Get(ctx, req.NamespacedName, &pool); err != nil {
 		// NotFound is not an error: the pool was deleted between the event
@@ -131,6 +132,15 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
+	// Everything below mutates pool.Status in place; this writes it back once,
+	// on every exit path, and only when it actually differs from what we read.
+	before := pool.DeepCopy()
+	defer func() {
+		if err := r.patchStatus(ctx, before, &pool); err != nil {
+			reterr = kerrors.NewAggregate([]error{reterr, err})
+		}
+	}()
+
 	// Asked before any expensive work: a template that is not even
 	// addressable (no apiVersion or kind) cannot be rendered for any group.
 	// The error is the pool's own, not any group's, and no retry fixes a
@@ -142,10 +152,6 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			desired:     pool.Spec.Replicas,
 			poolInvalid: true,
 		})
-
-		if err := r.Status().Patch(ctx, &pool, client.Merge); err != nil {
-			return ctrl.Result{}, fmt.Errorf("writing status: %w", err)
-		}
 
 		return ctrl.Result{}, nil
 	}
@@ -168,9 +174,10 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	var failedGroups, notOwnedGroups []string
 
-	// The status this pass read, before anything below overwrites it. Failed
-	// groups carry their previous row forward from here.
-	prevGroups := pool.Status.Groups
+	// The deep copy taken at the top is the status this pass read, before
+	// anything below overwrites it. Failed groups carry their previous row
+	// forward from here.
+	prevGroups := before.Status.Groups
 
 	reconciledGroups := make(map[string]bool, len(pool.Spec.Groups))
 	childByGroup := make(map[string]*unstructured.Unstructured, len(pool.Spec.Groups))
@@ -230,7 +237,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		groupStatuses = append(groupStatuses, grResult.status)
 	}
 
-	if sweepErrs := r.sweepAllOrphans(ctx, &pool, gvk, reconciledGroups); len(sweepErrs) > 0 {
+	if sweepErrs := r.sweepAllOrphans(ctx, before, &pool, gvk, reconciledGroups); len(sweepErrs) > 0 {
 		errs = append(errs, sweepErrs...)
 	}
 
@@ -272,16 +279,6 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		notOwnedGroups: notOwnedGroups,
 	})
 
-	// A merge patch rather than an update: an update carries the object's
-	// resourceVersion and conflicts whenever anything else touched the pool
-	// mid-pass, including this controller's own previous write, and every
-	// conflict is a full retry of the pass. Status is this controller's to
-	// state, so last-writer-wins is correct here. The remaining sharp edges
-	// of this write are a dedicated commit later in the milestone.
-	if err := r.Status().Patch(ctx, &pool, client.Merge); err != nil {
-		errs = append(errs, fmt.Errorf("writing status: %w", err))
-	}
-
 	return ctrl.Result{}, kerrors.NewAggregate(errs)
 }
 
@@ -291,6 +288,25 @@ func (r *PodPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&podpoolsv1alpha1.PodPool{}).
 		Named("podpool").
 		Complete(r)
+}
+
+// patchStatus writes the pass's status exactly once, and only when it differs
+// from what the pass read. Writing unconditionally has two costs the naive
+// version paid: an identical write still round-trips to the API server on
+// every pass, and the controller's own write event wakes it again, a quiet
+// self-sustaining loop. NotFound is tolerated because a pool deleted mid-pass
+// has nothing left to report to.
+func (r *PodPoolReconciler) patchStatus(ctx context.Context, before, after *podpoolsv1alpha1.PodPool) error {
+	if apiequality.Semantic.DeepEqual(before.Status, after.Status) {
+		return nil
+	}
+
+	err := r.Status().Patch(ctx, after, client.MergeFrom(before))
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	return err
 }
 
 func (r *PodPoolReconciler) reconcileGroup(
@@ -497,6 +513,7 @@ func (r *PodPoolReconciler) reconcileWorkload(
 // worst defer a real orphan to the next pass.
 func (r *PodPoolReconciler) sweepAllOrphans(
 	ctx context.Context,
+	before *podpoolsv1alpha1.PodPool,
 	pool *podpoolsv1alpha1.PodPool,
 	gvk schema.GroupVersionKind,
 	reconciledGroups map[string]bool,
@@ -522,7 +539,7 @@ func (r *PodPoolReconciler) sweepAllOrphans(
 	// A stale-GVK child shares its replacement's name, so activeChildren alone
 	// says "keep" for both. The reconciled term is what distinguishes them;
 	// without it the entire pre-change workload set leaks.
-	for _, staleGVK := range staleWorkloadGVKs(pool.Status.Groups, gvk) {
+	for _, staleGVK := range staleWorkloadGVKs(before.Status.Groups, gvk) {
 		if err := r.sweepOrphans(ctx, r.APIReader, pool, staleGVK,
 			func(name string) bool { return activeChildren[name] && !reconciledChildren[name] },
 			"group %s: workload kind changed",

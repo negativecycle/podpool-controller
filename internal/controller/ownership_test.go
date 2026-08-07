@@ -151,7 +151,7 @@ func TestReconcileRefusesForeignChild(t *testing.T) {
 	pool := fakeTestPool()
 	dep := foreignDeployment(pool.Name+"-"+testGroupBase, testNamespace)
 
-	r, _ := newFakeReconciler(t, pool, dep)
+	r, _ := newFakeReconciler(t, nil, pool, dep)
 
 	err := tryReconcilePool(r, pool)
 	if err == nil {

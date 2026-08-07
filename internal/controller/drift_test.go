@@ -33,7 +33,7 @@ func getChild(t *testing.T, cl client.Client, poolName string) *appsv1.Deploymen
 // because ownership is tracked field by field on the server.
 func TestReconcileRevertsChildSpecDrift(t *testing.T) {
 	pool := fakeTestPool()
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	reconcilePool(t, r, pool)
 
@@ -75,7 +75,7 @@ func TestReconcileRevertsChildSpecDrift(t *testing.T) {
 // server — see "does not rewrite a converged child" in drift_envtest_test.go.
 func TestReconcileIsStableWithoutDrift(t *testing.T) {
 	pool := fakeTestPool()
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	reconcilePool(t, r, pool)
 	first := getChild(t, cl, pool.Name)

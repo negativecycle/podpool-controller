@@ -21,7 +21,7 @@ func TestReconcileSkipsTerminatingPool(t *testing.T) {
 	pool := fakeTestPool()
 	pool.Finalizers = []string{"test.podpools.dev/hold"}
 
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	// Delete through the client so the fake sets deletionTimestamp; the
 	// finalizer holds the object, same as the real server.

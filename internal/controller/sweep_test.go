@@ -18,7 +18,7 @@ import (
 // running unless the sweep deletes it; and the survivor must be untouched.
 func TestSweepDeletesChildOfRemovedGroup(t *testing.T) {
 	pool := fakeTestPool()
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	reconcilePool(t, r, pool)
 
@@ -137,7 +137,7 @@ func TestStaleWorkloadGVKs(t *testing.T) {
 // from spec and immutable, so a stale read can at worst defer a real orphan.
 func TestSweepIgnoresDriftedGroupLabel(t *testing.T) {
 	pool := fakeTestPool()
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	reconcilePool(t, r, pool)
 
@@ -164,7 +164,7 @@ func TestSweepIgnoresDriftedGroupLabel(t *testing.T) {
 // confirmed, so a newcomer at the same name survives the race.
 func TestSweepDeleteCarriesUIDPrecondition(t *testing.T) {
 	pool := fakeTestPool()
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	reconcilePool(t, r, pool)
 

@@ -52,7 +52,7 @@ func TestReconcileContinuesPastFailingGroup(t *testing.T) {
 	pool := fakeTestPool()
 	breakGroup(pool)
 
-	r, cl := newFakeReconciler(t, pool)
+	r, cl := newFakeReconciler(t, nil, pool)
 
 	err := tryReconcilePool(r, pool)
 	if err == nil {

@@ -22,13 +22,18 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
 
+// statusPatches counts status patches that actually reach the API server, as
+// opposed to the ones patchStatus discards for being empty.
+type statusPatches struct{ n int }
+
 // newFakeReconciler builds a reconciler over a fake client, so Reconcile runs
 // end to end without a manager or an API server.
-func newFakeReconciler(t *testing.T, objs ...client.Object) (*PodPoolReconciler, client.Client) {
+func newFakeReconciler(t *testing.T, counter *statusPatches, objs ...client.Object) (*PodPoolReconciler, client.Client) {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
@@ -40,11 +45,26 @@ func newFakeReconciler(t *testing.T, objs ...client.Object) (*PodPoolReconciler,
 		t.Fatalf("adding podpools scheme: %v", err)
 	}
 
-	cl := fake.NewClientBuilder().
+	builder := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&podpoolsv1alpha1.PodPool{}).
-		WithObjects(objs...).
-		Build()
+		WithObjects(objs...)
+
+	if counter != nil {
+		builder = builder.WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, subResource string,
+				obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption,
+			) error {
+				if subResource == "status" {
+					counter.n++
+				}
+
+				return c.SubResource(subResource).Patch(ctx, obj, patch, opts...)
+			},
+		})
+	}
+
+	cl := builder.Build()
 
 	return &PodPoolReconciler{Client: cl, Scheme: scheme, APIReader: cl}, cl
 }
