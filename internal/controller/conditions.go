@@ -34,6 +34,29 @@ const (
 	ReasonPoolReady                  = "PoolReady"
 )
 
+// retiredConditionTypes are condition types this controller used to publish
+// and no longer does. They are removed from status on every reconcile, because
+// meta.SetStatusCondition can only upsert: nothing else in the write path can
+// express a deletion, so a pool stored before a type was retired would carry
+// it forever and keep reporting a signal nobody computes.
+//
+// The list is empty today, and building the mechanism before the first rename
+// needs it is the point. Renaming a condition type is not a refactor; it is a
+// change to a persisted, user-visible API surface, and it needs the same
+// treatment as renaming a status field: write the new one, retire the old one,
+// clean up what the old one left behind. Retire-the-old is the missing
+// two-thirds of every rename, and by the time it is needed the person doing
+// the rename is thinking about the new name, not the stored objects.
+//
+// This is deliberately a list of our own retired names rather than "prune
+// anything outside the set we publish". The conditions array is a shared,
+// extensible contract: kstatus, policy engines, and GitOps tooling read it and
+// some write to it. Deleting another actor's condition on every reconcile is a
+// far worse bug than leaving one stale entry, and nearly undiagnosable from
+// the other side. TestForeignConditionIsNotPruned exists to fail loudly if
+// anyone later "simplifies" this into an allow-list.
+var retiredConditionTypes = []string{}
+
 type conditionInputs struct {
 	targetDegraded bool
 	unplaced       int32
@@ -61,6 +84,15 @@ type conditionInputs struct {
 // than having neither.
 func setConditions(pool *podpoolsv1alpha1.PodPool, in conditionInputs) {
 	gen := pool.Generation
+
+	// Above every SetStatusCondition call, so a retired type can never be
+	// pruned and re-added in the same pass. That cannot happen today, since a
+	// retired type is by definition not in the live set, but the ordering
+	// makes it structural rather than incidental. Here rather than in
+	// Reconcile because conditions have one writer.
+	for _, t := range retiredConditionTypes {
+		meta.RemoveStatusCondition(&pool.Status.Conditions, t)
+	}
 
 	pool.Status.ObservedGeneration = gen
 
