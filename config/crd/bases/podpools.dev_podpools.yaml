@@ -14,7 +14,34 @@ spec:
     singular: podpool
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - description: Replicas requested by spec
+      jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - description: Replicas reported ready by child workloads
+      jsonPath: .status.readyReplicas
+      name: Ready
+      type: integer
+    - description: Summary of the Ready condition
+      jsonPath: .status.conditions[?(@.type=="Ready")].message
+      name: Status
+      type: string
+    - description: Number of groups in the pool
+      jsonPath: .status.groupCount
+      name: Groups
+      priority: 1
+      type: integer
+    - description: Machine-readable reason for the Ready condition
+      jsonPath: .status.conditions[?(@.type=="Ready")].reason
+      name: Reason
+      priority: 1
+      type: string
+    - description: Time since the pool was created
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: PodPool is the Schema for the podpools API.
@@ -138,7 +165,8 @@ spec:
                 description: |-
                   Total number of pod replicas to distribute across all groups. Each
                   group receives a share of this total according to its scaling
-                  constraints.
+                  constraints. An HPA targeting the pool's /scale subresource writes
+                  this field directly.
                 format: int32
                 maximum: 1000000
                 minimum: 0
@@ -361,4 +389,8 @@ spec:
     served: true
     storage: true
     subresources:
+      scale:
+        labelSelectorPath: .status.selector
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.replicas
       status: {}

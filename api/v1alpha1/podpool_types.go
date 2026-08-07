@@ -26,7 +26,8 @@ import (
 type PodPoolSpec struct {
 	// Total number of pod replicas to distribute across all groups. Each
 	// group receives a share of this total according to its scaling
-	// constraints.
+	// constraints. An HPA targeting the pool's /scale subresource writes
+	// this field directly.
 	// +required
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=1000000
@@ -258,6 +259,13 @@ type WorkloadReference struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector
+// +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.spec.replicas`,description="Replicas requested by spec"
+// +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyReplicas`,description="Replicas reported ready by child workloads"
+// +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].message`,description="Summary of the Ready condition"
+// +kubebuilder:printcolumn:name="Groups",type=integer,JSONPath=`.status.groupCount`,priority=1,description="Number of groups in the pool"
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`,priority=1,description="Machine-readable reason for the Ready condition"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`,description="Time since the pool was created"
 
 // PodPool is the Schema for the podpools API.
 type PodPool struct {
