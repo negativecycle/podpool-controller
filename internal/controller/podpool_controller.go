@@ -342,8 +342,26 @@ func (r *PodPoolReconciler) sweepOrphans(
 		log.Info("Deleting orphaned workload", "workload", klog.KObj(item),
 			"reason", fmt.Sprintf(reasonFmt, groupLabel))
 
-		if err := r.Delete(ctx, item); err != nil && !apierrors.IsNotFound(err) {
-			return err
+		// Bind the delete to the object we confirmed. Without it, a name freed
+		// and reused between the confirm and the delete takes the newcomer.
+		// UID and not ResourceVersion: identity is what needs guarding here,
+		// and an RV precondition would 409 on any unrelated concurrent write to
+		// a legitimately orphaned object.
+		uid := fresh.GetUID()
+
+		if err := r.Delete(ctx, item, client.Preconditions{UID: &uid}); err != nil {
+			if !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+				return err
+			}
+
+			// The object moved under us. Nothing was deleted, so nothing is
+			// reported; the next reconcile decides against whatever is there
+			// now. Returning this would back the whole pool off for a benign
+			// race.
+			log.V(4).Info("Orphan changed under the sweep, leaving it to the next pass",
+				"workload", klog.KObj(item), "err", err)
+
+			continue
 		}
 	}
 
