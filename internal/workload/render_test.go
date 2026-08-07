@@ -12,6 +12,9 @@ import (
 
 const (
 	testGroupBurst = "burst"
+
+	fieldStatus   = "status"
+	fieldReplicas = "replicas"
 )
 
 func TestChildName(t *testing.T) {
@@ -275,5 +278,42 @@ func TestBuildChildWorkloadStripsPastedMetadata(t *testing.T) {
 	refs := child.GetOwnerReferences()
 	if len(refs) != 1 || refs[0].Kind != KindPodPool {
 		t.Errorf("pasted ownerReferences were not replaced by the pool's: %+v", refs)
+	}
+}
+
+func TestReadInt32(t *testing.T) {
+	t.Parallel()
+
+	child := &unstructured.Unstructured{Object: map[string]any{
+		fieldStatus: map[string]any{
+			fieldReplicas:  int64(4),
+			"readyBadType": "three",
+		},
+	}}
+
+	tests := []struct {
+		name   string
+		fields []string
+		want   int32
+		wantOK bool
+	}{
+		{"present", []string{fieldStatus, fieldReplicas}, 4, true},
+		// omitempty on the built-in types makes absent the ordinary state of
+		// a healthy child reporting zero; ok=false is not a diagnosis.
+		{"absent leaf", []string{fieldStatus, "readyReplicas"}, 0, false},
+		{"absent branch", []string{"nowhere", fieldReplicas}, 0, false},
+		{"wrong type", []string{fieldStatus, "readyBadType"}, 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, ok := ReadInt32(child, tt.fields...)
+			if got != tt.want || ok != tt.wantOK {
+				t.Errorf("ReadInt32(%v) = (%d, %v), want (%d, %v)",
+					tt.fields, got, ok, tt.want, tt.wantOK)
+			}
+		})
 	}
 }

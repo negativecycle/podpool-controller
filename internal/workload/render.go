@@ -126,3 +126,20 @@ func stripPastedMetadata(obj map[string]any) {
 		}
 	}
 }
+
+// ReadInt32 reads an integer status field from a child workload, returning
+// ok=false when the field is absent or unreadable.
+//
+// Absent is also the ordinary state of a healthy child: these fields are
+// omitempty on the built-in types, so a count of zero and a field the kind
+// never publishes are the same wire state. Treat ok=false as "zero for now",
+// never as "this kind does not publish the field"; only elapsed time can
+// separate those readings.
+func ReadInt32(obj *unstructured.Unstructured, fields ...string) (int32, bool) {
+	v, found, err := unstructured.NestedInt64(obj.Object, fields...)
+	if err != nil || !found {
+		return 0, false
+	}
+
+	return int32(v), true //nolint:gosec // counts are small in practice; revisited when a hostile child is considered
+}
