@@ -328,7 +328,16 @@ func (r *PodPoolReconciler) sweepOrphans(
 			continue
 		}
 
-		groupLabel := item.GetLabels()[workload.LabelGroup]
+		fresh, err := r.confirmOrphan(ctx, pool, item, gvk, keep)
+		if err != nil {
+			return err
+		}
+
+		if fresh == nil {
+			continue
+		}
+
+		groupLabel := fresh.GetLabels()[workload.LabelGroup]
 
 		log.Info("Deleting orphaned workload", "workload", klog.KObj(item),
 			"reason", fmt.Sprintf(reasonFmt, groupLabel))
@@ -339,6 +348,44 @@ func (r *PodPoolReconciler) sweepOrphans(
 	}
 
 	return nil
+}
+
+// confirmOrphan re-reads a delete candidate straight from the API server and
+// re-runs both tests against the result. A nil object means leave it alone:
+// already gone, no longer ours, or no longer an orphan.
+//
+// Keying the sweep on the name settles the keep predicate, but the ownership
+// check still ran on a cached copy. A user who adopts a genuinely orphaned
+// child by removing our controller reference would have their object deleted
+// off a cache that still showed it. The create path already confirms absence
+// with an uncached read before its first apply; this is the counterpart the
+// delete path never had.
+//
+// It costs nothing in steady state: the read happens only for objects already
+// selected for deletion, which is empty unless a group was actually removed.
+func (r *PodPoolReconciler) confirmOrphan(
+	ctx context.Context,
+	pool *podpoolsv1alpha1.PodPool,
+	item *unstructured.Unstructured,
+	gvk schema.GroupVersionKind,
+	keep func(childName string) bool,
+) (*unstructured.Unstructured, error) {
+	fresh := &unstructured.Unstructured{}
+	fresh.SetGroupVersionKind(gvk)
+
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(item), fresh); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	if !isControlledBy(fresh, pool) || keep(fresh.GetName()) {
+		return nil, nil
+	}
+
+	return fresh, nil
 }
 
 // staleWorkloadGVKs returns the distinct GVKs recorded in the previous
