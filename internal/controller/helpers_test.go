@@ -18,9 +18,17 @@ package controller
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
+
+func pctTarget(pct int32) *intstr.IntOrString {
+	v := intstr.FromString(fmt.Sprintf("%d%%", pct))
+
+	return &v
+}
 
 // Shared fixtures for the CRD-only suite. The controller tests and their
 // harness arrive with the reconciler and take these over then.
