@@ -27,9 +27,10 @@ import (
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
 
-// PodPoolReconciler reconciles a PodPool object
+// PodPoolReconciler reconciles a PodPool object.
 type PodPoolReconciler struct {
 	client.Client
+
 	Scheme *runtime.Scheme
 }
 

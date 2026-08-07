@@ -47,6 +47,7 @@ var _ = Describe("PodPool Controller", func() {
 
 		BeforeEach(func() {
 			By("creating the custom resource for the Kind PodPool")
+
 			err := k8sClient.Get(ctx, typeNamespacedName, podpool)
 			if err != nil && errors.IsNotFound(err) {
 				resource := &podpoolsv1alpha1.PodPool{
@@ -71,6 +72,7 @@ var _ = Describe("PodPool Controller", func() {
 		})
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
+
 			controllerReconciler := &PodPoolReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),

@@ -24,7 +24,7 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// PodPoolSpec defines the desired state of PodPool
+// PodPoolSpec defines the desired state of PodPool.
 type PodPoolSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
@@ -62,7 +62,7 @@ type PodPoolStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 
-// PodPool is the Schema for the podpools API
+// PodPool is the Schema for the podpools API.
 type PodPool struct {
 	metav1.TypeMeta `json:",inline"`
 
@@ -81,16 +81,18 @@ type PodPool struct {
 
 // +kubebuilder:object:root=true
 
-// PodPoolList contains a list of PodPool
+// PodPoolList contains a list of PodPool.
 type PodPoolList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitzero"`
-	Items           []PodPool `json:"items"`
+
+	Items []PodPool `json:"items"`
 }
 
 func init() {
 	SchemeBuilder.Register(func(s *runtime.Scheme) error {
 		s.AddKnownTypes(SchemeGroupVersion, &PodPool{}, &PodPoolList{})
+
 		return nil
 	})
 }
