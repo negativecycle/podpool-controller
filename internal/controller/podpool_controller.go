@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -140,6 +141,13 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 			reterr = kerrors.NewAggregate([]error{reterr, err})
 		}
 	}()
+
+	// Above every early return, deliberately. The scale subresource's
+	// selectorpath points here, so a pool created with an unparseable
+	// template would otherwise expose an empty selector to every HPA reading
+	// /scale for as long as it stayed in that state. It is derived from the
+	// pool name alone, so no early path lacks anything it needs.
+	pool.Status.Selector = labels.Set{workload.LabelPool: pool.Name}.String()
 
 	// Asked before any expensive work: a template that is not even
 	// addressable (no apiVersion or kind) cannot be rendered for any group.
