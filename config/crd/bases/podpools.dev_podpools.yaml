@@ -161,15 +161,9 @@ spec:
             properties:
               conditions:
                 description: |-
-                  conditions represent the current state of the PodPool resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                  Standard conditions summarising pool health. Ready is the single
+                  top-level signal; Progressing, TargetDegraded, and GroupsReady
+                  provide detail.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -224,10 +218,142 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 32
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              groupCount:
+                description: |-
+                  Number of groups defined in the spec. Projected into a print
+                  column so kubectl get shows the pool's fan-out at a glance.
+                format: int32
+                type: integer
+              groups:
+                description: Per-group observed state, one entry per spec.groups entry.
+                items:
+                  description: GroupStatus reflects the observed state of a single
+                    group.
+                  properties:
+                    message:
+                      description: |-
+                        Human-readable detail from the child workload's conditions.
+                        Best-effort: present when the child publishes a standard condition
+                        explaining the problem, absent for workload types that publish no
+                        conditions (e.g. StatefulSet, DaemonSet).
+                      maxLength: 512
+                      type: string
+                    name:
+                      description: Name of the group, matching the corresponding spec
+                        entry.
+                      minLength: 1
+                      type: string
+                    ready:
+                      description: |-
+                        Whether this group has at least its target replicas ready. False
+                        also covers "not yet known"; see Reason for which case applies.
+                      type: boolean
+                    readyReplicas:
+                      description: Ready replicas reported by this group's child workload.
+                      format: int32
+                      type: integer
+                    reason:
+                      description: |-
+                        Machine-readable reason for Ready. A closed set owned by this
+                        API; values are the same vocabulary the pool-level conditions use.
+                      minLength: 1
+                      type: string
+                    replicas:
+                      description: Replicas reported by this group's child workload.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    sharePercent:
+                      description: |-
+                        This group's share of the pool's total observed replicas, as a percentage.
+                        Calculated from observed replicas, not from the distribution target.
+                      format: int32
+                      type: integer
+                    targetReplicas:
+                      description: |-
+                        What the distribution asked this group to run. Differs from
+                        Replicas while a rollout is in progress or the child has not
+                        yet converged.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    updatedReplicas:
+                      description: |-
+                        Updated replicas reported by this group's child workload.
+                        Tracked per group so that a group which fails to reconcile can keep its
+                        last observed counts without dragging the pool total down.
+                      format: int32
+                      type: integer
+                    workloadRef:
+                      description: Reference to the child workload this group owns.
+                      properties:
+                        apiVersion:
+                          description: API group and version of the child workload,
+                            e.g. "apps/v1".
+                          minLength: 1
+                          type: string
+                        kind:
+                          description: Kind of the child workload, e.g. "Deployment".
+                          minLength: 1
+                          type: string
+                        name:
+                          description: Name of the child workload, always <pool>-<group>.
+                          minLength: 1
+                          type: string
+                      required:
+                      - apiVersion
+                      - kind
+                      - name
+                      type: object
+                  required:
+                  - name
+                  - ready
+                  - reason
+                  - replicas
+                  - targetReplicas
+                  type: object
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: |-
+                  The generation of the spec this status reflects. Lags
+                  metadata.generation when the controller has not yet reconciled
+                  the latest edit.
+                format: int64
+                type: integer
+              readyReplicas:
+                description: Total ready replicas reported by all child workloads.
+                format: int32
+                type: integer
+              replicas:
+                description: Total replicas reported by all child workloads.
+                format: int32
+                type: integer
+              selector:
+                description: |-
+                  Label selector serialized as a string, used by the /scale
+                  subresource to identify pods belonging to this pool.
+                type: string
+              unplacedReplicas:
+                description: |-
+                  Replicas that no group could accept without exceeding a ceiling the user
+                  set. Non-zero only when every group is capped, in which case the pool
+                  deliberately runs below spec.replicas rather than overspending on a tier
+                  that was limited on purpose.
+                format: int32
+                type: integer
+              updatedReplicas:
+                description: Total updated replicas reported by all child workloads.
+                format: int32
+                type: integer
             type: object
         required:
         - spec

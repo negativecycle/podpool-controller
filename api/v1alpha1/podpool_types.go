@@ -128,19 +128,132 @@ type ScalingConstraints struct {
 
 // PodPoolStatus defines the observed state of PodPool.
 type PodPoolStatus struct {
-	// conditions represent the current state of the PodPool resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
+	// Standard conditions summarising pool health. Ready is the single
+	// top-level signal; Progressing, TargetDegraded, and GroupsReady
+	// provide detail.
+	// +kubebuilder:validation:MaxItems=32
 	// +listType=map
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// The generation of the spec this status reflects. Lags
+	// metadata.generation when the controller has not yet reconciled
+	// the latest edit.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Total replicas reported by all child workloads.
+	// +optional
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// Total ready replicas reported by all child workloads.
+	// +optional
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+
+	// Total updated replicas reported by all child workloads.
+	// +optional
+	UpdatedReplicas int32 `json:"updatedReplicas,omitempty"`
+
+	// Replicas that no group could accept without exceeding a ceiling the user
+	// set. Non-zero only when every group is capped, in which case the pool
+	// deliberately runs below spec.replicas rather than overspending on a tier
+	// that was limited on purpose.
+	// +optional
+	UnplacedReplicas int32 `json:"unplacedReplicas,omitempty"`
+
+	// Label selector serialized as a string, used by the /scale
+	// subresource to identify pods belonging to this pool.
+	// +optional
+	Selector string `json:"selector,omitempty"`
+
+	// Number of groups defined in the spec. Projected into a print
+	// column so kubectl get shows the pool's fan-out at a glance.
+	// +optional
+	GroupCount int32 `json:"groupCount,omitempty"`
+
+	// Per-group observed state, one entry per spec.groups entry.
+	// +kubebuilder:validation:MaxItems=32
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Groups []GroupStatus `json:"groups,omitempty"`
+}
+
+// GroupStatus reflects the observed state of a single group.
+type GroupStatus struct {
+	// Name of the group, matching the corresponding spec entry.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Whether this group has at least its target replicas ready. False
+	// also covers "not yet known"; see Reason for which case applies.
+	// +required
+	Ready bool `json:"ready"`
+
+	// Machine-readable reason for Ready. A closed set owned by this
+	// API; values are the same vocabulary the pool-level conditions use.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Reason string `json:"reason"`
+
+	// Human-readable detail from the child workload's conditions.
+	// Best-effort: present when the child publishes a standard condition
+	// explaining the problem, absent for workload types that publish no
+	// conditions (e.g. StatefulSet, DaemonSet).
+	// +optional
+	// +kubebuilder:validation:MaxLength=512
+	Message string `json:"message,omitempty"`
+
+	// Replicas reported by this group's child workload.
+	// +required
+	// +kubebuilder:validation:Minimum=0
+	Replicas int32 `json:"replicas"`
+
+	// What the distribution asked this group to run. Differs from
+	// Replicas while a rollout is in progress or the child has not
+	// yet converged.
+	// +required
+	// +kubebuilder:validation:Minimum=0
+	TargetReplicas int32 `json:"targetReplicas"`
+
+	// Ready replicas reported by this group's child workload.
+	// +optional
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+
+	// Updated replicas reported by this group's child workload.
+	// Tracked per group so that a group which fails to reconcile can keep its
+	// last observed counts without dragging the pool total down.
+	// +optional
+	UpdatedReplicas int32 `json:"updatedReplicas,omitempty"`
+
+	// This group's share of the pool's total observed replicas, as a percentage.
+	// Calculated from observed replicas, not from the distribution target.
+	// +optional
+	SharePercent int32 `json:"sharePercent,omitempty"`
+
+	// Reference to the child workload this group owns.
+	// +optional
+	WorkloadRef *WorkloadReference `json:"workloadRef,omitempty"`
+}
+
+// WorkloadReference identifies a child workload owned by the PodPool.
+type WorkloadReference struct {
+	// API group and version of the child workload, e.g. "apps/v1".
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	APIVersion string `json:"apiVersion"`
+
+	// Kind of the child workload, e.g. "Deployment".
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Kind string `json:"kind"`
+
+	// Name of the child workload, always <pool>-<group>.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
 }
 
 // +kubebuilder:object:root=true
