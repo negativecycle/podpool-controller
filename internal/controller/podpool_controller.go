@@ -24,10 +24,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 	"github.com/negativecycle/podpool-controller/internal/workload"
@@ -57,8 +60,8 @@ type PodPoolReconciler struct {
 // +kubebuilder:rbac:groups=podpools.dev,resources=podpools/finalizers,verbs=update
 // Server-side apply against an absent object checks create then patch; both are
 // required or the first reconcile of every child fails.
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;get;list;patch;watch
-// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=create;get;list;patch;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;delete;get;list;patch;watch
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=create;delete;get;list;patch;watch
 
 // Reconcile moves the cluster toward the pool's desired state. Everything
 // starts from a fresh read of the pool: the request carries only a name, and
@@ -86,7 +89,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Asked before any expensive work: a template that is not even
 	// addressable (no apiVersion or kind) cannot be rendered for any group.
-	if _, err := workload.ExtractGVK(pool.Spec.WorkloadTemplate.Raw); err != nil {
+	gvk, err := workload.ExtractGVK(pool.Spec.WorkloadTemplate.Raw)
+	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("extracting workload GVK: %w", err)
 	}
 
@@ -110,6 +114,10 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if _, err := r.reconcileGroup(ctx, &pool, tmpl, group, result.Targets[i]); err != nil {
 			errs = append(errs, fmt.Errorf("group %s: %w", group.Name, err))
 		}
+	}
+
+	if err := r.sweepOrphans(ctx, &pool, gvk); err != nil {
+		errs = append(errs, fmt.Errorf("deleting orphaned workloads: %w", err))
 	}
 
 	return ctrl.Result{}, kerrors.NewAggregate(errs)
@@ -204,6 +212,70 @@ func (r *PodPoolReconciler) reconcileWorkload(
 	}
 
 	return childObservation{}, nil
+}
+
+// sweepOrphans deletes children whose group has left the spec. A pool
+// scaled from three groups to two leaves the third group's child running,
+// invisibly consuming capacity, unless something deletes it.
+//
+// Children are found by the controller's own labels, and a labelled workload
+// this pool does not control is skipped, never deleted: the labels are the
+// search, ownership is the authority. The keep decision keys off spec.groups,
+// so a group that merely failed this pass does not look orphaned; its child
+// stays while the failure is retried.
+func (r *PodPoolReconciler) sweepOrphans(
+	ctx context.Context,
+	pool *podpoolsv1alpha1.PodPool,
+	gvk schema.GroupVersionKind,
+) error {
+	log := logf.FromContext(ctx)
+
+	activeGroups := make(map[string]bool, len(pool.Spec.Groups))
+	for _, g := range pool.Spec.Groups {
+		activeGroups[g.Name] = true
+	}
+
+	listGVK := schema.GroupVersionKind{
+		Group:   gvk.Group,
+		Version: gvk.Version,
+		Kind:    gvk.Kind + "List",
+	}
+
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(listGVK)
+
+	if err := r.List(ctx, list,
+		client.InNamespace(pool.Namespace),
+		client.MatchingLabels{
+			workload.LabelPool:      pool.Name,
+			workload.LabelManagedBy: workload.ManagerName,
+		},
+	); err != nil {
+		return err
+	}
+
+	for i := range list.Items {
+		item := &list.Items[i]
+		if !isControlledBy(item, pool) {
+			log.Info("Skipping labelled workload not controlled by this pool",
+				"workload", klog.KObj(item))
+
+			continue
+		}
+
+		groupLabel := item.GetLabels()[workload.LabelGroup]
+		if activeGroups[groupLabel] {
+			continue
+		}
+
+		log.Info("Deleting orphaned workload", "workload", klog.KObj(item), "group", groupLabel)
+
+		if err := r.Delete(ctx, item); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // applyChild writes the rendered child with server-side apply.
