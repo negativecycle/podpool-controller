@@ -16,18 +16,6 @@ import (
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
 
-// watchPhase tracks how far a GVK's watch has progressed. A watch that has
-// been started but not yet confirmed synced must be re-checked on the next
-// pass, and must not be re-Watched: every Watch call adds another permanent
-// event handler to the informer.
-type watchPhase uint8
-
-const (
-	watchAbsent  watchPhase = iota // never Watched
-	watchStarted                   // Watch called; informer sync unconfirmed
-	watchSynced                    // informer confirmed synced; terminal
-)
-
 // ensureWatch starts watching a workload kind the first time a pool asks for
 // it.
 //
@@ -46,6 +34,10 @@ const (
 // watch's poolPredicate: child watches exist to deliver status changes
 // (readyReplicas), and GenerationChangedPredicate would drop those and
 // freeze every ready count.
+//
+// The invariant is one rule rather than a sequence of states: Watch once per
+// informer instance, verify liveness every pass. Steady state costs a map
+// lookup and two interface calls.
 //
 // Reconcile runs concurrently, so the map needs the mutex. Two pools created
 // at once with the same kind would otherwise race, and a concurrent map
@@ -78,13 +70,33 @@ func (r *PodPoolReconciler) ensureWatch(ctx context.Context, gvk schema.GroupVer
 	// detected synchronously: the informer is constructed inline, so a missing
 	// CRD surfaces as an error here rather than as silence.
 	//
-	// Start the watch at most once. A second Watch for the same GVK would add
-	// a second event handler to the same informer, permanently: every child
-	// event would then enqueue its owner twice.
+	// Fetched before anything is decided, and asked not to block: the
+	// reconcile context has no deadline, so a blocking wait would park a
+	// worker indefinitely on a kind that may never sync.
+	inf, err := r.Cache.GetInformer(ctx, u, cache.BlockUntilSynced(false))
+	if err != nil {
+		return fmt.Errorf("getting informer for %s: %w", gvk, err)
+	}
+
+	// A stopped informer delivers nothing and never restarts. Drop it and
+	// forget the registration; the next pass builds a fresh one and watches
+	// that.
+	if inf.IsStopped() {
+		_ = r.Cache.RemoveInformer(ctx, u)
+
+		r.watchMu.Lock()
+		delete(r.watchStates, gvk)
+		r.watchMu.Unlock()
+
+		return fmt.Errorf("informer for %s stopped; rebuilding", gvk)
+	}
+
+	// Watch once per informer instance. Identity is the whole test: the same
+	// instance already carries our handler and must not get a second one,
+	// while a different instance carries none at all.
 	r.watchMu.Lock()
 
-	phase := r.watchPhases[gvk]
-	if phase == watchAbsent {
+	if r.watchStates[gvk] != inf {
 		if err := r.ctrl.Watch(
 			source.Kind(r.Cache, u,
 				handler.TypedEnqueueRequestForOwner[*unstructured.Unstructured](r.Scheme, r.RESTMapper, &podpoolsv1alpha1.PodPool{}),
@@ -95,29 +107,13 @@ func (r *PodPoolReconciler) ensureWatch(ctx context.Context, gvk schema.GroupVer
 			return fmt.Errorf("setting up watch for %s: %w", gvk, err)
 		}
 
-		r.watchPhases[gvk] = watchStarted
+		r.watchStates[gvk] = inf
 	}
 	r.watchMu.Unlock()
-
-	if phase == watchSynced {
-		return nil
-	}
-
-	// Confirmed outside the lock, and asked not to block: the reconcile
-	// context has no deadline, so a blocking wait inside the mutex would park
-	// every worker behind one kind that may never sync.
-	inf, err := r.Cache.GetInformer(ctx, u, cache.BlockUntilSynced(false))
-	if err != nil {
-		return fmt.Errorf("getting informer for %s: %w", gvk, err)
-	}
 
 	if !inf.HasSynced() {
 		return fmt.Errorf("informer for %s has not synced yet", gvk)
 	}
-
-	r.watchMu.Lock()
-	r.watchPhases[gvk] = watchSynced
-	r.watchMu.Unlock()
 
 	return nil
 }
@@ -151,7 +147,7 @@ func (r *PodPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.ctrl = c
 	r.RESTMapper = mgr.GetRESTMapper()
 	r.Cache = mgr.GetCache()
-	r.watchPhases = make(map[schema.GroupVersionKind]watchPhase)
+	r.watchStates = make(map[schema.GroupVersionKind]cache.Informer)
 
 	return nil
 }

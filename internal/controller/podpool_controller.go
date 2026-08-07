@@ -108,8 +108,11 @@ type PodPoolReconciler struct {
 	// Watches are registered lazily, from Reconcile, which runs on several
 	// goroutines at once. The mutex guards the map; the controller handle is
 	// what watches get attached to after Build.
+	// watchStates maps each GVK to the informer instance our event handler
+	// was registered on, which is what makes "is this watch still live?"
+	// answerable rather than assumed.
 	ctrl        controller.Controller
-	watchPhases map[schema.GroupVersionKind]watchPhase
+	watchStates map[schema.GroupVersionKind]cache.Informer
 	watchMu     sync.Mutex
 
 	// Which groups have already been reported as publishing a count we could
