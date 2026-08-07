@@ -111,9 +111,14 @@ type PodPoolReconciler struct {
 	// watchStates maps each GVK to the informer instance our event handler
 	// was registered on, which is what makes "is this watch still live?"
 	// answerable rather than assumed.
-	ctrl        controller.Controller
-	watchStates map[schema.GroupVersionKind]cache.Informer
-	watchMu     sync.Mutex
+	ctrl                controller.Controller
+	watchStates         map[schema.GroupVersionKind]cache.Informer
+	watchFailureEmitted map[schema.GroupVersionKind]bool
+	// watchPendingSince is when each GVK's informer was first seen unsynced,
+	// which is the only thing that separates a cache still filling from one
+	// that never will.
+	watchPendingSince map[schema.GroupVersionKind]time.Time
+	watchMu           sync.Mutex
 
 	// Which groups have already been reported as publishing a count we could
 	// not represent. Keyed per group, not per GVK: a child reporting nonsense
@@ -198,8 +203,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	// Registered before any child is written, so the first child of a kind is
 	// born observed: a child changing is the event a pool most needs to hear,
 	// and the pool watch alone cannot deliver it.
-	if err := r.ensureWatch(ctx, gvk); err != nil {
-		return ctrl.Result{}, err
+	if res, handled, err := r.setUpWatch(ctx, &pool, gvk); handled {
+		return res, err
 	}
 
 	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups)
@@ -348,6 +353,11 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	// requeue can turn elapsed time into a verdict.
 	return ctrl.Result{RequeueAfter: deadlineAwareRequeue(&pool, groupStatuses, now)}, kerrors.NewAggregate(errs)
 }
+
+// watchSyncRequeue is how soon to look again while an informer is filling its
+// initial cache. Short, because the wait is normally milliseconds and nothing
+// else will wake the pool once the cache is warm.
+const watchSyncRequeue = 2 * time.Second
 
 // reconcileFloor is the base requeue interval for every pool. Without a floor
 // a converged pool is never looked at again until something changes it, and
@@ -937,6 +947,58 @@ func (r *PodPoolReconciler) reportOutOfRange(ctx context.Context, pool *podpools
 	logf.FromContext(ctx).Info(
 		"Child workload published counts outside the representable range; stored values are clamped",
 		"group", groupName)
+}
+
+// setUpWatch establishes the child watch and turns its outcome into an exit.
+// handled is false only when the watch is ready and Reconcile should carry on.
+//
+// Separate from ensureWatch because the two answer different questions: that
+// one reports what the informer is doing, this one decides what the pool
+// should do about it.
+func (r *PodPoolReconciler) setUpWatch(
+	ctx context.Context, pool *podpoolsv1alpha1.PodPool, gvk schema.GroupVersionKind,
+) (ctrl.Result, bool, error) {
+	err := r.ensureWatch(ctx, gvk)
+	if err == nil {
+		return ctrl.Result{}, false, nil
+	}
+
+	// A cache still filling is not a fault. No warning and no error: come back
+	// when it is warm. Returning the error would put the pool into exponential
+	// backoff waiting for something that takes milliseconds, and complain
+	// about it on every manager start.
+	if errors.Is(err, errWatchSyncPending) {
+		logf.FromContext(ctx).V(4).Info("Informer still syncing, retrying shortly", "gvk", gvk)
+
+		return ctrl.Result{RequeueAfter: watchSyncRequeue}, true, nil
+	}
+
+	r.handleWatchFailure(ctx, pool, gvk, err)
+
+	return ctrl.Result{}, true, fmt.Errorf("setting up watch for %s: %w", gvk, err)
+}
+
+// handleWatchFailure reports a watch that will not come up, once per GVK per
+// process. Deduped because the pool retries on backoff for as long as the
+// kind stays unservable, and a line per retry buries the one that mattered.
+// The record is cleared when the informer finally syncs, so a kind that
+// breaks again later is reported again.
+func (r *PodPoolReconciler) handleWatchFailure(
+	ctx context.Context, pool *podpoolsv1alpha1.PodPool, gvk schema.GroupVersionKind, err error,
+) {
+	r.watchMu.Lock()
+	r.initWatchMapsLocked()
+
+	emitted := r.watchFailureEmitted[gvk]
+	if !emitted {
+		r.watchFailureEmitted[gvk] = true
+	}
+	r.watchMu.Unlock()
+
+	if !emitted {
+		logf.FromContext(ctx).Error(err, "Failed to set up watch for workload kind",
+			"podpool", klog.KObj(pool), "gvk", gvk)
+	}
 }
 
 // applyChild writes the rendered child with server-side apply.

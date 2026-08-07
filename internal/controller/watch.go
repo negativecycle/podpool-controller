@@ -2,10 +2,13 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -15,6 +18,23 @@ import (
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
+
+// errWatchSyncPending means the informer exists and is still filling its
+// initial cache. The first reconcile for any GVK always sees this, because
+// GetInformer is deliberately asked not to block, so it is a normal startup
+// state rather than a failure.
+//
+// It stops being normal after watchSyncGrace. A GVK whose CRD is absent
+// presents identically at any single instant: GetInformer succeeds, the
+// informer is created, and its ListWatch fails silently against an
+// unregistered resource, so HasSynced stays false forever. Only elapsed time
+// separates the two, which is why this cannot be decided by inspection.
+var errWatchSyncPending = errors.New("informer sync pending")
+
+// watchSyncGrace is how long an informer may remain unsynced before the wait
+// is reported as a failure. Long enough for an initial LIST of a large
+// collection, short enough that a missing CRD is surfaced promptly.
+const watchSyncGrace = 30 * time.Second
 
 // ensureWatch starts watching a workload kind the first time a pool asks for
 // it.
@@ -85,6 +105,7 @@ func (r *PodPoolReconciler) ensureWatch(ctx context.Context, gvk schema.GroupVer
 		_ = r.Cache.RemoveInformer(ctx, u)
 
 		r.watchMu.Lock()
+		r.initWatchMapsLocked()
 		delete(r.watchStates, gvk)
 		r.watchMu.Unlock()
 
@@ -95,6 +116,7 @@ func (r *PodPoolReconciler) ensureWatch(ctx context.Context, gvk schema.GroupVer
 	// instance already carries our handler and must not get a second one,
 	// while a different instance carries none at all.
 	r.watchMu.Lock()
+	r.initWatchMapsLocked()
 
 	if r.watchStates[gvk] != inf {
 		if err := r.ctrl.Watch(
@@ -112,10 +134,52 @@ func (r *PodPoolReconciler) ensureWatch(ctx context.Context, gvk schema.GroupVer
 	r.watchMu.Unlock()
 
 	if !inf.HasSynced() {
-		return fmt.Errorf("informer for %s has not synced yet", gvk)
+		now := r.Clock.Now()
+
+		r.watchMu.Lock()
+		r.initWatchMapsLocked()
+
+		since, seen := r.watchPendingSince[gvk]
+		if !seen {
+			since = now
+			r.watchPendingSince[gvk] = since
+		}
+		r.watchMu.Unlock()
+
+		if now.Sub(since) < watchSyncGrace {
+			return fmt.Errorf("%w for %s", errWatchSyncPending, gvk)
+		}
+
+		return fmt.Errorf("informer for %s has not synced after %s", gvk, watchSyncGrace)
 	}
 
+	// Synced. Forget both pieces of failure bookkeeping so a kind that breaks
+	// again later is treated as a fresh problem rather than a remembered one.
+	r.watchMu.Lock()
+	delete(r.watchPendingSince, gvk)
+	delete(r.watchFailureEmitted, gvk)
+	r.watchMu.Unlock()
+
 	return nil
+}
+
+// initWatchMapsLocked makes the watch-machinery maps safe to write. Caller
+// must hold watchMu. SetupWithManager also builds them eagerly; this exists
+// because nothing forces every construction path through SetupWithManager,
+// and unit tests deliberately do not go through it. A nil-map write in Go is
+// a panic, not a lost update.
+func (r *PodPoolReconciler) initWatchMapsLocked() {
+	if r.watchStates == nil {
+		r.watchStates = make(map[schema.GroupVersionKind]cache.Informer)
+	}
+
+	if r.watchFailureEmitted == nil {
+		r.watchFailureEmitted = make(map[schema.GroupVersionKind]bool)
+	}
+
+	if r.watchPendingSince == nil {
+		r.watchPendingSince = make(map[schema.GroupVersionKind]time.Time)
+	}
 }
 
 // poolPredicate drops PodPool updates that changed neither spec, annotations,
@@ -146,8 +210,15 @@ func (r *PodPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	r.ctrl = c
 	r.RESTMapper = mgr.GetRESTMapper()
+
 	r.Cache = mgr.GetCache()
+	if r.Clock == nil {
+		r.Clock = clock.RealClock{}
+	}
+
 	r.watchStates = make(map[schema.GroupVersionKind]cache.Informer)
+	r.watchFailureEmitted = make(map[schema.GroupVersionKind]bool)
+	r.watchPendingSince = make(map[schema.GroupVersionKind]time.Time)
 
 	return nil
 }

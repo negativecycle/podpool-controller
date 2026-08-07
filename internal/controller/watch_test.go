@@ -10,6 +10,7 @@ import (
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -59,10 +60,15 @@ var _ = Describe("ensureWatch identity tracking", func() {
 	},
 	) *PodPoolReconciler {
 		return &PodPoolReconciler{
-			ctrl:        ctrl,
-			Cache:       reconciler.Cache,
-			Scheme:      reconciler.Scheme,
-			RESTMapper:  reconciler.RESTMapper,
+			ctrl:       ctrl,
+			Cache:      reconciler.Cache,
+			Scheme:     reconciler.Scheme,
+			RESTMapper: reconciler.RESTMapper,
+			// ensureWatch reads the clock to time the grace window, and a
+			// reconciler built by struct literal has no manager to supply one.
+			// A nil clock here is a panic, not a failure, so it surfaces in
+			// whichever spec happens to run first rather than where it belongs.
+			Clock:       clock.RealClock{},
 			watchStates: make(map[schema.GroupVersionKind]cache.Informer),
 		}
 	}

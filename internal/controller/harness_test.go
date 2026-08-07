@@ -115,9 +115,15 @@ func reconcilePool(t *testing.T, r *PodPoolReconciler, pool *podpoolsv1alpha1.Po
 }
 
 func tryReconcilePool(r *PodPoolReconciler, pool *podpoolsv1alpha1.PodPool) error {
-	_, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace},
-	})
+	_, err := r.Reconcile(context.Background(), reconcileRequestFor(pool))
 
 	return err
+}
+
+// reconcileRequestFor is for tests that need the ctrl.Result as well as the
+// error, which the drivers above discard.
+func reconcileRequestFor(pool *podpoolsv1alpha1.PodPool) ctrl.Request {
+	return ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace},
+	}
 }
