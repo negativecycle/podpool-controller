@@ -37,15 +37,66 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of PodPool
+            description: PodPoolSpec defines the desired state of PodPool.
             properties:
-              foo:
-                description: foo is an example field of PodPool. Edit podpool_types.go
-                  to remove/update
-                type: string
+              groups:
+                description: |-
+                  Ordered list of groups that divide the pool's replicas. Groups are
+                  filled in list order: earlier groups are satisfied first, and the
+                  first group constrained only by min (no ceiling) absorbs whatever
+                  remains.
+                items:
+                  description: GroupSpec defines a single group within a PodPool.
+                  properties:
+                    name:
+                      description: |-
+                        DNS-label name that identifies this group within the pool. Becomes
+                        part of the child workload's name (<pool>-<name>) and its label
+                        selector, so renaming a group replaces its child entirely.
+                      minLength: 1
+                      pattern: ^[a-z][a-z0-9-]*[a-z0-9]$
+                      type: string
+                    overrides:
+                      description: |-
+                        Partial workload object deep-merged on top of the pool's template
+                        before the child is created. Use this to differentiate groups:
+                        node selectors, tolerations, resource requests, or any field the
+                        workload kind supports. Null values delete the corresponding key
+                        from the template.
+                      x-kubernetes-preserve-unknown-fields: true
+                    scaling:
+                      description: How many of the pool's total replicas this group
+                        should receive.
+                      type: object
+                  required:
+                  - name
+                  - scaling
+                  type: object
+                minItems: 1
+                type: array
+              replicas:
+                description: |-
+                  Total number of pod replicas to distribute across all groups. Each
+                  group receives a share of this total according to its scaling
+                  constraints.
+                format: int32
+                minimum: 0
+                type: integer
+              workloadTemplate:
+                description: |-
+                  Template for the child workload each group creates. Accepts any
+                  workload kind with a pod template at .spec.template: Deployment,
+                  StatefulSet, or a CRD such as Argo Rollout or Kruise CloneSet.
+                  The controller copies this template per group, injects
+                  group-specific overrides, and applies it with server-side apply.
+                x-kubernetes-preserve-unknown-fields: true
+            required:
+            - groups
+            - replicas
+            - workloadTemplate
             type: object
           status:
-            description: status defines the observed state of PodPool
+            description: PodPoolStatus defines the observed state of PodPool.
             properties:
               conditions:
                 description: |-
