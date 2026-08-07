@@ -63,6 +63,15 @@ func BuildChildWorkload(
 ) (*unstructured.Unstructured, error) {
 	obj := runtime.DeepCopyJSON(tmpl)
 
+	if group.Overrides != nil && group.Overrides.Raw != nil {
+		var patch map[string]any
+		if err := json.Unmarshal(group.Overrides.Raw, &patch); err != nil {
+			return nil, fmt.Errorf("unmarshalling overrides for group %s: %w", group.Name, err)
+		}
+
+		obj = MergeMaps(obj, patch)
+	}
+
 	stripPastedMetadata(obj)
 
 	child := &unstructured.Unstructured{Object: obj}

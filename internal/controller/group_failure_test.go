@@ -1,8 +1,6 @@
 package controller
 
 import (
-	"context"
-	"errors"
 	"strings"
 	"testing"
 
@@ -11,10 +9,25 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
+
+// breakGroup makes one group unbuildable, the way a user would: a null in the
+// overrides deletes the key it targets, and deleting .spec.template leaves
+// nothing to build a workload from. The JSON stays valid, so the failure lands
+// in BuildChildWorkload rather than in serialization.
+func breakGroup(pool *podpoolsv1alpha1.PodPool) {
+	for i := range pool.Spec.Groups {
+		if pool.Spec.Groups[i].Name == testGroupBase {
+			pool.Spec.Groups[i].Overrides = &runtime.RawExtension{
+				Raw: []byte(`{"spec":{"template":null}}`),
+			}
+
+			return
+		}
+	}
+}
 
 func childExists(t *testing.T, cl client.Client, pool *podpoolsv1alpha1.PodPool, group string) bool {
 	t.Helper()
@@ -37,26 +50,9 @@ func childExists(t *testing.T, cl client.Client, pool *podpoolsv1alpha1.PodPool,
 // naming each failed group.
 func TestReconcileContinuesPastFailingGroup(t *testing.T) {
 	pool := fakeTestPool()
+	breakGroup(pool)
+
 	r, cl := newFakeReconciler(t, pool)
-
-	base, ok := r.Client.(client.WithWatch)
-	if !ok {
-		t.Fatalf("fake client %T does not implement client.WithWatch", r.Client)
-	}
-
-	applyCalls := 0
-	r.Client = interceptor.NewClient(base, interceptor.Funcs{
-		Apply: func(ctx context.Context, c client.WithWatch, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
-			applyCalls++
-			// The loop walks groups in spec order, so the first apply is the
-			// base group's child.
-			if applyCalls == 1 {
-				return errors.New("simulated apply failure")
-			}
-
-			return c.Apply(ctx, obj, opts...)
-		},
-	})
 
 	err := tryReconcilePool(r, pool)
 	if err == nil {
@@ -68,7 +64,7 @@ func TestReconcileContinuesPastFailingGroup(t *testing.T) {
 	}
 
 	if childExists(t, cl, pool, testGroupBase) {
-		t.Errorf("child for the failing group %s was created", testGroupBase)
+		t.Errorf("child for the broken group %s was created", testGroupBase)
 	}
 
 	if !childExists(t, cl, pool, testGroupSpot) {

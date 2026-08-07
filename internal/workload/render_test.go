@@ -6,6 +6,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
@@ -15,6 +16,8 @@ const (
 
 	fieldStatus   = "status"
 	fieldReplicas = "replicas"
+	fieldMetadata = "metadata"
+	fieldUID      = "uid"
 )
 
 func TestChildName(t *testing.T) {
@@ -363,5 +366,79 @@ func TestMergeMaps(t *testing.T) {
 
 	if base["a"] != "1" || base["b"].(map[string]any)["x"] != "2" {
 		t.Error("MergeMaps mutated its base; a shared template merged twice would corrupt")
+	}
+}
+
+func TestBuildChildWorkloadWithOverrides(t *testing.T) {
+	t.Parallel()
+
+	override := map[string]any{
+		"spec": map[string]any{
+			"minReadySeconds": float64(30),
+		},
+	}
+	overrideBytes, _ := json.Marshal(override)
+
+	group := podpoolsv1alpha1.GroupSpec{
+		Name:      testGroupBase,
+		Overrides: &runtime.RawExtension{Raw: overrideBytes},
+	}
+
+	child, err := BuildChildWorkload(mustParse(t, rawTemplate()), group, testPool(), 5)
+	if err != nil {
+		t.Fatalf("BuildChildWorkload: %v", err)
+	}
+
+	minReady, found, _ := unstructured.NestedFloat64(child.Object, "spec", "minReadySeconds")
+	if !found || minReady != 30 {
+		t.Errorf("minReadySeconds: got %v (found=%v), want 30", minReady, found)
+	}
+}
+
+// TestRenderStripsMetadataFromOverrides closes the loophole the strip left
+// open: pasted metadata can arrive through an override just as easily as
+// through the template, and it is exactly as wrong there.
+func TestRenderStripsMetadataFromOverrides(t *testing.T) {
+	t.Parallel()
+
+	override := map[string]any{
+		fieldMetadata: map[string]any{
+			fieldUID:          "override-uid",
+			"resourceVersion": "99999",
+		},
+	}
+	overrideBytes, _ := json.Marshal(override)
+
+	group := podpoolsv1alpha1.GroupSpec{
+		Name:      testGroupBase,
+		Overrides: &runtime.RawExtension{Raw: overrideBytes},
+	}
+
+	child, err := BuildChildWorkload(mustParse(t, rawTemplate()), group, testPool(), 1)
+	if err != nil {
+		t.Fatalf("BuildChildWorkload: %v", err)
+	}
+
+	meta, _, _ := unstructured.NestedMap(child.Object, fieldMetadata)
+	if _, ok := meta[fieldUID]; ok {
+		t.Error("uid introduced by override should have been stripped")
+	}
+
+	if _, ok := meta["resourceVersion"]; ok {
+		t.Error("resourceVersion introduced by override should have been stripped")
+	}
+}
+
+func TestBuildChildWorkloadRejectsMalformedOverrides(t *testing.T) {
+	t.Parallel()
+
+	group := podpoolsv1alpha1.GroupSpec{
+		Name:      testGroupBase,
+		Overrides: &runtime.RawExtension{Raw: []byte(`{`)},
+	}
+
+	_, err := BuildChildWorkload(mustParse(t, rawTemplate()), group, testPool(), 1)
+	if err == nil {
+		t.Fatal("BuildChildWorkload accepted malformed override JSON")
 	}
 }
