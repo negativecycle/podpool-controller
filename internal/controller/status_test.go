@@ -128,3 +128,64 @@ func TestConditionsOnFullyCappedPool(t *testing.T) {
 		t.Errorf("Progressing = %+v, want False/CeilingsBelowDesired", pr)
 	}
 }
+
+// TestReadyMessagesFitTheColumnBudget sweeps every summaryReady arm with
+// hostile inputs (long names, many groups, large counts) and holds each
+// message to the print-column budget. The Status column added in the API
+// milestone is where these strings land, and kubectl truncates anything
+// longer mid-word.
+func TestReadyMessagesFitTheColumnBudget(t *testing.T) {
+	longNames := []string{
+		"an-extremely-long-group-name-that-tests-the-budget",
+		"another-very-long-group-name",
+		"a-third-name", "a-fourth-name", "a-fifth-name",
+	}
+
+	cases := []struct {
+		name string
+		cond metav1.Condition
+	}{
+		{"scaled to zero", summaryReady(1, 0, 0, 0, nil, nil)},
+		{"failed groups", summaryReady(1, 0, 9, 0, longNames, nil)},
+		{"unplaced", summaryReady(1, 100000, 1000000, 900000, nil, nil)},
+		{"none ready", summaryReady(1, 0, 1000000, 0, nil, nil)},
+		{"stalled", summaryReady(1, 3, 9, 0, nil, longNames)},
+		{"updating", summaryReady(1, 999999, 1000000, 0, nil, nil)},
+		{"ready", summaryReady(1, 1000000, 1000000, 0, nil, nil)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if n := len(tc.cond.Message); n > readyMessageBudget {
+				t.Errorf("message %q is %d chars, budget is %d", tc.cond.Message, n, readyMessageBudget)
+			}
+
+			if tc.cond.Message == "" {
+				t.Error("empty message: the column would show nothing")
+			}
+		})
+	}
+}
+
+// TestReadySummarisesTheFourConditions pins the single-answer property: with
+// four detail conditions and no summary, every consumer recomputes "is this
+// pool healthy?" and each gets it slightly wrong.
+func TestReadySummarisesTheFourConditions(t *testing.T) {
+	pool := fakeTestPool()
+	r, cl := newFakeReconciler(t, pool)
+
+	reconcilePool(t, r, pool)
+
+	got := getPool(t, cl, pool)
+
+	ready := conditionByType(got, ConditionReady)
+	if ready == nil {
+		t.Fatal("Ready condition missing")
+	}
+
+	// Children exist but report no readiness, so the answer is a clean False
+	// with the not-ready count, not an error state.
+	if ready.Status != metav1.ConditionFalse || ready.Reason != ReasonNoReplicasAvailable {
+		t.Errorf("Ready = %s/%s, want False/NoReplicasAvailable", ready.Status, ready.Reason)
+	}
+}

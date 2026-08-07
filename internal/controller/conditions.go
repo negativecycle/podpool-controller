@@ -16,6 +16,7 @@ const (
 	ConditionProgressing    = "Progressing"
 	ConditionTargetDegraded = "TargetDegraded"
 	ConditionGroupsReady    = "GroupsReady"
+	ConditionReady          = "Ready"
 
 	ReasonScaledToZero               = "ScaledToZero"
 	ReasonMinimumReplicasAvailable   = "MinimumReplicasAvailable"
@@ -30,6 +31,7 @@ const (
 	ReasonGroupSpecInvalid           = "GroupSpecInvalid"
 	ReasonWorkloadNotOwned           = "WorkloadNotOwned"
 	ReasonProgressDeadlineExceeded   = "ProgressDeadlineExceeded"
+	ReasonPoolReady                  = "PoolReady"
 )
 
 type conditionInputs struct {
@@ -167,6 +169,77 @@ func setConditions(pool *podpoolsv1alpha1.PodPool, in conditionInputs) {
 	meta.SetStatusCondition(&pool.Status.Conditions, progressing)
 	meta.SetStatusCondition(&pool.Status.Conditions, degraded)
 	meta.SetStatusCondition(&pool.Status.Conditions, groupsReady)
+	meta.SetStatusCondition(&pool.Status.Conditions, summaryReady(
+		gen, in.ready, in.desired, in.unplaced, in.failedGroups, in.stalledGroups))
+}
+
+const readyMessageBudget = 60
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+
+	return s[:maxLen-3] + "..."
+}
+
+// formatGroupNamesBudgeted is used only by summaryReady, where the message is
+// projected into a kubectl column. It truncates each name to keep the assembled
+// message readable and includes a total count so the operator knows how many
+// groups are affected even when names are elided.
+func formatGroupNamesBudgeted(groups []string) string {
+	const maxNameLen = 20
+
+	if len(groups) == 1 {
+		return truncate(groups[0], maxNameLen)
+	}
+
+	return fmt.Sprintf("%s +%d more (%d total)", truncate(groups[0], maxNameLen), len(groups)-1, len(groups))
+}
+
+// summaryReady collapses the four detail conditions into the single
+// question "is this pool doing what its spec asked?". The switch is a
+// precedence table, ordered most-serious-first: a new state is one row,
+// not another branch. Messages are deliberately short: this condition is
+// projected into a kubectl print column where anything over ~60
+// characters is unreadable.
+func summaryReady(gen int64, ready, desired, unplaced int32, failedGroups, stalledGroups []string) metav1.Condition {
+	mk := func(status metav1.ConditionStatus, reason, message string) metav1.Condition {
+		return metav1.Condition{
+			Type:               ConditionReady,
+			Status:             status,
+			Reason:             reason,
+			Message:            truncate(message, readyMessageBudget),
+			ObservedGeneration: gen,
+		}
+	}
+
+	switch {
+	case desired == 0:
+		return mk(metav1.ConditionTrue, ReasonScaledToZero, "Scaled to zero")
+	case len(failedGroups) > 0:
+		return mk(metav1.ConditionFalse, ReasonGroupReconcileFailed,
+			"Group reconcile failed: "+formatGroupNamesBudgeted(failedGroups))
+	case unplaced > 0:
+		return mk(metav1.ConditionFalse, ReasonCeilingsBelowDesired,
+			fmt.Sprintf("%d/%d unplaced by group ceilings", unplaced, desired))
+	case ready == 0:
+		return mk(metav1.ConditionFalse, ReasonNoReplicasAvailable,
+			fmt.Sprintf("0/%d ready", desired))
+	case len(stalledGroups) > 0:
+		return mk(metav1.ConditionFalse, ReasonProgressDeadlineExceeded,
+			"Stalled: "+formatGroupNamesBudgeted(stalledGroups))
+	case ready < desired:
+		return mk(metav1.ConditionFalse, ReasonReplicasUpdating,
+			fmt.Sprintf("%d/%d ready", ready, desired))
+	default:
+		return mk(metav1.ConditionTrue, ReasonPoolReady,
+			fmt.Sprintf("%d/%d ready", ready, desired))
+	}
 }
 
 // clampInt32 narrows a widened accumulator back to the int32 the API stores.
