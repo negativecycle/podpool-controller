@@ -10,6 +10,12 @@ import (
 
 type DistributionResult struct {
 	Targets []int32
+
+	// Unplaced counts replicas that no group's ceiling could accept. Non-zero
+	// only when every group is capped; see GroupCeiling. The pool then runs
+	// below spec.replicas rather than breaching a ceiling the user set, and
+	// says so through status.unplacedReplicas.
+	Unplaced int32
 }
 
 // GroupFloor returns the cascade threshold (min) for a group, defaulting to 0.
@@ -65,9 +71,15 @@ func GroupTarget(total int32, s podpoolsv1alpha1.ScalingConstraints) (int32, boo
 // Algorithm:
 //  1. Satisfy cascade thresholds (floor) in list order, constrained by total.
 //  2. Chase percentage-based targets for groups that have one.
+//  3. Distribute the remainder in list order, up to each group's ceiling.
+//
+// Anything still unplaced after the overflow phase stays unplaced. Ceilings
+// are honoured absolutely: a user who put a limit on every tier meant it, and
+// quietly overspending on the expensive one is the failure this controller
+// exists to prevent.
 //
 // It is a pure function of its arguments, so it remains exhaustively testable
-// without a cluster. Later phases distribute what the targets leave over.
+// without a cluster.
 func ComputeGroupTargets(
 	total int32,
 	groups []podpoolsv1alpha1.GroupSpec,
@@ -120,7 +132,59 @@ func ComputeGroupTargets(
 		}
 	}
 
-	return DistributionResult{Targets: targets}
+	// The overflow phase: distribute the remainder in list order, respecting
+	// ceilings.
+	//
+	// Earlier groups are filled first, so the overflow lands on the tier the
+	// user ranked highest: the same cascade as phase 1.
+	for i := range groups {
+		if remaining <= 0 {
+			break
+		}
+
+		limit, bounded := GroupCeiling(total, groups[i].Scaling)
+		if !bounded {
+			targets[i] += remaining
+			remaining = 0
+
+			continue
+		}
+
+		headroom := limit - targets[i]
+		if headroom <= 0 {
+			continue
+		}
+
+		give := min(headroom, remaining)
+		targets[i] += give
+		remaining -= give
+	}
+
+	return DistributionResult{
+		Targets:  targets,
+		Unplaced: remaining,
+	}
+}
+
+// GroupCeiling reports the largest target a group may hold, and whether it is
+// bounded at all.
+//
+// The ceiling is max if set, otherwise the target itself (resolved at the
+// current total). A group with neither is unbounded: the overflow bucket. That
+// case must stay exactly as broad as it is — an absent target is a deliberate
+// statement that this tier absorbs what the others cannot, and the whole
+// overflow design rests on it.
+func GroupCeiling(total int32, s podpoolsv1alpha1.ScalingConstraints) (limit int32, bounded bool) {
+	if s.Max != nil {
+		return *s.Max, true
+	}
+
+	pct, ok := TargetPercent(s.Target)
+	if ok {
+		return percentOf(total, pct), true
+	}
+
+	return 0, false
 }
 
 // percentOf returns total × pct / 100 rounded down.
