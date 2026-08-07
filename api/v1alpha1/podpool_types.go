@@ -19,6 +19,7 @@ package v1alpha1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // PodPoolSpec defines the desired state of PodPool.
@@ -42,8 +43,8 @@ type PodPoolSpec struct {
 
 	// Ordered list of groups that divide the pool's replicas. Groups are
 	// filled in list order: earlier groups are satisfied first, and the
-	// first group constrained only by min (no ceiling) absorbs whatever
-	// remains.
+	// first group constrained only by min (no ceiling, not opportunistic)
+	// absorbs whatever remains.
 	// +required
 	// +kubebuilder:validation:MinItems=1
 	Groups []GroupSpec `json:"groups"`
@@ -76,10 +77,45 @@ type GroupSpec struct {
 
 // ScalingConstraints defines the distribution constraints for a group.
 //
-// Defined incrementally: each constraint field arrives with the
-// distribution behavior that honours it. An empty constraint set is legal
-// and means the group takes whatever the distributor assigns.
-type ScalingConstraints struct{}
+// Every group is a (floor, target, ceiling) triple. `min` and `max` are
+// hard limits; `target` is best-effort. The ceiling is `max` if set,
+// otherwise the target itself. The floor is `min`, defaulting to 0.
+type ScalingConstraints struct {
+	// Cascade threshold. Satisfy before filling later groups.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Min *int32 `json:"min,omitempty"`
+
+	// Absolute ceiling. Never more than this many pods.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Max *int32 `json:"max,omitempty"`
+
+	// Best-effort target. The group's desired share of the pool total, as
+	// a percentage (1%–100%). Expressed as a string with a trailing percent
+	// sign, following the same convention as maxSurge. When no max is set,
+	// the target doubles as the ceiling; when max is set, the group may
+	// grow past the target up to max via overflow.
+	// +optional
+	// +kubebuilder:validation:XIntOrString
+	// +kubebuilder:validation:MaxLength=4
+	Target *intstr.IntOrString `json:"target,omitempty"`
+
+	// Size this group by whatever the scheduler will actually accept, rather
+	// than by a declared number or percentage.
+	//
+	// For a group running in another tier's spare capacity (expendable
+	// priority, pinned to nodes it does not own) the right size is "however
+	// much happens to be free right now", which no static value can express.
+	// The controller finds it by offering the group more replicas than it
+	// expects to place and handing the ones the scheduler rejects to the next
+	// group.
+	//
+	// Pairs with min only: this *is* the ceiling, so max and target would
+	// contradict it. Requires a later group able to absorb what does not fit.
+	// +optional
+	Opportunistic *bool `json:"opportunistic,omitempty"`
+}
 
 // PodPoolStatus defines the observed state of PodPool.
 type PodPoolStatus struct {

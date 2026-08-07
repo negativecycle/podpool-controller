@@ -43,8 +43,8 @@ spec:
                 description: |-
                   Ordered list of groups that divide the pool's replicas. Groups are
                   filled in list order: earlier groups are satisfied first, and the
-                  first group constrained only by min (no ceiling) absorbs whatever
-                  remains.
+                  first group constrained only by min (no ceiling, not opportunistic)
+                  absorbs whatever remains.
                 items:
                   description: GroupSpec defines a single group within a PodPool.
                   properties:
@@ -67,6 +67,46 @@ spec:
                     scaling:
                       description: How many of the pool's total replicas this group
                         should receive.
+                      properties:
+                        max:
+                          description: Absolute ceiling. Never more than this many
+                            pods.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        min:
+                          description: Cascade threshold. Satisfy before filling later
+                            groups.
+                          format: int32
+                          minimum: 0
+                          type: integer
+                        opportunistic:
+                          description: |-
+                            Size this group by whatever the scheduler will actually accept, rather
+                            than by a declared number or percentage.
+
+                            For a group running in another tier's spare capacity (expendable
+                            priority, pinned to nodes it does not own) the right size is "however
+                            much happens to be free right now", which no static value can express.
+                            The controller finds it by offering the group more replicas than it
+                            expects to place and handing the ones the scheduler rejects to the next
+                            group.
+
+                            Pairs with min only: this *is* the ceiling, so max and target would
+                            contradict it. Requires a later group able to absorb what does not fit.
+                          type: boolean
+                        target:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          description: |-
+                            Best-effort target. The group's desired share of the pool total, as
+                            a percentage (1%–100%). Expressed as a string with a trailing percent
+                            sign, following the same convention as maxSurge. When no max is set,
+                            the target doubles as the ceiling; when max is set, the group may
+                            grow past the target up to max via overflow.
+                          maxLength: 4
+                          x-kubernetes-int-or-string: true
                       type: object
                   required:
                   - name
