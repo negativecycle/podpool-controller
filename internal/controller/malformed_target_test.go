@@ -154,6 +154,14 @@ func TestTargetBoundedness(t *testing.T) {
 				t.Errorf("GroupCeiling(%d) = (%d, %v), want (%d, %v)",
 					total, limit, bounded, tt.wantLimit, tt.wantBounded)
 			}
+
+			// The predicate every layer shares. It agrees with GroupCeiling on
+			// every static shape; the capacity feature will part them on
+			// opportunistic groups, whose ceiling is real but discovered
+			// rather than declared.
+			if got := workload.IsBounded(tt.scaling); got != tt.wantBounded {
+				t.Errorf("IsBounded = %v, want %v", got, tt.wantBounded)
+			}
 		})
 	}
 }

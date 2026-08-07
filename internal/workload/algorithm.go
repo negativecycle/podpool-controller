@@ -226,6 +226,19 @@ func checkTargetDegraded(total int32, targets []int32, groups []podpoolsv1alpha1
 	return false
 }
 
+// IsBounded reports whether a group has an effective ceiling, and so cannot
+// become the pool's overflow sink.
+//
+// This is the single definition. Any layer asking "could this group swallow
+// the remainder?" must ask here: two implementations of that question always
+// drift, and a group one layer believes is capped becoming the other's
+// overflow sink is exactly the failure the previous commit closed. It is
+// possible to share at all because the previous commit made the distributor's
+// definition presence-based; before it, presence and parsing disagreed.
+func IsBounded(s podpoolsv1alpha1.ScalingConstraints) bool {
+	return hasStaticCeiling(s)
+}
+
 // hasStaticCeiling reports whether a group declares a ceiling at all.
 //
 // Declaring one and declaring a readable one are different questions, and this
