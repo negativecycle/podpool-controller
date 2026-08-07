@@ -46,7 +46,7 @@ func newFakeReconciler(t *testing.T, objs ...client.Object) (*PodPoolReconciler,
 		WithObjects(objs...).
 		Build()
 
-	return &PodPoolReconciler{Client: cl, Scheme: scheme}, cl
+	return &PodPoolReconciler{Client: cl, Scheme: scheme, APIReader: cl}, cl
 }
 
 func fakeTestPool() *podpoolsv1alpha1.PodPool {

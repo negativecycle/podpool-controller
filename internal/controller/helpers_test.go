@@ -31,7 +31,9 @@ const (
 	testNamespace  = "default"
 	testAppsV1     = "apps/v1"
 	testDepKind    = "Deployment"
+	testStsKind    = "StatefulSet"
 	testContainer  = "api"
+	testPoolName   = "my-pool"
 
 	fieldAPIVersion      = "apiVersion"
 	fieldKind            = "kind"
