@@ -2,6 +2,10 @@ package controller
 
 import (
 	"testing"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
 
 // A pool scaled from two groups to one leaves the second group's child
@@ -31,5 +35,92 @@ func TestSweepDeletesChildOfRemovedGroup(t *testing.T) {
 
 	if !childExists(t, cl, pool, testGroupBase) {
 		t.Error("child of the surviving group was deleted")
+	}
+}
+
+func TestStaleWorkloadGVKs(t *testing.T) {
+	current := schema.GroupVersionKind{Group: testAppsGroup, Version: "v1", Kind: testDepKind}
+
+	tests := []struct {
+		name    string
+		prev    []podpoolsv1alpha1.GroupStatus
+		current schema.GroupVersionKind
+		want    []schema.GroupVersionKind
+	}{
+		{
+			name:    "nil refs produce nothing",
+			prev:    []podpoolsv1alpha1.GroupStatus{{Name: "a"}, {Name: "b"}},
+			current: current,
+			want:    nil,
+		},
+		{
+			name: "ref matching current is not stale",
+			prev: []podpoolsv1alpha1.GroupStatus{
+				{Name: testGroupBase, WorkloadRef: &podpoolsv1alpha1.WorkloadReference{
+					APIVersion: testAppsV1, Kind: testDepKind, Name: "pool-base",
+				}},
+			},
+			current: current,
+			want:    nil,
+		},
+		{
+			name: "two groups sharing a stale GVK deduplicate",
+			prev: []podpoolsv1alpha1.GroupStatus{
+				{Name: testGroupBase, WorkloadRef: &podpoolsv1alpha1.WorkloadReference{
+					APIVersion: testAppsV1, Kind: testStsKind, Name: "pool-base",
+				}},
+				{Name: "burst", WorkloadRef: &podpoolsv1alpha1.WorkloadReference{
+					APIVersion: testAppsV1, Kind: testStsKind, Name: "pool-burst",
+				}},
+			},
+			current: current,
+			want: []schema.GroupVersionKind{
+				{Group: testAppsGroup, Version: "v1", Kind: testStsKind},
+			},
+		},
+		{
+			name: "malformed APIVersion is skipped",
+			prev: []podpoolsv1alpha1.GroupStatus{
+				{Name: "bad", WorkloadRef: &podpoolsv1alpha1.WorkloadReference{
+					APIVersion: "not-a-valid-api-version/with/slashes", Kind: testDepKind, Name: "pool-bad",
+				}},
+			},
+			current: current,
+			want:    nil,
+		},
+		{
+			name: "mix of current, stale, nil, and malformed",
+			prev: []podpoolsv1alpha1.GroupStatus{
+				{Name: "a", WorkloadRef: &podpoolsv1alpha1.WorkloadReference{
+					APIVersion: testAppsV1, Kind: testDepKind, Name: "pool-a",
+				}},
+				{Name: "b"},
+				{Name: "c", WorkloadRef: &podpoolsv1alpha1.WorkloadReference{
+					APIVersion: testAppsV1, Kind: testStsKind, Name: "pool-c",
+				}},
+				{Name: "d", WorkloadRef: &podpoolsv1alpha1.WorkloadReference{
+					APIVersion: "///", Kind: "X", Name: "pool-d",
+				}},
+			},
+			current: current,
+			want: []schema.GroupVersionKind{
+				{Group: testAppsGroup, Version: "v1", Kind: testStsKind},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := staleWorkloadGVKs(tt.prev, tt.current)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("index %d: got %v, want %v", i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }

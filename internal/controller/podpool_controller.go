@@ -110,14 +110,20 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// still reach the original error through errors.As.
 	var errs []error
 
+	reconciledGroups := make(map[string]bool, len(pool.Spec.Groups))
+
 	for i, group := range pool.Spec.Groups {
 		if _, err := r.reconcileGroup(ctx, &pool, tmpl, group, result.Targets[i]); err != nil {
 			errs = append(errs, fmt.Errorf("group %s: %w", group.Name, err))
+
+			continue
 		}
+
+		reconciledGroups[group.Name] = true
 	}
 
-	if err := r.sweepOrphans(ctx, &pool, gvk); err != nil {
-		errs = append(errs, fmt.Errorf("deleting orphaned workloads: %w", err))
+	if sweepErrs := r.sweepAllOrphans(ctx, &pool, gvk, reconciledGroups); len(sweepErrs) > 0 {
+		errs = append(errs, sweepErrs...)
 	}
 
 	return ctrl.Result{}, kerrors.NewAggregate(errs)
@@ -214,26 +220,68 @@ func (r *PodPoolReconciler) reconcileWorkload(
 	return childObservation{}, nil
 }
 
-// sweepOrphans deletes children whose group has left the spec. A pool
-// scaled from three groups to two leaves the third group's child running,
-// invisibly consuming capacity, unless something deletes it.
+// sweepAllOrphans sweeps orphaned children across the current and any stale
+// GVKs. For the current GVK an orphan is a child whose group left the spec.
+// For a stale GVK (after a kind change in the template), a child is orphaned
+// once its replacement has been reconciled: gating on reconciledGroups
+// preserves running capacity until the new child exists, so a failed
+// replacement never costs the capacity it was meant to replace.
 //
-// Children are found by the controller's own labels, and a labelled workload
-// this pool does not control is skipped, never deleted: the labels are the
-// search, ownership is the authority. The keep decision keys off spec.groups,
-// so a group that merely failed this pass does not look orphaned; its child
-// stays while the failure is retried.
-func (r *PodPoolReconciler) sweepOrphans(
+// The stale GVKs come from the workloadRef each group's status records, which
+// is the only place the old kind survives once the spec has moved on. Status
+// starts recording it later in this milestone; until then the stale set is
+// empty and only the current-GVK sweep runs.
+func (r *PodPoolReconciler) sweepAllOrphans(
 	ctx context.Context,
 	pool *podpoolsv1alpha1.PodPool,
 	gvk schema.GroupVersionKind,
-) error {
-	log := logf.FromContext(ctx)
-
+	reconciledGroups map[string]bool,
+) []error {
 	activeGroups := make(map[string]bool, len(pool.Spec.Groups))
 	for _, g := range pool.Spec.Groups {
 		activeGroups[g.Name] = true
 	}
+
+	var errs []error
+	if err := r.sweepOrphans(ctx, r.Client, pool, gvk,
+		func(group string) bool { return activeGroups[group] },
+		"group %s removed from spec",
+	); err != nil {
+		errs = append(errs, fmt.Errorf("deleting orphaned workloads: %w", err))
+	}
+
+	// A stale-GVK child shares its replacement's group, so activeGroups alone
+	// says "keep" for both. The reconciled term is what distinguishes them;
+	// without it the entire pre-change workload set leaks.
+	for _, staleGVK := range staleWorkloadGVKs(pool.Status.Groups, gvk) {
+		if err := r.sweepOrphans(ctx, r.APIReader, pool, staleGVK,
+			func(group string) bool { return activeGroups[group] && !reconciledGroups[group] },
+			"group %s: workload kind changed",
+		); err != nil {
+			errs = append(errs, fmt.Errorf("deleting stale %s orphans: %w", staleGVK.Kind, err))
+		}
+	}
+
+	return errs
+}
+
+// sweepOrphans deletes children of the given GVK whose group the keep
+// predicate rejects. The reader is either the cache (for the current GVK,
+// whose informer exists anyway) or r.APIReader (for a stale GVK, to avoid
+// constructing a permanent informer for a one-shot cleanup).
+//
+// Children are found by the controller's own labels, and a labelled workload
+// this pool does not control is skipped, never deleted: the labels are the
+// search, ownership is the authority.
+func (r *PodPoolReconciler) sweepOrphans(
+	ctx context.Context,
+	reader client.Reader,
+	pool *podpoolsv1alpha1.PodPool,
+	gvk schema.GroupVersionKind,
+	keep func(group string) bool,
+	reasonFmt string,
+) error {
+	log := logf.FromContext(ctx)
 
 	listGVK := schema.GroupVersionKind{
 		Group:   gvk.Group,
@@ -244,7 +292,7 @@ func (r *PodPoolReconciler) sweepOrphans(
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(listGVK)
 
-	if err := r.List(ctx, list,
+	if err := reader.List(ctx, list,
 		client.InNamespace(pool.Namespace),
 		client.MatchingLabels{
 			workload.LabelPool:      pool.Name,
@@ -264,11 +312,12 @@ func (r *PodPoolReconciler) sweepOrphans(
 		}
 
 		groupLabel := item.GetLabels()[workload.LabelGroup]
-		if activeGroups[groupLabel] {
+		if keep(groupLabel) {
 			continue
 		}
 
-		log.Info("Deleting orphaned workload", "workload", klog.KObj(item), "group", groupLabel)
+		log.Info("Deleting orphaned workload", "workload", klog.KObj(item),
+			"reason", fmt.Sprintf(reasonFmt, groupLabel))
 
 		if err := r.Delete(ctx, item); err != nil && !apierrors.IsNotFound(err) {
 			return err
@@ -276,6 +325,36 @@ func (r *PodPoolReconciler) sweepOrphans(
 	}
 
 	return nil
+}
+
+// staleWorkloadGVKs returns the distinct GVKs recorded in the previous
+// status that differ from the current template GVK. After a template kind
+// change, these are the kinds whose children the sweep must also visit.
+func staleWorkloadGVKs(prev []podpoolsv1alpha1.GroupStatus, current schema.GroupVersionKind) []schema.GroupVersionKind {
+	seen := make(map[schema.GroupVersionKind]bool)
+
+	var result []schema.GroupVersionKind
+
+	for _, gs := range prev {
+		if gs.WorkloadRef == nil {
+			continue
+		}
+
+		gv, err := schema.ParseGroupVersion(gs.WorkloadRef.APIVersion)
+		if err != nil {
+			continue
+		}
+
+		stale := schema.GroupVersionKind{Group: gv.Group, Version: gv.Version, Kind: gs.WorkloadRef.Kind}
+		if stale == current || seen[stale] {
+			continue
+		}
+
+		seen[stale] = true
+		result = append(result, stale)
+	}
+
+	return result
 }
 
 // applyChild writes the rendered child with server-side apply.

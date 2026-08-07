@@ -30,6 +30,7 @@ const (
 	testGroupSpot  = "spot"
 	testNamespace  = "default"
 	testAppsV1     = "apps/v1"
+	testAppsGroup  = "apps"
 	testDepKind    = "Deployment"
 	testStsKind    = "StatefulSet"
 	testContainer  = "api"
