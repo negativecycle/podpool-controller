@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -142,4 +143,35 @@ func ReadInt32(obj *unstructured.Unstructured, fields ...string) (int32, bool) {
 	}
 
 	return int32(v), true //nolint:gosec // counts are small in practice; revisited when a hostile child is considered
+}
+
+// MergeMaps deep-merges patch into base following RFC 7386 semantics: maps
+// merge recursively, a null deletes the key it targets, and anything else
+// replaces. Exported because admission will validate overrides with the same
+// merge; two implementations of "what does this override do" would drift.
+//
+// Every level the patch touches gets a fresh map, so the base is never
+// mutated: callers can merge one shared template many times.
+func MergeMaps(base, patch map[string]any) map[string]any {
+	result := make(map[string]any, len(base))
+	maps.Copy(result, base)
+
+	for k, v := range patch {
+		if v == nil {
+			delete(result, k)
+
+			continue
+		}
+
+		baseMap, baseIsMap := result[k].(map[string]any)
+
+		patchMap, patchIsMap := v.(map[string]any)
+		if baseIsMap && patchIsMap {
+			result[k] = MergeMaps(baseMap, patchMap)
+		} else {
+			result[k] = v
+		}
+	}
+
+	return result
 }

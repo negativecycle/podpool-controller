@@ -317,3 +317,51 @@ func TestReadInt32(t *testing.T) {
 		})
 	}
 }
+
+func TestMergeMaps(t *testing.T) {
+	t.Parallel()
+
+	base := map[string]any{
+		"a": "1",
+		"b": map[string]any{
+			"x": "2",
+			"y": "3",
+		},
+		"c": "keep",
+	}
+	patch := map[string]any{
+		"a": "overridden",
+		"b": map[string]any{
+			"x": "changed",
+			"z": "added",
+		},
+		"c": nil,
+	}
+
+	result := MergeMaps(base, patch)
+
+	if result["a"] != "overridden" {
+		t.Errorf("a: got %v, want overridden", result["a"])
+	}
+
+	b := result["b"].(map[string]any)
+	if b["x"] != "changed" {
+		t.Errorf("b.x: got %v, want changed", b["x"])
+	}
+
+	if b["y"] != "3" {
+		t.Errorf("b.y: got %v, want 3 (preserved from base)", b["y"])
+	}
+
+	if b["z"] != "added" {
+		t.Errorf("b.z: got %v, want added", b["z"])
+	}
+
+	if _, ok := result["c"]; ok {
+		t.Error("c should have been deleted by null patch")
+	}
+
+	if base["a"] != "1" || base["b"].(map[string]any)["x"] != "2" {
+		t.Error("MergeMaps mutated its base; a shared template merged twice would corrupt")
+	}
+}
