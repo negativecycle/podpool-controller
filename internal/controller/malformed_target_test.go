@@ -11,11 +11,6 @@ import (
 	"github.com/negativecycle/podpool-controller/internal/workload"
 )
 
-// skipUnreadableBinds marks the rows whose want values describe the behaviour
-// the next commit installs rather than the behaviour that exists. Deleted with
-// the skips.
-const skipUnreadableBinds = "an unreadable target must bind the group, not free it"
-
 // intTarget builds an Int-typed target: `target: 30` written in YAML without
 // quotes, which reads as obviously correct in a manifest and is the single most
 // likely way a real user produces an unreadable one.
@@ -38,11 +33,9 @@ func strTarget(s string) *intstr.IntOrString {
 // group at all.
 //
 // One table rather than three because the regression it guards is precisely a
-// future edit that makes the answers disagree. Today a target the algorithm
-// cannot read leaves the group unbounded, which makes a typo on the most
-// expensive tier into the pool's overflow sink; the skipped rows describe the
-// behaviour the next commit installs instead. Pin first, then change: the
-// table is the contract, and the diff that flips the skips is the fix.
+// future edit that makes the answers disagree again. A target the algorithm
+// could not read used to leave the group unbounded, which made a typo on the
+// most expensive tier into the pool's overflow sink.
 //
 // The three lenient rows ("+30%", "030%", bare "30") are honoured as 30% here
 // and rejected by the CEL rule, so the two grammars are not the same grammar.
@@ -55,10 +48,7 @@ func TestTargetBoundedness(t *testing.T) {
 	const total = 100
 
 	tests := []struct {
-		name string
-		// skip marks a row whose want values describe the behaviour the fix
-		// asks for rather than the behaviour that exists.
-		skip        string
+		name        string
 		scaling     podpoolsv1alpha1.ScalingConstraints
 		wantPct     int32
 		wantParsed  bool
@@ -74,7 +64,6 @@ func TestTargetBoundedness(t *testing.T) {
 		},
 		{
 			name:        "int-typed target",
-			skip:        skipUnreadableBinds,
 			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: intTarget(30)},
 			wantBounded: true,
 		},
@@ -112,31 +101,26 @@ func TestTargetBoundedness(t *testing.T) {
 		},
 		{
 			name:        "zero percent is out of range",
-			skip:        skipUnreadableBinds,
 			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("0%")},
 			wantBounded: true,
 		},
 		{
 			name:        "over one hundred percent is out of range",
-			skip:        skipUnreadableBinds,
 			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("101%")},
 			wantBounded: true,
 		},
 		{
 			name:        "empty string",
-			skip:        skipUnreadableBinds,
 			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("")},
 			wantBounded: true,
 		},
 		{
 			name:        "non-numeric",
-			skip:        skipUnreadableBinds,
 			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("abc%")},
 			wantBounded: true,
 		},
 		{
 			name:        "embedded space",
-			skip:        skipUnreadableBinds,
 			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("30 %")},
 			wantBounded: true,
 		},
@@ -160,10 +144,6 @@ func TestTargetBoundedness(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.skip != "" {
-				t.Skip(tt.skip)
-			}
-
 			pct, parsed := workload.TargetPercent(tt.scaling.Target)
 			if pct != tt.wantPct || parsed != tt.wantParsed {
 				t.Errorf("TargetPercent = (%d, %v), want (%d, %v)", pct, parsed, tt.wantPct, tt.wantParsed)
@@ -192,8 +172,8 @@ func malformedTargetSpec(baseMin int32, baseTarget *intstr.IntOrString) []podpoo
 // TestMalformedTargetDoesNotAbsorbTheOverflow is the distribution consequence
 // of TestTargetBoundedness, and the reason the fix is worth making.
 //
-// The user capped base at 30% of 20 = 6. With a target the distributor cannot
-// read, base becomes the unbounded group and silently runs 10 — an overspend
+// The user capped base at 30% of 20 = 6. With a target the distributor could
+// not read, base became the unbounded group and silently ran 10 — an overspend
 // on the tier the cap existed to protect. Quietly overspending on the
 // expensive tier is the failure this controller exists to prevent.
 func TestMalformedTargetDoesNotAbsorbTheOverflow(t *testing.T) {
@@ -201,7 +181,6 @@ func TestMalformedTargetDoesNotAbsorbTheOverflow(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		skip         string
 		baseMin      int32
 		baseTarget   *intstr.IntOrString
 		wantTargets  []int32
@@ -219,7 +198,6 @@ func TestMalformedTargetDoesNotAbsorbTheOverflow(t *testing.T) {
 			// The regression. base falls back to its floor and the remainder
 			// surfaces as unplaced instead of inflating the bill.
 			name:         "int-typed target binds base at its floor",
-			skip:         skipUnreadableBinds,
 			baseMin:      1,
 			baseTarget:   intTarget(30),
 			wantTargets:  []int32{1, 10},
@@ -227,7 +205,6 @@ func TestMalformedTargetDoesNotAbsorbTheOverflow(t *testing.T) {
 		},
 		{
 			name:         "out-of-range target binds base at its floor",
-			skip:         skipUnreadableBinds,
 			baseMin:      1,
 			baseTarget:   strTarget("0%"),
 			wantTargets:  []int32{1, 10},
@@ -249,7 +226,6 @@ func TestMalformedTargetDoesNotAbsorbTheOverflow(t *testing.T) {
 			// group lands above its own ceiling: the floor is the harder
 			// guarantee. Recorded rather than discovered.
 			name:         "a floor above the new ceiling still wins",
-			skip:         skipUnreadableBinds,
 			baseMin:      5,
 			baseTarget:   strTarget("abc%"),
 			wantTargets:  []int32{5, 10},
@@ -259,10 +235,6 @@ func TestMalformedTargetDoesNotAbsorbTheOverflow(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.skip != "" {
-				t.Skip(tt.skip)
-			}
-
 			got := workload.ComputeGroupTargets(total, malformedTargetSpec(tt.baseMin, tt.baseTarget))
 
 			if fmt.Sprint(got.Targets) != fmt.Sprint(tt.wantTargets) {

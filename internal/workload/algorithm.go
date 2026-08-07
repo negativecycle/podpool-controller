@@ -79,6 +79,13 @@ func GroupTarget(total int32, s podpoolsv1alpha1.ScalingConstraints) (int32, boo
 // quietly overspending on the expensive one is the failure this controller
 // exists to prevent.
 //
+// This runs on stored objects: a pool admitted before a validation rule existed,
+// or written while the webhook was unreachable, still has to distribute sanely.
+// CRD validation ratcheting means such an object keeps updating indefinitely
+// rather than being repaired on its next write, so "sanely" has to mean
+// "conservatively" — an input this function cannot read binds the group rather
+// than freeing it.
+//
 // It is a pure function of its arguments, so it remains exhaustively testable
 // without a cluster.
 func ComputeGroupTargets(
@@ -219,6 +226,16 @@ func checkTargetDegraded(total int32, targets []int32, groups []podpoolsv1alpha1
 	return false
 }
 
+// hasStaticCeiling reports whether a group declares a ceiling at all.
+//
+// Declaring one and declaring a readable one are different questions, and this
+// answers the first. It is deliberately about presence: a target nobody can
+// parse is still the user saying they wanted this tier capped, and reading it
+// as "no cap" turns a typo into the overflow sink.
+func hasStaticCeiling(s podpoolsv1alpha1.ScalingConstraints) bool {
+	return s.Max != nil || s.Target != nil
+}
+
 // GroupCeiling reports the largest target a group may hold, and whether it is
 // bounded at all.
 //
@@ -228,16 +245,27 @@ func checkTargetDegraded(total int32, targets []int32, groups []podpoolsv1alpha1
 // statement that this tier absorbs what the others cannot, and the whole
 // overflow design rests on it.
 func GroupCeiling(total int32, s podpoolsv1alpha1.ScalingConstraints) (limit int32, bounded bool) {
+	if !hasStaticCeiling(s) {
+		return 0, false
+	}
+
 	if s.Max != nil {
 		return *s.Max, true
 	}
 
+	// A target that is present but unreadable binds at zero: the group keeps
+	// its floor and grows no further. Every other reading is worse. Treating it
+	// as absent makes the group unbounded, so a typo on the tier the user was
+	// trying to cap silently makes it the one that absorbs the whole pool —
+	// measured at a 33% overspend on a three-tier pool, and invisible because
+	// nothing reports it. Binding at zero surfaces the same mistake through
+	// status.unplacedReplicas instead.
 	pct, ok := TargetPercent(s.Target)
-	if ok {
-		return percentOf(total, pct), true
+	if !ok {
+		return 0, true
 	}
 
-	return 0, false
+	return percentOf(total, pct), true
 }
 
 // percentOf returns total × pct / 100 rounded down.
