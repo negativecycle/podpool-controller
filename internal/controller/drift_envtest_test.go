@@ -20,6 +20,35 @@ import (
 	"github.com/negativecycle/podpool-controller/internal/workload"
 )
 
+// reconcileCount reads controller-runtime's own completion counter, which is
+// the only footprint a no-op reconcile leaves: an annotation nudge does not
+// bump the pool's generation, and the child not changing is the property
+// under test. The counter has no per-object label, so this proves "a podpool
+// reconcile completed", not "this pool's reconcile completed"; callers carry
+// their actual assertion over any straggler themselves.
+func reconcileCount() float64 {
+	families, err := crmetrics.Registry.Gather()
+	Expect(err).NotTo(HaveOccurred())
+
+	var total float64
+
+	for _, fam := range families {
+		if fam.GetName() != "controller_runtime_reconcile_total" {
+			continue
+		}
+
+		for _, m := range fam.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "controller" && l.GetValue() == "podpool" {
+					total += m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+
+	return total
+}
+
 // These run against a real API server because the two properties in tension
 // here cannot both be observed against the fake client: it neither tracks
 // managedFields nor models a no-op apply, so it bumps resourceVersion on every
@@ -69,12 +98,11 @@ var _ = Describe("Child workload drift", func() {
 		return &dep
 	}
 
-	// The controller watches only pools so far: nothing tells it a child
-	// changed. Nudging an annotation on the pool is how these specs trigger a
-	// pass after touching the child, and the nudge is a temporary crutch worth
-	// noticing. In production the same gap means drift sits unrepaired until
-	// something else happens to wake the pool, which is exactly what the
-	// watches milestone exists to close.
+	// Forces a pass that changes nothing the child renders from. Only the
+	// no-op apply spec still needs this: now that the child watch delivers
+	// child edits on its own, a converged child generates no events at all,
+	// so the passes whose absence of writes is the property under test have
+	// to be triggered synthetically.
 	nudgePool := func(v string) {
 		var pool podpoolsv1alpha1.PodPool
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: poolName, Namespace: ns}, &pool)).To(Succeed())
@@ -87,36 +115,6 @@ var _ = Describe("Child workload drift", func() {
 		Expect(k8sClient.Update(ctx, &pool)).To(Succeed())
 	}
 
-	// reconcileCount reads controller-runtime's own completion counter, which
-	// is the only footprint a no-op reconcile leaves: an annotation nudge does
-	// not bump the pool's generation, and the child not changing is the
-	// property under test. The counter has no per-object label, so this proves
-	// "a podpool reconcile completed", not "this pool's reconcile completed";
-	// the trailing Consistently carries the actual assertion over any
-	// straggler.
-	reconcileCount := func() float64 {
-		families, err := crmetrics.Registry.Gather()
-		Expect(err).NotTo(HaveOccurred())
-
-		var total float64
-
-		for _, fam := range families {
-			if fam.GetName() != "controller_runtime_reconcile_total" {
-				continue
-			}
-
-			for _, m := range fam.GetMetric() {
-				for _, l := range m.GetLabel() {
-					if l.GetName() == "controller" && l.GetValue() == "podpool" {
-						total += m.GetCounter().GetValue()
-					}
-				}
-			}
-		}
-
-		return total
-	}
-
 	It("reverts an external edit to a field the pool renders", func() {
 		waitForChild()
 
@@ -126,8 +124,8 @@ var _ = Describe("Child workload drift", func() {
 		drift.Spec.Template.Spec.Containers[0].Image = "nginx:tampered"
 		Expect(k8sClient.Update(ctx, drift, client.FieldOwner("rogue-actor"))).To(Succeed())
 
-		nudgePool("after-drift")
-
+		// Nothing nudges the pool. The child watch delivers the rogue edit to
+		// the controller, and the revert below is the proof it did.
 		Eventually(func(g Gomega) {
 			dep := getChild()
 			g.Expect(*dep.Spec.Replicas).To(Equal(int32(2)))
@@ -316,16 +314,19 @@ var _ = Describe("Foreign fields on a child", func() {
 			foreign.Labels = map[string]string{}
 		}
 
+		before := reconcileCount()
+
 		foreign.Labels["app.kubernetes.io/managed-by"] = "Helm"
 		foreign.Spec.Template.Spec.Containers[0].TerminationMessagePath = "/dev/termination-custom"
 		Expect(k8sClient.Update(ctx, foreign, client.FieldOwner("other-controller"))).To(Succeed())
 
-		// No child watch yet, so give the controller its chance to clobber
-		// deliberately: nudge a pass, then hold the assertion open.
-		var pool podpoolsv1alpha1.PodPool
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: poolName, Namespace: ns}, &pool)).To(Succeed())
-		pool.Annotations = map[string]string{"test.podpools.dev/nudge": "foreign"}
-		Expect(k8sClient.Update(ctx, &pool)).To(Succeed())
+		// The child watch delivers the foreign edit, so the pass that could
+		// clobber these fields happens on its own; wait for proof it ran, then
+		// hold the assertion open across it. This is a stronger spec than the
+		// pool-nudge it replaces, which forced a pass without ever showing
+		// that a child edit alone causes one.
+		Eventually(reconcileCount).Should(BeNumerically(">", before),
+			"the child edit never triggered a reconcile")
 
 		Consistently(func(g Gomega) {
 			var d appsv1.Deployment

@@ -25,6 +25,7 @@ import (
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -36,7 +37,9 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
@@ -88,7 +91,9 @@ type groupReconcileResult struct {
 type PodPoolReconciler struct {
 	client.Client
 
-	Scheme *runtime.Scheme
+	Scheme     *runtime.Scheme
+	RESTMapper meta.RESTMapper
+	Cache      cache.Cache
 
 	// Clock is injected rather than read from the wall, because deadline
 	// behaviour is untestable against time.Now: a test cannot wait ten
@@ -99,6 +104,13 @@ type PodPoolReconciler struct {
 	// create path force-applies over an object the cache says is absent, the
 	// absence is confirmed against the API server itself.
 	APIReader client.Reader
+
+	// Watches are registered lazily, from Reconcile, which runs on several
+	// goroutines at once. The mutex guards the map; the controller handle is
+	// what watches get attached to after Build.
+	ctrl        controller.Controller
+	watchedGVKs map[schema.GroupVersionKind]bool
+	watchMu     sync.Mutex
 
 	// Which groups have already been reported as publishing a count we could
 	// not represent. Keyed per group, not per GVK: a child reporting nonsense
@@ -178,6 +190,13 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	tmpl, err := workload.ParseTemplate(pool.Spec.WorkloadTemplate.Raw)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("parsing workload template: %w", err)
+	}
+
+	// Registered before any child is written, so the first child of a kind is
+	// born observed: a child changing is the event a pool most needs to hear,
+	// and the pool watch alone cannot deliver it.
+	if err := r.ensureWatch(gvk); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups)
