@@ -109,6 +109,21 @@ spec:
                           maxLength: 4
                           x-kubernetes-int-or-string: true
                       type: object
+                      x-kubernetes-validations:
+                      - message: min must not exceed max
+                        reason: FieldValueInvalid
+                        rule: '!has(self.min) || !has(self.max) || self.min <= self.max'
+                      - fieldPath: .opportunistic
+                        message: opportunistic is itself the ceiling; it pairs only
+                          with min
+                        reason: FieldValueInvalid
+                        rule: (!has(self.opportunistic) || !self.opportunistic) ||
+                          (!has(self.max) && !has(self.target))
+                      - fieldPath: .target
+                        message: target must be a percentage string like "30%" (1%–100%)
+                        reason: FieldValueInvalid
+                        rule: '!has(self.target) || (type(self.target) == string &&
+                          self.target.matches(''^([1-9]|[1-9][0-9]|100)%$''))'
                   required:
                   - name
                   - scaling

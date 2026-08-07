@@ -83,6 +83,10 @@ type GroupSpec struct {
 // Every group is a (floor, target, ceiling) triple. `min` and `max` are
 // hard limits; `target` is best-effort. The ceiling is `max` if set,
 // otherwise the target itself. The floor is `min`, defaulting to 0.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.min) || !has(self.max) || self.min <= self.max",message="min must not exceed max",reason=FieldValueInvalid
+// +kubebuilder:validation:XValidation:rule="(!has(self.opportunistic) || !self.opportunistic) || (!has(self.max) && !has(self.target))",message="opportunistic is itself the ceiling; it pairs only with min",reason=FieldValueInvalid,fieldPath=".opportunistic"
+// +kubebuilder:validation:XValidation:rule="!has(self.target) || (type(self.target) == string && self.target.matches('^([1-9]|[1-9][0-9]|100)%$'))",message="target must be a percentage string like \"30%\" (1%–100%)",reason=FieldValueInvalid,fieldPath=".target"
 type ScalingConstraints struct {
 	// Cascade threshold. Satisfy before filling later groups.
 	// +optional
