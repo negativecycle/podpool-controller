@@ -973,6 +973,11 @@ func (r *PodPoolReconciler) setUpWatch(
 		return ctrl.Result{RequeueAfter: watchSyncRequeue}, true, nil
 	}
 
+	// Without this the pool keeps reporting whatever the last pass wrote,
+	// which for a pool that was healthy until its CRD was uninstalled is
+	// Ready. Nothing in the object mentions the watch, and the only other
+	// signal is deduped to one line per GVK per process.
+	setConditions(pool, conditionInputs{watchFailed: true})
 	r.handleWatchFailure(ctx, pool, gvk, err)
 
 	return ctrl.Result{}, true, fmt.Errorf("setting up watch for %s: %w", gvk, err)
@@ -997,7 +1002,7 @@ func (r *PodPoolReconciler) handleWatchFailure(
 
 	if !emitted {
 		logf.FromContext(ctx).Error(err, "Failed to set up watch for workload kind",
-			"podpool", klog.KObj(pool), "gvk", gvk)
+			"podpool", klog.KObj(pool), "gvk", gvk, "reason", ReasonWatchSetupFailed)
 	}
 }
 

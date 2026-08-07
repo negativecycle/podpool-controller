@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -160,5 +161,143 @@ func TestInformerSyncCompletesQuietly(t *testing.T) {
 	if len(getPool(t, r.Client, pool).Status.Groups) == 0 {
 		t.Error("no groups were reconciled, so the pass exited early on a watch " +
 			"that is now perfectly healthy")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The watch-failure exit
+// ---------------------------------------------------------------------------
+
+// brokenWatchAfterHealthyPass builds the case that matters: a pool that ran
+// normally and published a healthy status, whose workload kind then stopped
+// being servable. A CRD uninstalled under a running pool, or RBAC revoked.
+// The pool's stored status is the thing the failing exit has to contradict,
+// so a pool that was never healthy would not exercise the bug at all.
+func brokenWatchAfterHealthyPass(t *testing.T) (*PodPoolReconciler, *podpoolsv1alpha1.PodPool) {
+	t.Helper()
+
+	pool := fakeTestPool()
+	r, synced, fake := newSyncingReconciler(t, pool)
+
+	synced.Store(true)
+	reconcilePool(t, r, pool)
+
+	// The kind goes away. One quiet pass opens the grace window, then time
+	// passes: the window only starts when the GVK is first seen unsynced, so
+	// advancing the clock before that sighting would do nothing.
+	synced.Store(false)
+	reconcilePool(t, r, pool)
+	fake.SetTime(fake.Now().Add(2 * watchSyncGrace))
+
+	return r, pool
+}
+
+// TestWatchFailureLeavesAnHonestReadyCondition is the half of this that is
+// not a filed bug and is the worse of the two.
+//
+// The exit never called setConditions, so patchStatus saw no diff and wrote
+// nothing. The pool went on reporting the status of its last healthy pass:
+// Ready=True, replica counts and all, while the controller could not see a
+// single one of its children. An operator reading kubectl get podpool has no
+// reason to look further.
+func TestWatchFailureLeavesAnHonestReadyCondition(t *testing.T) {
+	r, pool := brokenWatchAfterHealthyPass(t)
+
+	before := getPool(t, r.Client, pool)
+	if ready := meta.FindStatusCondition(before.Status.Conditions, ConditionReady); ready == nil {
+		t.Fatal("fixture never published a Ready condition, so there is nothing stale to contradict")
+	}
+
+	_ = tryReconcilePool(r, pool)
+
+	got := getPool(t, r.Client, pool)
+
+	ready := meta.FindStatusCondition(got.Status.Conditions, ConditionReady)
+	if ready == nil {
+		t.Fatal("no Ready condition after a watch failure")
+	}
+
+	if ready.Reason != ReasonWatchSetupFailed {
+		t.Errorf("Ready reason is %q, want %q: nothing in the object says why the "+
+			"pool is not running", ready.Reason, ReasonWatchSetupFailed)
+	}
+}
+
+// TestWatchFailureDoesNotObserveTheGeneration applies the paused-pool rule to
+// this exit. The obvious way to write the branch is to copy the code below
+// it, which stamps; the pool would then report an edit it never acted on as
+// reconciled, and anything gating on observedGeneration == generation would
+// read a blind pool as settled.
+func TestWatchFailureDoesNotObserveTheGeneration(t *testing.T) {
+	r, pool := brokenWatchAfterHealthyPass(t)
+
+	live := getPool(t, r.Client, pool)
+	live.Generation = pool.Generation + 1
+	live.Spec.Replicas = 7
+
+	if err := r.Update(t.Context(), live); err != nil {
+		t.Fatalf("editing the spec: %v", err)
+	}
+
+	_ = tryReconcilePool(r, pool)
+
+	got := getPool(t, r.Client, pool)
+	if got.Status.ObservedGeneration == got.Generation {
+		t.Errorf("observedGeneration = %d at generation %d: no informer means "+
+			"nothing below the exit ran, so this spec has not been acted on",
+			got.Status.ObservedGeneration, got.Generation)
+	}
+}
+
+// TestEveryEarlyExitWritesReady is a class guard rather than a bug
+// reproducer. Every exit leaving a Ready condition is what makes the fix
+// above work, and a third early return that forgets would silently reopen it.
+// Reading the code will not catch that; this will.
+func TestEveryEarlyExitWritesReady(t *testing.T) {
+	tests := []struct {
+		name       string
+		wantReason string
+		build      func(*testing.T) (*PodPoolReconciler, *podpoolsv1alpha1.PodPool)
+	}{
+		{
+			name: "unparseable workload template",
+			// Ready aggregates rather than naming the fault; GroupsReady is
+			// where the invalid template is reported. What matters here is
+			// that this exit writes Ready at all.
+			wantReason: ReasonNoReplicasAvailable,
+			build: func(t *testing.T) (*PodPoolReconciler, *podpoolsv1alpha1.PodPool) {
+				t.Helper()
+
+				pool := fakeTestPool()
+				pool.Spec.WorkloadTemplate.Raw = []byte(`{"spec":{"template":{}}}`)
+				r, _ := newFakeReconciler(t, nil, pool)
+
+				return r, pool
+			},
+		},
+		{
+			name:       "no informer for the workload type",
+			wantReason: ReasonWatchSetupFailed,
+			build:      brokenWatchAfterHealthyPass,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, pool := tt.build(t)
+
+			_ = tryReconcilePool(r, pool)
+
+			got := getPool(t, r.Client, pool)
+
+			ready := meta.FindStatusCondition(got.Status.Conditions, ConditionReady)
+			if ready == nil {
+				t.Fatal("the exit left no Ready condition at all")
+			}
+
+			if ready.Reason != tt.wantReason {
+				t.Errorf("Ready reason is %q, want %q", ready.Reason, tt.wantReason)
+			}
+		})
 	}
 }
