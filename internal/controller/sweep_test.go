@@ -6,6 +6,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
+	"github.com/negativecycle/podpool-controller/internal/workload"
 )
 
 // A pool scaled from two groups to one leaves the second group's child
@@ -122,5 +123,32 @@ func TestStaleWorkloadGVKs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSweepIgnoresDriftedGroupLabel pins the keep decision to the child's
+// name. The group label is user-writable and read through a cache: a drifted
+// label on a healthy child must never read as "orphan". The name is derived
+// from spec and immutable, so a stale read can at worst defer a real orphan.
+func TestSweepIgnoresDriftedGroupLabel(t *testing.T) {
+	pool := fakeTestPool()
+	r, cl := newFakeReconciler(t, pool)
+
+	reconcilePool(t, r, pool)
+
+	// Drift the label the way a user (or a chaotic controller) would; SSA
+	// would repair it next pass, but the sweep may be reading the pre-repair
+	// copy.
+	child := getChild(t, cl, pool.Name)
+
+	child.Labels[workload.LabelGroup] = "no-such-group"
+	if err := cl.Update(t.Context(), child); err != nil {
+		t.Fatalf("drifting group label: %v", err)
+	}
+
+	reconcilePool(t, r, pool)
+
+	if !childExists(t, cl, pool, testGroupBase) {
+		t.Error("a drifted group label got a healthy child deleted; the sweep must key on the name")
 	}
 }

@@ -231,31 +231,43 @@ func (r *PodPoolReconciler) reconcileWorkload(
 // is the only place the old kind survives once the spec has moved on. Status
 // starts recording it later in this milestone; until then the stale set is
 // empty and only the current-GVK sweep runs.
+//
+// Both predicates key on the child's name, never on its group label. The name
+// is derived from the spec and immutable for the object's lifetime, whereas the
+// label is user-writable and read here through a cache that may not yet have
+// seen this reconcile repair it. Deciding a delete on the label lets a stale
+// read destroy a healthy group; deciding on the name means a stale read can at
+// worst defer a real orphan to the next pass.
 func (r *PodPoolReconciler) sweepAllOrphans(
 	ctx context.Context,
 	pool *podpoolsv1alpha1.PodPool,
 	gvk schema.GroupVersionKind,
 	reconciledGroups map[string]bool,
 ) []error {
-	activeGroups := make(map[string]bool, len(pool.Spec.Groups))
+	activeChildren := make(map[string]bool, len(pool.Spec.Groups))
 	for _, g := range pool.Spec.Groups {
-		activeGroups[g.Name] = true
+		activeChildren[workload.ChildName(pool.Name, g.Name)] = true
+	}
+
+	reconciledChildren := make(map[string]bool, len(reconciledGroups))
+	for g := range reconciledGroups {
+		reconciledChildren[workload.ChildName(pool.Name, g)] = true
 	}
 
 	var errs []error
 	if err := r.sweepOrphans(ctx, r.Client, pool, gvk,
-		func(group string) bool { return activeGroups[group] },
+		func(name string) bool { return activeChildren[name] },
 		"group %s removed from spec",
 	); err != nil {
 		errs = append(errs, fmt.Errorf("deleting orphaned workloads: %w", err))
 	}
 
-	// A stale-GVK child shares its replacement's group, so activeGroups alone
+	// A stale-GVK child shares its replacement's name, so activeChildren alone
 	// says "keep" for both. The reconciled term is what distinguishes them;
 	// without it the entire pre-change workload set leaks.
 	for _, staleGVK := range staleWorkloadGVKs(pool.Status.Groups, gvk) {
 		if err := r.sweepOrphans(ctx, r.APIReader, pool, staleGVK,
-			func(group string) bool { return activeGroups[group] && !reconciledGroups[group] },
+			func(name string) bool { return activeChildren[name] && !reconciledChildren[name] },
 			"group %s: workload kind changed",
 		); err != nil {
 			errs = append(errs, fmt.Errorf("deleting stale %s orphans: %w", staleGVK.Kind, err))
@@ -265,7 +277,7 @@ func (r *PodPoolReconciler) sweepAllOrphans(
 	return errs
 }
 
-// sweepOrphans deletes children of the given GVK whose group the keep
+// sweepOrphans deletes children of the given GVK whose name the keep
 // predicate rejects. The reader is either the cache (for the current GVK,
 // whose informer exists anyway) or r.APIReader (for a stale GVK, to avoid
 // constructing a permanent informer for a one-shot cleanup).
@@ -278,7 +290,7 @@ func (r *PodPoolReconciler) sweepOrphans(
 	reader client.Reader,
 	pool *podpoolsv1alpha1.PodPool,
 	gvk schema.GroupVersionKind,
-	keep func(group string) bool,
+	keep func(childName string) bool,
 	reasonFmt string,
 ) error {
 	log := logf.FromContext(ctx)
@@ -311,10 +323,12 @@ func (r *PodPoolReconciler) sweepOrphans(
 			continue
 		}
 
-		groupLabel := item.GetLabels()[workload.LabelGroup]
-		if keep(groupLabel) {
+		// The label reports; the name decides.
+		if keep(item.GetName()) {
 			continue
 		}
+
+		groupLabel := item.GetLabels()[workload.LabelGroup]
 
 		log.Info("Deleting orphaned workload", "workload", klog.KObj(item),
 			"reason", fmt.Sprintf(reasonFmt, groupLabel))
