@@ -1,153 +1,257 @@
 package controller
 
+// The gate the last commit shipped is wrong on a real API server, and these
+// tests are the inversion. Four of the five fail against it; only
+// TestStatusMissingEmitsOncePerStall was already green.
+//
+// The harness stands in for the workload controller the fake client does not
+// run: a Get interceptor rewrites the child's status on every read, and nil
+// fields are omitted from the object entirely, which is what omitempty does on
+// a real API server -- see status_wire_state_test.go, which measures it.
+
 import (
+	"context"
 	"testing"
+	"time"
 
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/events"
-
-	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
+	clocktesting "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-const reasonStatusMissing = "StatusMissing"
+var statusMissingTestBase = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-// A Deployment carrying status.replicas but no status.readyReplicas is what
-// ownedChild(..., n, 0) produces: readyReplicas is omitempty on every built-in
-// workload type, so zero is written as *absent*. That is the whole reason this
-// warning exists, and it is also the reason it is hard to get right.
-func statusMissingReconciler(t *testing.T, pool *podpoolsv1alpha1.PodPool, ready int32) (*PodPoolReconciler, *events.FakeRecorder) {
+// injectedChildStatus is what the interceptor writes over the child's status.
+// A nil field is removed from the object, not set to zero: absent and zero
+// are the same wire state for omitempty status ints, and these tests exist
+// because the controller once read absence as "unsupported".
+type injectedChildStatus struct {
+	replicas, ready, updated *int64
+}
+
+// installChildStatus wraps the reconciler's client so every read of the named
+// child carries exactly the status *st describes at call time. Install once;
+// mutate *st between reconciles.
+func installChildStatus(t *testing.T, r *PodPoolReconciler, childName string, st *injectedChildStatus) {
 	t.Helper()
 
+	base, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatalf("fake client %T does not implement client.WithWatch", r.Client)
+	}
+
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+
+			u, isU := obj.(*unstructured.Unstructured)
+			if !isU || u.GetName() != childName {
+				return nil
+			}
+
+			unstructured.RemoveNestedField(u.Object, "status")
+
+			for field, v := range map[string]*int64{
+				"replicas":        st.replicas,
+				"readyReplicas":   st.ready,
+				"updatedReplicas": st.updated,
+			} {
+				if v != nil {
+					_ = unstructured.SetNestedField(u.Object, *v, "status", field)
+				}
+			}
+
+			return nil
+		},
+	})
+}
+
+// newStatusMissingHarness builds a single-group pool over a fake clock with
+// the status injector installed. The returned *injectedChildStatus starts
+// all-nil (a child with no status at all).
+func newStatusMissingHarness(t *testing.T) (*PodPoolReconciler, *events.FakeRecorder, *clocktesting.FakePassiveClock, *injectedChildStatus) {
+	t.Helper()
+
+	pool := singleGroupPool()
 	rec := events.NewFakeRecorder(64)
-	r, _ := newFakeReconciler(t, nil, pool,
-		ownedChild(pool, testGroupBase, 2, ready),
-		ownedChild(pool, testGroupSpot, 1, 1),
-	)
+	r, _ := newFakeReconciler(t, nil, pool)
 	r.Recorder = rec
 
-	return r, rec
+	fake := clocktesting.NewFakePassiveClock(statusMissingTestBase)
+	r.Clock = fake
+
+	st := &injectedChildStatus{}
+	installChildStatus(t, r, pool.Name+"-"+testGroupBase, st)
+
+	return r, rec, fake, st
 }
 
-// The pool reports 0 ready for a kind that never publishes readiness, and
-// cannot tell that from a kind that publishes an honest zero. Saying so once is
-// the only thing standing between an operator and a permanently wrong number
-// with no explanation.
-func TestStatusMissingWarns(t *testing.T) {
-	pool := fakeTestPool()
-	r, rec := statusMissingReconciler(t, pool, 0)
+// The first reconcile of a healthy pool creates the child, which has no
+// status at all, while target > 0. On a real API server a child with zero
+// ready pods stores no readyReplicas key either, so this state is
+// indistinguishable from a healthy rollout that is seconds old. Silence is
+// the only correct output.
+func TestNoStatusMissingOnFreshPool(t *testing.T) {
+	r, rec, _, _ := newStatusMissingHarness(t)
 
-	reconcilePool(t, r, pool)
+	reconcilePool(t, r, singleGroupPool())
 
 	evts := drainEvents(rec.Events)
-	if n := countEventsByReason(evts, reasonStatusMissing); n != 1 {
-		t.Errorf("got %d %s events, want 1; events: %v", n, reasonStatusMissing, evts)
+	if n := countEventsByReason(evts, "StatusMissing"); n != 0 {
+		t.Errorf("got %d StatusMissing events on the first reconcile of a healthy pool, want 0; events: %v", n, evts)
 	}
 }
 
-// Deduped by kind for the lifetime of the process. Whether a kind publishes
-// readiness is a fact about the kind, so repeating it per pass would be spam
-// and repeating it per pool would be spam at a slower rate.
-func TestStatusMissingWarnsOncePerKind(t *testing.T) {
-	pool := fakeTestPool()
-	r, rec := statusMissingReconciler(t, pool, 0)
+// A normal rollout, pass by pass, mirroring what a real API server stores. No
+// pass may warn: the first row is what the previous gate got wrong, and the
+// last pins that a kind which has published readiness once is proven, so a
+// later collapse to zero (stored as absent) is not "unsupported".
+func TestNoStatusMissingDuringHealthyRollout(t *testing.T) {
+	r, rec, fake, st := newStatusMissingHarness(t)
+	pool := singleGroupPool()
 
 	reconcilePool(t, r, pool)
-	reconcilePool(t, r, pool)
-	reconcilePool(t, r, pool)
 
-	evts := drainEvents(rec.Events)
-	if n := countEventsByReason(evts, reasonStatusMissing); n != 1 {
-		t.Errorf("got %d %s events across 3 reconciles, want 1; events: %v",
-			n, reasonStatusMissing, evts)
+	steps := []struct {
+		name string
+		at   time.Duration
+		st   injectedChildStatus
+	}{
+		{"replicas up, none ready yet", 30 * time.Second,
+			injectedChildStatus{replicas: ptr.To(int64(3)), updated: ptr.To(int64(3))}},
+		{"some ready", 60 * time.Second,
+			injectedChildStatus{replicas: ptr.To(int64(3)), ready: ptr.To(int64(2)), updated: ptr.To(int64(3))}},
+		{"ready fell back to zero", 90 * time.Second,
+			injectedChildStatus{replicas: ptr.To(int64(3)), updated: ptr.To(int64(3))}},
+	}
+
+	for _, step := range steps {
+		*st = step.st
+		fake.SetTime(statusMissingTestBase.Add(step.at))
+		reconcilePool(t, r, pool)
+
+		evts := drainEvents(rec.Events)
+		if n := countEventsByReason(evts, "StatusMissing"); n != 0 {
+			t.Errorf("%s: got %d StatusMissing events, want 0; events: %v", step.name, n, evts)
+		}
 	}
 }
 
-// The dedup is keyed on the GVK, not on the pool, so a second pool running the
-// same kind is silent. This is the opposite call from the out-of-range warning,
-// which is keyed per group because a child reporting nonsense is a fact about
-// that object.
-func TestStatusMissingIsSilentForASecondPoolOfTheSameKind(t *testing.T) {
-	first := fakeTestPool()
-	r, rec := statusMissingReconciler(t, first, 0)
+// The true positive: a kind that never publishes readiness, run past the
+// default 600s progress deadline with replicas up the whole time. The
+// diagnostic must arrive exactly once, in the same pass as the deadline
+// event it explains.
+func TestStatusMissingFiresAtTheDeadline(t *testing.T) {
+	r, rec, fake, st := newStatusMissingHarness(t)
+	pool := singleGroupPool()
 
-	reconcilePool(t, r, first)
+	reconcilePool(t, r, pool)
 	drainEvents(rec.Events)
 
-	second := fakeTestPool()
-	second.Name = "other-pool"
+	*st = injectedChildStatus{replicas: ptr.To(int64(3)), updated: ptr.To(int64(3))}
 
-	if err := r.Create(t.Context(), second); err != nil {
-		t.Fatalf("creating second pool: %v", err)
-	}
-
-	if err := r.Create(t.Context(), ownedChild(second, testGroupBase, 2, 0)); err != nil {
-		t.Fatalf("creating second pool's child: %v", err)
-	}
-
-	reconcilePool(t, r, second)
-
-	evts := drainEvents(rec.Events)
-	if n := countEventsByReason(evts, reasonStatusMissing); n != 0 {
-		t.Errorf("got %d %s events for a second pool of the same kind, want 0; events: %v",
-			n, reasonStatusMissing, evts)
-	}
-}
-
-// A group asked for nothing has nothing to be ready, so absent readiness there
-// says nothing about the kind.
-func TestStatusMissingIsSilentWhenNothingWasAsked(t *testing.T) {
-	pool := fakeTestPool()
-	pool.Spec.Replicas = 0
-	pool.Spec.Groups[0].Scaling = podpoolsv1alpha1.ScalingConstraints{}
-	pool.Spec.Groups[1].Scaling = podpoolsv1alpha1.ScalingConstraints{}
-
-	r, rec := statusMissingReconciler(t, pool, 0)
-
+	fake.SetTime(statusMissingTestBase.Add(601 * time.Second))
 	reconcilePool(t, r, pool)
 
 	evts := drainEvents(rec.Events)
-	if n := countEventsByReason(evts, reasonStatusMissing); n != 0 {
-		t.Errorf("got %d %s events for a pool asking for no replicas, want 0; events: %v",
-			n, reasonStatusMissing, evts)
+	if n := countEventsByReason(evts, "StatusMissing"); n != 1 {
+		t.Errorf("got %d StatusMissing events at the deadline, want 1; events: %v", n, evts)
+	}
+
+	if n := countEventsByReason(evts, ReasonProgressDeadlineExceeded); n != 1 {
+		t.Errorf("got %d %s events at the deadline, want 1; the two explain each other and must arrive together; events: %v",
+			n, ReasonProgressDeadlineExceeded, evts)
 	}
 }
 
-// A kind that does publish readiness must never trip the warning, no matter how
-// many passes run.
-func TestStatusMissingIsSilentWhenReadinessIsPublished(t *testing.T) {
-	pool := fakeTestPool()
-	r, rec := statusMissingReconciler(t, pool, 2)
+// A child that never scaled up at all is a different fault, and this warning
+// must not claim it. status.replicas is 0, so the child has no replica that
+// could be ready and its silence about readiness says nothing about whether the
+// kind publishes it. The stall is real and ProgressDeadlineExceeded reports it;
+// the diagnosis "this kind does not publish readiness" would be a guess, and a
+// wrong one for every workload controller that is merely wedged.
+func TestNoStatusMissingWhenTheChildHasNoReplicas(t *testing.T) {
+	r, rec, fake, st := newStatusMissingHarness(t)
+	pool := singleGroupPool()
 
 	reconcilePool(t, r, pool)
+	drainEvents(rec.Events)
+
+	// The child's own controller is stuck: it publishes status, but has
+	// brought up nothing.
+	*st = injectedChildStatus{replicas: ptr.To(int64(0))}
+
+	fake.SetTime(statusMissingTestBase.Add(601 * time.Second))
 	reconcilePool(t, r, pool)
 
 	evts := drainEvents(rec.Events)
-	if n := countEventsByReason(evts, reasonStatusMissing); n != 0 {
-		t.Errorf("got %d %s events for a child publishing readiness, want 0; events: %v",
-			n, reasonStatusMissing, evts)
+	if n := countEventsByReason(evts, ReasonProgressDeadlineExceeded); n != 1 {
+		t.Errorf("got %d %s events, want 1 (the pool is genuinely stalled); events: %v",
+			n, ReasonProgressDeadlineExceeded, evts)
+	}
+
+	if n := countEventsByReason(evts, "StatusMissing"); n != 0 {
+		t.Errorf("got %d StatusMissing events for a child with zero replicas, want 0 — "+
+			"a child with no replicas has nothing to report readiness about; events: %v", n, evts)
 	}
 }
 
-// The map is keyed by the whole GVK, so a pool whose template names a different
-// kind gets its own verdict. Otherwise the first CRD to misbehave would silence
-// the diagnosis for every other kind in the cluster.
-func TestStatusMissingKeyIsTheWholeGVK(t *testing.T) {
-	r := &PodPoolReconciler{}
-	pool := fakeTestPool()
+// A kind that has published readiness is proven to publish it. When its
+// readiness later collapses to zero (stored as absent) and the pool stalls,
+// the deadline event fires but StatusMissing must not: the correct diagnosis
+// is "nothing is ready", which ProgressDeadlineExceeded already says.
+func TestNoStatusMissingForAProvenKind(t *testing.T) {
+	r, rec, fake, st := newStatusMissingHarness(t)
+	pool := singleGroupPool()
 
-	dep := schema.GroupVersionKind{Group: testAppsGroup, Version: "v1", Kind: testDepKind}
-	sts := schema.GroupVersionKind{Group: testAppsGroup, Version: "v1", Kind: testStsKind}
+	reconcilePool(t, r, pool)
 
-	rec := events.NewFakeRecorder(64)
-	r.Recorder = rec
+	*st = injectedChildStatus{replicas: ptr.To(int64(3)), ready: ptr.To(int64(2)), updated: ptr.To(int64(3))}
 
-	r.reportStatusMissing(pool, testGroupBase, dep, "pool-base", false, 2)
-	r.reportStatusMissing(pool, testGroupBase, dep, "pool-base", false, 2)
-	r.reportStatusMissing(pool, testGroupBase, sts, "pool-base", false, 2)
+	fake.SetTime(statusMissingTestBase.Add(60 * time.Second))
+	reconcilePool(t, r, pool)
+
+	*st = injectedChildStatus{replicas: ptr.To(int64(3)), updated: ptr.To(int64(3))}
+
+	fake.SetTime(statusMissingTestBase.Add(60*time.Second + 601*time.Second))
+	reconcilePool(t, r, pool)
 
 	evts := drainEvents(rec.Events)
-	if n := countEventsByReason(evts, reasonStatusMissing); n != 2 {
-		t.Errorf("got %d %s events for two distinct kinds reported twice each, want 2; events: %v",
-			n, reasonStatusMissing, evts)
+	if n := countEventsByReason(evts, ReasonProgressDeadlineExceeded); n != 1 {
+		t.Errorf("got %d %s events, want 1 (the pool genuinely stalled); events: %v",
+			n, ReasonProgressDeadlineExceeded, evts)
+	}
+
+	if n := countEventsByReason(evts, "StatusMissing"); n != 0 {
+		t.Errorf("got %d StatusMissing events for a kind that has published readiness, want 0; events: %v", n, evts)
+	}
+}
+
+// Continuously stalled is not repeatedly news. The warning rides the same
+// transition edge as the deadline event: one emission when the pool enters
+// stalled, silence while it stays there.
+func TestStatusMissingEmitsOncePerStall(t *testing.T) {
+	r, rec, fake, st := newStatusMissingHarness(t)
+	pool := singleGroupPool()
+
+	reconcilePool(t, r, pool)
+
+	*st = injectedChildStatus{replicas: ptr.To(int64(3)), updated: ptr.To(int64(3))}
+
+	fake.SetTime(statusMissingTestBase.Add(601 * time.Second))
+	reconcilePool(t, r, pool)
+	drainEvents(rec.Events)
+
+	fake.SetTime(statusMissingTestBase.Add(1200 * time.Second))
+	reconcilePool(t, r, pool)
+
+	evts := drainEvents(rec.Events)
+	if n := countEventsByReason(evts, "StatusMissing"); n != 0 {
+		t.Errorf("got %d StatusMissing events while continuously stalled, want 0 (emit on the transition only); events: %v", n, evts)
 	}
 }

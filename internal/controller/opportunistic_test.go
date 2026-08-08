@@ -158,9 +158,9 @@ var _ = Describe("Opportunistic gate", func() {
 			},
 			Spec: appsv1.DeploymentSpec{
 				Replicas: ptr.To[int32](8), // asked for 8
-				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "gate"}},
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{testUserLabelKey: "gate"}},
 				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "gate"}},
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{testUserLabelKey: "gate"}},
 					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: testContainer, Image: testImageNginx}}},
 				},
 			},

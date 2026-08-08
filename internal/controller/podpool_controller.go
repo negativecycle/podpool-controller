@@ -131,23 +131,20 @@ type PodPoolReconciler struct {
 	// which is the only thing that separates a cache still filling from one
 	// that never will.
 	watchPendingSince map[schema.GroupVersionKind]time.Time
-	// statusMissingEmitted records, per workload GVK, that the child status
-	// contract has already been complained about.
+	watchMu           sync.Mutex
+
+	// readyEverPublished records, per workload GVK, that some child of that
+	// kind has published status.readyReplicas at least once this process.
 	//
-	// A second dedup mechanism, deliberately, and the shape of the question is
-	// what picks it. The group-event gate compares against a reason this
-	// controller persisted in status, so it needs no memory and survives a
-	// restart. Nothing about "this kind does not publish readyReplicas" is
-	// written anywhere, and it is a property of the *kind* rather than of any
-	// pool, so there is nothing to diff against and per-pool dedup would repeat
-	// the same complaint once per pool. A process-lifetime map keyed by GVK is
-	// the honest answer to a question with no persisted state behind it.
-	//
-	// The cost is that a restart re-reports once. That is the right side to err
-	// on: the alternative is persisting a controller-internal observation into
-	// a user-visible object.
-	statusMissingEmitted map[schema.GroupVersionKind]bool
-	watchMu              sync.Mutex
+	// Latching, and that is the point: once a kind is proven to publish
+	// readiness, a later absent key means "zero right now", never
+	// "unsupported". A process-lifetime map keyed by GVK for the same reason
+	// the watch-failure map is one -- nothing about "this kind publishes
+	// readiness" is written anywhere to diff against, and it is a fact about
+	// the kind rather than any pool. A restart forgets, which can delay a
+	// diagnostic by one stall transition and can never suppress a true one.
+	readyEverPublished map[schema.GroupVersionKind]bool
+	readyPublishedMu   sync.Mutex
 
 	// Probe bookkeeping for opportunistic groups. In-memory by design (see
 	// probeState) and guarded because Reconcile runs concurrently across
@@ -294,6 +291,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 
 	reconciledGroups := make(map[string]bool, len(pool.Spec.Groups))
 	childByGroup := make(map[string]*unstructured.Unstructured, len(pool.Spec.Groups))
+	obsByGroup := make(map[string]childObservation, len(pool.Spec.Groups))
 	groupStatuses := make([]podpoolsv1alpha1.GroupStatus, 0, len(pool.Spec.Groups))
 
 	for i, group := range pool.Spec.Groups {
@@ -339,6 +337,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		grResult.status.TargetReplicas = finalTargets[i]
 
 		reconciledGroups[group.Name] = true
+		obsByGroup[group.Name] = grResult.obs
 
 		if grResult.obs.child != nil {
 			childByGroup[group.Name] = grResult.obs.child
@@ -412,6 +411,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	if len(stalledGroups) > 0 && !wasStalled {
 		r.event(&pool, corev1.EventTypeWarning, ReasonProgressDeadlineExceeded, "ProgressDeadline",
 			"Group(s) %s exceeded progress deadline", formatGroupNames(stalledGroups))
+
+		r.diagnoseStatusMissing(&pool, gvk, stalledGroups, obsByGroup)
 	}
 
 	setConditions(&pool, conditionInputs{
@@ -476,6 +477,55 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	// for a rollout four seconds old and a pool stuck forever, so only a
 	// requeue can turn elapsed time into a verdict.
 	return ctrl.Result{RequeueAfter: deadlineAwareRequeue(&pool, groupStatuses, now)}, nil
+}
+
+func (r *PodPoolReconciler) markReadinessPublished(gvk schema.GroupVersionKind) {
+	r.readyPublishedMu.Lock()
+	defer r.readyPublishedMu.Unlock()
+
+	if r.readyEverPublished == nil {
+		r.readyEverPublished = make(map[schema.GroupVersionKind]bool)
+	}
+
+	r.readyEverPublished[gvk] = true
+}
+
+func (r *PodPoolReconciler) readinessProven(gvk schema.GroupVersionKind) bool {
+	r.readyPublishedMu.Lock()
+	defer r.readyPublishedMu.Unlock()
+
+	return r.readyEverPublished[gvk]
+}
+
+// diagnoseStatusMissing emits a StatusMissing warning when the deadline fires
+// and readiness was never published by this GVK. Extracted from Reconcile to
+// keep its cyclomatic complexity in budget.
+func (r *PodPoolReconciler) diagnoseStatusMissing(
+	pool *podpoolsv1alpha1.PodPool,
+	gvk schema.GroupVersionKind,
+	stalledGroups []string,
+	obsByGroup map[string]childObservation,
+) {
+	if r.readinessProven(gvk) {
+		return
+	}
+
+	var silent []string
+
+	for _, name := range stalledGroups {
+		if obs := obsByGroup[name]; obs.replicas > 0 && !obs.readyFound {
+			silent = append(silent, name)
+		}
+	}
+
+	if len(silent) > 0 {
+		r.event(pool, corev1.EventTypeWarning, "StatusMissing", "ChildStatus",
+			"%s has published no status.readyReplicas for group(s) %s in the whole "+
+				"deadline window; either the kind does not publish readiness or no "+
+				"replica has ever become ready, and the pool cannot tell these apart, "+
+				"so it reports 0 ready",
+			gvk.Kind, formatGroupNames(silent))
+	}
 }
 
 // stampGroupProgress applies the progress timestamp rules.
@@ -572,13 +622,9 @@ func (r *PodPoolReconciler) reconcileGroup(
 	// publishing figures we could not represent.
 	r.reportOutOfRange(pool, group.Name, gvk, desired.GetName(), obs.outOfRange)
 
-	// readyReplicas is omitempty on every built-in workload type, so an absent
-	// key means "zero, or never published" and the pool cannot tell which. It
-	// reports 0 ready either way, which for a kind that simply does not publish
-	// readiness is permanently wrong and invisible. Gated on the pool having
-	// asked for replicas at all, because a group told to run none has nothing
-	// to be ready.
-	r.reportStatusMissing(pool, group.Name, gvk, desired.GetName(), obs.readyFound, target)
+	if obs.readyFound {
+		r.markReadinessPublished(gvk)
+	}
 
 	return groupReconcileResult{
 		status: podpoolsv1alpha1.GroupStatus{
@@ -1061,47 +1107,6 @@ func classifyGroupError(groupName string, err error) pendingEvent {
 func (r *PodPoolReconciler) event(pool *podpoolsv1alpha1.PodPool, eventType, reason, action, noteFmt string, args ...any) {
 	if r.Recorder != nil {
 		r.Recorder.Eventf(pool, nil, eventType, reason, action, noteFmt, args...)
-	}
-}
-
-// reportStatusMissing emits one Warning per workload kind per process when a
-// child publishes no status.readyReplicas.
-//
-// Per GVK and not per pool: whether a kind publishes readiness is a fact about
-// the kind, so the second pool running the same CRD adds no information. That
-// is the opposite call from reportOutOfRange, where a child reporting nonsense
-// is a fact about that one object and gating per kind would silence every pool
-// after the first. The two maps look alike and are keyed differently on
-// purpose.
-func (r *PodPoolReconciler) reportStatusMissing(
-	pool *podpoolsv1alpha1.PodPool,
-	groupName string,
-	gvk schema.GroupVersionKind,
-	childName string,
-	readyFound bool,
-	target int32,
-) {
-	if readyFound || target <= 0 {
-		return
-	}
-
-	r.watchMu.Lock()
-
-	emitted := r.statusMissingEmitted[gvk]
-	if !emitted {
-		if r.statusMissingEmitted == nil {
-			r.statusMissingEmitted = make(map[schema.GroupVersionKind]bool)
-		}
-
-		r.statusMissingEmitted[gvk] = true
-	}
-
-	r.watchMu.Unlock()
-
-	if !emitted {
-		r.event(pool, corev1.EventTypeWarning, "StatusMissing", "ChildStatus",
-			"%s %s does not publish status.readyReplicas; the pool cannot track readiness for group %s",
-			gvk.Kind, childName, groupName)
 	}
 }
 
