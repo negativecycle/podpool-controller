@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -33,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -44,6 +46,10 @@ import (
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 	"github.com/negativecycle/podpool-controller/internal/workload"
 )
+
+// actionReconcileGroup is the `action` field on every group-scoped event: what
+// the controller was doing, as opposed to the reason it is telling you.
+const actionReconcileGroup = "ReconcileGroup"
 
 // childObservation is what one pass learned about a group's child workload.
 type childObservation struct {
@@ -93,6 +99,14 @@ type PodPoolReconciler struct {
 	Scheme     *runtime.Scheme
 	RESTMapper meta.RESTMapper
 	Cache      cache.Cache
+
+	// Recorder publishes Events. Events mark transitions; conditions carry
+	// state. The two are not alternatives: a condition answers "what is true
+	// now?" and is overwritten every pass, while an event answers "what
+	// happened, and when?" and is retained for its TTL. An operator running
+	// kubectl describe is asking the second question, and until now this
+	// controller could only answer the first.
+	Recorder events.EventRecorder
 
 	// Clock is injected rather than read from the wall, because deadline
 	// behaviour is untestable against time.Now: a test cannot wait ten
@@ -144,6 +158,11 @@ type PodPoolReconciler struct {
 // Pods are listed (never watched) for opportunistic sizing: the scheduler's
 // verdict on a handful of pods, not a permanent cache.
 // +kubebuilder:rbac:groups="",resources=pods,verbs=list
+
+// The recorder writes through events.k8s.io; the legacy core-group rule is
+// still needed because the client falls back to it against older servers.
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch;update
 
 // Reconcile moves the cluster toward the pool's desired state. Everything
 // starts from a fresh read of the pool: the request carries only a name, and
@@ -200,6 +219,11 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 			poolInvalid: true,
 		})
 
+		if conditionTupleChanged(before.Status.Conditions, pool.Status.Conditions, ConditionGroupsReady) {
+			r.event(&pool, corev1.EventTypeWarning, ReasonWorkloadTemplateInvalid, "ParseWorkloadTemplate",
+				"workloadTemplate has an invalid GVK: %v", err)
+		}
+
 		return ctrl.Result{RequeueAfter: requeueAfter(&pool)}, nil
 	}
 
@@ -234,7 +258,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	// The probe rides on top of the distribution rather than inside it, so the
 	// extra replica is funded by nobody: the pool briefly runs one over
 	// spec.replicas and the surplus is the question itself.
-	finalTargets, probePending := r.applyProbes(ctx, &pool, result.Targets, observed, now)
+	finalTargets, probePending := r.applyProbes(&pool, result.Targets, observed, now)
 
 	// Groups are reconciled independently: one that cannot be built or
 	// applied must not stop the others. Failures are collected and returned
@@ -242,7 +266,10 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	// still reach the original error through errors.As.
 	var errs []error
 
-	var failedGroups, notOwnedGroups []string
+	var (
+		failedGroups, notOwnedGroups []string
+		pendingGroupEvents           []pendingEvent
+	)
 
 	// The deep copy taken at the top is the status this pass read, before
 	// anything below overwrites it. Failed groups carry their previous row
@@ -259,13 +286,16 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 			errs = append(errs, fmt.Errorf("group %s: %w", group.Name, err))
 			failedGroups = append(failedGroups, group.Name)
 
-			reason := ReasonGroupReconcileFailed
+			pe := classifyGroupError(group.Name, err)
 
-			var notOwned *workloadNotOwnedError
-			if errors.As(err, &notOwned) {
+			// Reading the classifier's verdict back rather than running a
+			// second errors.As: one place decides the class, so the condition
+			// and the event can never disagree about what happened.
+			if pe.reason == ReasonWorkloadNotOwned {
 				notOwnedGroups = append(notOwnedGroups, group.Name)
-				reason = ReasonWorkloadNotOwned
 			}
+
+			pendingGroupEvents = append(pendingGroupEvents, pe)
 
 			// Carry the last observed counts and workloadRef forward. Dropping
 			// the group would report its replicas as lost while the child is
@@ -275,14 +305,14 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 			if previous := findGroupStatus(prevGroups, group.Name); previous != nil {
 				carried := *previous
 				carried.Ready = false
-				carried.Reason = reason
+				carried.Reason = pe.reason
 				carried.Message = ""
 				groupStatuses = append(groupStatuses, carried)
 			} else {
 				groupStatuses = append(groupStatuses, podpoolsv1alpha1.GroupStatus{
 					Name:           group.Name,
 					Ready:          false,
-					Reason:         reason,
+					Reason:         pe.reason,
 					TargetReplicas: finalTargets[i],
 				})
 			}
@@ -291,12 +321,6 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		}
 
 		grResult.status.TargetReplicas = finalTargets[i]
-
-		// The counts have already been clamped into something the API can
-		// store, so the pool is safe. Say so anyway: otherwise the operator
-		// sees a group pinned at an odd number with nothing explaining that
-		// its child is publishing figures we could not represent.
-		r.reportOutOfRange(ctx, &pool, group.Name, grResult.obs.outOfRange)
 
 		reconciledGroups[group.Name] = true
 
@@ -362,6 +386,18 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	pool.Status.GroupCount = int32(len(pool.Spec.Groups)) //nolint:gosec // spec.groups carries MaxItems=32, so len() fits int32
 	pool.Status.Groups = groupStatuses
 
+	// Emit a warning on the transition into stalled, not on every pass. With a
+	// requeue floor the pool wakes on its own for as long as it stays wedged,
+	// so an ungated warning is an unbounded stream against an object nobody is
+	// touching.
+	prevProgressing := meta.FindStatusCondition(before.Status.Conditions, ConditionProgressing)
+
+	wasStalled := prevProgressing != nil && prevProgressing.Reason == ReasonProgressDeadlineExceeded
+	if len(stalledGroups) > 0 && !wasStalled {
+		r.event(&pool, corev1.EventTypeWarning, ReasonProgressDeadlineExceeded, "ProgressDeadline",
+			"Group(s) %s exceeded progress deadline", formatGroupNames(stalledGroups))
+	}
+
 	setConditions(&pool, conditionInputs{
 		targetDegraded: result.TargetDegraded,
 		unplaced:       result.Unplaced,
@@ -371,6 +407,12 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		stalledGroups:  stalledGroups,
 		notOwnedGroups: notOwnedGroups,
 	})
+
+	if conditionTupleChanged(before.Status.Conditions, pool.Status.Conditions, ConditionGroupsReady) {
+		for _, pe := range pendingGroupEvents {
+			r.event(&pool, pe.eventType, pe.reason, pe.action, "%s", pe.note)
+		}
+	}
 
 	deleteStaleGroupMetrics(pool.Namespace, pool.Name,
 		groupNames(groupStatuses), groupNames(before.Status.Groups))
@@ -500,6 +542,16 @@ func (r *PodPoolReconciler) reconcileGroup(
 	if err != nil {
 		return groupReconcileResult{}, fmt.Errorf("reconciling workload: %w", err)
 	}
+
+	if obs.created {
+		r.event(pool, corev1.EventTypeNormal, "ChildCreated", "CreateWorkload", "Created %s %s", gvk.Kind, desired.GetName())
+	}
+
+	// The counts have already been clamped into something the API can store,
+	// so the pool is safe. Say so anyway: otherwise the operator sees a group
+	// pinned at an odd number with nothing explaining that its child is
+	// publishing figures we could not represent.
+	r.reportOutOfRange(pool, group.Name, gvk, desired.GetName(), obs.outOfRange)
 
 	return groupReconcileResult{
 		status: podpoolsv1alpha1.GroupStatus{
@@ -811,6 +863,13 @@ func (r *PodPoolReconciler) sweepOrphans(
 
 			continue
 		}
+
+		// A deletion is the one thing here that cannot be undone by the next
+		// pass, so it gets both a log line and an event: the log for whoever is
+		// reading the manager's output, the event for whoever is looking at the
+		// pool and wondering where their workload went.
+		r.event(pool, corev1.EventTypeNormal, "OrphanDeleted", "DeleteWorkload",
+			"Deleted orphaned %s %s ("+reasonFmt+")", gvk.Kind, item.GetName(), groupLabel)
 	}
 
 	return nil
@@ -884,35 +943,102 @@ func staleWorkloadGVKs(prev []podpoolsv1alpha1.GroupStatus, current schema.Group
 	return result
 }
 
-// reportOutOfRange logs, once per group per process, that a child published a
-// count outside the representable range, and re-arms once the child recovers.
-// The stored values are already clamped and safe; this exists so the clamp
-// does not launder the corruption into silence.
-func (r *PodPoolReconciler) reportOutOfRange(ctx context.Context, pool *podpoolsv1alpha1.PodPool, groupName string, outOfRange bool) {
+type pendingEvent struct {
+	eventType, reason, action, note string
+}
+
+// conditionTupleChanged reports whether the (status, reason, message) of a
+// named condition changed between the previous and current status. A nil
+// previous condition is treated as changed: the first-ever reconcile of a
+// broken pool emits.
+//
+// Gating events on this rather than diffing group names couples granularity to
+// message determinism: if a future change truncates messages to a column
+// budget, gating degrades toward fewer emissions and never toward spam. That
+// bias is deliberate. An event stream that occasionally misses a transition is
+// an inconvenience; one that repeats a warning every ten minutes for a week is
+// how people learn to ignore events entirely.
+func conditionTupleChanged(prev []metav1.Condition, cur []metav1.Condition, condType string) bool {
+	p := meta.FindStatusCondition(prev, condType)
+
+	c := meta.FindStatusCondition(cur, condType)
+	if p == nil || c == nil {
+		return p != c
+	}
+
+	return p.Status != c.Status || p.Reason != c.Reason || p.Message != c.Message
+}
+
+// classifyGroupError decides what a failed group's failure *is*, once, so the
+// condition reason and the event can never disagree about it.
+func classifyGroupError(groupName string, err error) pendingEvent {
+	var notOwned *workloadNotOwnedError
+	if errors.As(err, &notOwned) {
+		return pendingEvent{
+			corev1.EventTypeWarning, ReasonWorkloadNotOwned, actionReconcileGroup,
+			fmt.Sprintf("Refusing to manage group %s: %v", groupName, err),
+		}
+	}
+
+	return pendingEvent{
+		corev1.EventTypeWarning, ReasonGroupReconcileFailed, actionReconcileGroup,
+		fmt.Sprintf("Failed to reconcile group %s: %v", groupName, err),
+	}
+}
+
+// event is the one place that touches the Recorder, so a nil one (every
+// fake-client test, and any construction that forgets to wire it) degrades to
+// silence rather than a panic in the middle of a reconcile.
+func (r *PodPoolReconciler) event(pool *podpoolsv1alpha1.PodPool, eventType, reason, action, noteFmt string, args ...any) {
+	if r.Recorder != nil {
+		r.Recorder.Eventf(pool, nil, eventType, reason, action, noteFmt, args...)
+	}
+}
+
+// reportOutOfRange emits one Warning the first time a group's child publishes
+// a count that had to be clamped, and re-arms once the child recovers. The
+// stored values are already clamped and safe; this exists so the clamp does not
+// launder the corruption into silence.
+//
+// Gating on the transition rather than on every pass matters here more than
+// most: a child stuck publishing a bad number is reconciled on every heartbeat
+// and every child event, so an ungated warning is an unbounded event stream
+// against a pool that is otherwise working.
+func (r *PodPoolReconciler) reportOutOfRange(
+	pool *podpoolsv1alpha1.PodPool,
+	groupName string,
+	gvk schema.GroupVersionKind,
+	childName string,
+	outOfRange bool,
+) {
 	key := probeKey(pool, groupName)
 
+	// The lock covers the map and nothing else. Emitting under it would hold a
+	// process-wide mutex across a broadcast to every event sink, which is the
+	// kind of lock scope that only hurts when the cluster is already unwell.
 	r.outOfRangeMu.Lock()
-	defer r.outOfRangeMu.Unlock()
 
-	if r.outOfRangeEmitted == nil {
-		r.outOfRangeEmitted = make(map[string]bool)
-	}
+	already := r.outOfRangeEmitted[key]
 
-	if !outOfRange {
+	switch {
+	case !outOfRange:
 		delete(r.outOfRangeEmitted, key)
+	case !already:
+		if r.outOfRangeEmitted == nil {
+			r.outOfRangeEmitted = make(map[string]bool)
+		}
 
-		return
+		r.outOfRangeEmitted[key] = true
 	}
 
-	if r.outOfRangeEmitted[key] {
-		return
+	r.outOfRangeMu.Unlock()
+
+	if outOfRange && !already {
+		r.event(pool, corev1.EventTypeWarning, "ChildStatusOutOfRange", "ChildStatus",
+			"%s %s published a replica count outside the representable range; "+
+				"group %s is using a clamped value and its reported counts are not the child's",
+			gvk.Kind, childName, groupName)
 	}
-
-	r.outOfRangeEmitted[key] = true
-
-	logf.FromContext(ctx).Info(
-		"Child workload published counts outside the representable range; stored values are clamped",
-		"group", groupName)
 }
 
 // setUpWatch establishes the child watch and turns its outcome into an exit.
@@ -944,7 +1070,7 @@ func (r *PodPoolReconciler) setUpWatch(
 	// Ready. Nothing in the object mentions the watch, and the only other
 	// signal is deduped to one line per GVK per process.
 	setConditions(pool, conditionInputs{watchFailed: true})
-	r.handleWatchFailure(ctx, pool, gvk, err)
+	r.handleWatchFailure(pool, gvk, err)
 
 	return ctrl.Result{}, true, fmt.Errorf("setting up watch for %s: %w", gvk, err)
 }
@@ -954,9 +1080,7 @@ func (r *PodPoolReconciler) setUpWatch(
 // kind stays unservable, and a line per retry buries the one that mattered.
 // The record is cleared when the informer finally syncs, so a kind that
 // breaks again later is reported again.
-func (r *PodPoolReconciler) handleWatchFailure(
-	ctx context.Context, pool *podpoolsv1alpha1.PodPool, gvk schema.GroupVersionKind, err error,
-) {
+func (r *PodPoolReconciler) handleWatchFailure(pool *podpoolsv1alpha1.PodPool, gvk schema.GroupVersionKind, err error) {
 	r.watchMu.Lock()
 	r.initWatchMapsLocked()
 
@@ -967,15 +1091,14 @@ func (r *PodPoolReconciler) handleWatchFailure(
 	r.watchMu.Unlock()
 
 	if !emitted {
-		logf.FromContext(ctx).Error(err, "Failed to set up watch for workload kind",
-			"podpool", klog.KObj(pool), "gvk", gvk, "reason", ReasonWatchSetupFailed)
+		r.event(pool, corev1.EventTypeWarning, ReasonWatchSetupFailed, "SetupWatch",
+			"Failed to set up watch for %s: %v", gvk, err)
 	}
 }
 
 // applyProbes layers the +1 probe on top of the distribution for any
 // opportunistic groups that are due a heartbeat.
 func (r *PodPoolReconciler) applyProbes(
-	ctx context.Context,
 	pool *podpoolsv1alpha1.PodPool,
 	targets []int32,
 	observed map[string]opportunisticObservation,
@@ -991,15 +1114,16 @@ func (r *PodPoolReconciler) applyProbes(
 			continue
 		}
 
-		d := r.decideProbe(pool, group.Name, targets[i], observed[group.Name], now)
+		d := r.decideProbe(pool, group.Name, targets[i], observed[group.Name], now) //nolint:gosec // targets is len(pool.Spec.Groups)
 		if d.issued {
-			logf.FromContext(ctx).Info("Probing group for one replica beyond its observed capacity",
-				"group", group.Name)
+			r.event(pool, corev1.EventTypeNormal, "CapacityProbe", "ProbeCapacity",
+				"Probing group %s for one replica beyond its observed capacity", group.Name)
 		}
 
 		if d.abandoned {
-			logf.FromContext(ctx).Info("Probe got no scheduler verdict in time; treating it as refused",
-				"group", group.Name, "timeout", probeVerdictTimeout)
+			r.event(pool, corev1.EventTypeWarning, "CapacityProbeTimeout", "ProbeCapacity",
+				"Probe for group %s got no scheduler verdict within %s; treating it as refused",
+				group.Name, probeVerdictTimeout)
 		}
 
 		finalTargets[i] = d.target

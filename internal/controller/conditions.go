@@ -33,7 +33,10 @@ const (
 	ReasonProgressDeadlineExceeded   = "ProgressDeadlineExceeded"
 	ReasonPoolReady                  = "PoolReady"
 	ReasonWorkloadUpdating           = "WorkloadUpdating"
-	ReasonWatchSetupFailed           = "WatchSetupFailed"
+	ReasonWorkloadTemplateInvalid    = "WorkloadTemplateInvalid"
+	// Used as both a condition reason and an event reason, from one constant so
+	// the two cannot drift.
+	ReasonWatchSetupFailed = "WatchSetupFailed"
 )
 
 // retiredConditionTypes are condition types this controller used to publish
