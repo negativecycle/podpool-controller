@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -304,19 +305,239 @@ var _ = Describe("Manager", Ordered, func() {
 			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
 		})
 
-		// +kubebuilder:scaffold:e2e-webhooks-checks
+		It("should provisioned cert-manager", func() {
+			By("validating that cert-manager has the certificate Secret")
+			verifyCertManager := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "secrets", "webhook-server-cert", "-n", namespace)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+			}
+			Eventually(verifyCertManager).Should(Succeed())
+		})
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+		It("should have CA injection for mutating webhooks", func() {
+			By("checking CA injection for mutating webhooks")
+			verifyCAInjection := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get",
+					"mutatingwebhookconfigurations.admissionregistration.k8s.io",
+					"podpools-mutating-webhook-configuration",
+					"-o", "go-template={{ range .webhooks }}{{ .clientConfig.caBundle }}{{ end }}")
+				mwhOutput, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(len(mwhOutput)).To(BeNumerically(">", 10))
+			}
+			Eventually(verifyCAInjection).Should(Succeed())
+		})
+
+		It("should have CA injection for validating webhooks", func() {
+			By("checking CA injection for validating webhooks")
+			verifyCAInjection := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get",
+					"validatingwebhookconfigurations.admissionregistration.k8s.io",
+					"podpools-validating-webhook-configuration",
+					"-o", "go-template={{ range .webhooks }}{{ .clientConfig.caBundle }}{{ end }}")
+				vwhOutput, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(len(vwhOutput)).To(BeNumerically(">", 10))
+			}
+			Eventually(verifyCAInjection).Should(Succeed())
+		})
+
+		// +kubebuilder:scaffold:e2e-webhooks-checks
+	})
+
+	Context("PodPool lifecycle", func() {
+		const (
+			podpoolName = "e2e-lifecycle"
+			testNS      = "podpool-e2e-test"
+		)
+
+		BeforeAll(func() {
+			By("creating test namespace")
+			cmd := exec.Command("kubectl", "create", "ns", testNS)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		AfterAll(func() {
+			By("removing test namespace")
+			cmd := exec.Command("kubectl", "delete", "ns", testNS, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		})
+
+		It("should create child Deployments matching group spec", func() {
+			By("applying a PodPool with two groups")
+			cmd := exec.Command("kubectl", "apply", "-n", testNS, "-f", "-")
+			cmd.Stdin = podpoolManifest(podpoolName, 6, 3)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for child Deployments to appear")
+			verifyDeployments := func(g Gomega) {
+				out := kubectlGetJSON(g, testNS, "deployments",
+					"-l", fmt.Sprintf("podpools.dev/pool=%s", podpoolName))
+				items := jsonItems(out)
+				g.Expect(items).To(HaveLen(2), "expected 2 child Deployments")
+			}
+			Eventually(verifyDeployments, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("verifying base group has 3 replicas and burst gets the remainder")
+			verifyReplicas := func(g Gomega) {
+				baseReplicas := deploymentReplicas(g, testNS, podpoolName+"-base")
+				burstReplicas := deploymentReplicas(g, testNS, podpoolName+"-burst")
+				g.Expect(baseReplicas).To(Equal(3), "base group should have min=3 replicas")
+				g.Expect(burstReplicas).To(Equal(3), "burst group should get the remaining 3 replicas")
+			}
+			Eventually(verifyReplicas, time.Minute, 2*time.Second).Should(Succeed())
+
+			By("verifying PodPool status is populated")
+			verifyStatus := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "podpool", podpoolName, "-n", testNS,
+					"-o", "jsonpath={.status.groupCount}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("2"))
+			}
+			Eventually(verifyStatus, time.Minute, 2*time.Second).Should(Succeed())
+		})
+
+		It("should scale child Deployments when replicas change", func() {
+			By("scaling the PodPool to 10 replicas")
+			cmd := exec.Command("kubectl", "patch", "podpool", podpoolName, "-n", testNS,
+				"--type=merge", "-p", `{"spec":{"replicas":10}}`)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying base scales to target ceiling and burst absorbs overflow")
+			verifyScale := func(g Gomega) {
+				baseReplicas := deploymentReplicas(g, testNS, podpoolName+"-base")
+				burstReplicas := deploymentReplicas(g, testNS, podpoolName+"-burst")
+				g.Expect(baseReplicas).To(Equal(5))
+				g.Expect(burstReplicas).To(Equal(5))
+			}
+			Eventually(verifyScale, time.Minute, 2*time.Second).Should(Succeed())
+		})
+
+		It("should delete orphaned Deployments when a group is removed", func() {
+			By("updating the PodPool to a single group")
+			cmd := exec.Command("kubectl", "apply", "-n", testNS, "-f", "-")
+			cmd.Stdin = podpoolManifest(podpoolName, 5, 5)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for burst Deployment to be deleted")
+			verifyOrphanDeleted := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "deployment", podpoolName+"-burst",
+					"-n", testNS, "--ignore-not-found", "-o", "name")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(BeEmpty(), "burst Deployment should be deleted")
+			}
+			Eventually(verifyOrphanDeleted, time.Minute, 2*time.Second).Should(Succeed())
+
+			By("verifying base Deployment has all 5 replicas")
+			verifyBaseScaled := func(g Gomega) {
+				g.Expect(deploymentReplicas(g, testNS, podpoolName+"-base")).To(Equal(5))
+			}
+			Eventually(verifyBaseScaled, time.Minute, 2*time.Second).Should(Succeed())
+		})
+
+		It("should clean up all children when the PodPool is deleted", func() {
+			By("deleting the PodPool")
+			cmd := exec.Command("kubectl", "delete", "podpool", podpoolName, "-n", testNS)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for all child Deployments to be garbage collected")
+			verifyCleanup := func(g Gomega) {
+				out := kubectlGetJSON(g, testNS, "deployments",
+					"-l", fmt.Sprintf("podpools.dev/pool=%s", podpoolName))
+				items := jsonItems(out)
+				g.Expect(items).To(BeEmpty(), "all child Deployments should be garbage collected")
+			}
+			Eventually(verifyCleanup, time.Minute, 2*time.Second).Should(Succeed())
+		})
 	})
 })
+
+func podpoolManifest(name string, replicas, baseMin int) *strings.Reader {
+	if baseMin == replicas {
+		return strings.NewReader(fmt.Sprintf(`apiVersion: podpools.dev/v1alpha1
+kind: PodPool
+metadata:
+  name: %s
+spec:
+  replicas: %d
+  workloadTemplate:
+    apiVersion: apps/v1
+    kind: Deployment
+    spec:
+      template:
+        spec:
+          containers:
+          - name: app
+            image: nginx:latest
+  groups:
+  - name: base
+    scaling:
+      min: %d
+`, name, replicas, baseMin))
+	}
+	return strings.NewReader(fmt.Sprintf(`apiVersion: podpools.dev/v1alpha1
+kind: PodPool
+metadata:
+  name: %s
+spec:
+  replicas: %d
+  workloadTemplate:
+    apiVersion: apps/v1
+    kind: Deployment
+    spec:
+      template:
+        spec:
+          containers:
+          - name: app
+            image: nginx:latest
+  groups:
+  - name: base
+    scaling:
+      min: %d
+      target: "50%%"
+  - name: burst
+    scaling:
+      min: 0
+`, name, replicas, baseMin))
+}
+
+func kubectlGetJSON(g Gomega, ns, resource string, extraArgs ...string) string {
+	args := []string{"get", resource, "-n", ns, "-o", "json"}
+	args = append(args, extraArgs...)
+	cmd := exec.Command("kubectl", args...)
+	out, err := utils.Run(cmd)
+	g.Expect(err).NotTo(HaveOccurred())
+	return out
+}
+
+func jsonItems(raw string) []any {
+	var parsed struct {
+		Items []any `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil
+	}
+	return parsed.Items
+}
+
+func deploymentReplicas(g Gomega, ns, name string) int {
+	cmd := exec.Command("kubectl", "get", "deployment", name, "-n", ns,
+		"-o", "jsonpath={.spec.replicas}")
+	out, err := utils.Run(cmd)
+	g.Expect(err).NotTo(HaveOccurred())
+	var replicas int
+	_, err = fmt.Sscanf(out, "%d", &replicas)
+	g.Expect(err).NotTo(HaveOccurred())
+	return replicas
+}
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.
 // It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
