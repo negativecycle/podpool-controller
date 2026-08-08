@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/utils/clock"
+	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
@@ -12,6 +14,32 @@ import (
 // testGroupScavShort keeps the child's name inside the DNS budget in tests that
 // build one by hand.
 const testGroupScavShort = "scav"
+
+// ---------------------------------------------------------------------------
+// #35 — the clock
+// ---------------------------------------------------------------------------
+
+// The field has existed since the progress deadline was born: every deadline
+// test in this package already swaps in a fake. These two pin the seam itself,
+// so the field cannot narrow to a concrete type — the fake and the real clock
+// are the two implementations that must keep fitting.
+
+func TestClockFieldExistsAndAcceptsFake(t *testing.T) {
+	fake := clocktesting.NewFakePassiveClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	r := &PodPoolReconciler{Clock: fake}
+
+	got := r.Clock.Now()
+	if !got.Equal(fake.Now()) {
+		t.Errorf("Clock.Now() = %v, want %v", got, fake.Now())
+	}
+}
+
+func TestClockFieldAcceptsRealClock(t *testing.T) {
+	r := &PodPoolReconciler{Clock: clock.RealClock{}}
+	if r.Clock == nil {
+		t.Fatal("Clock is nil after setting to RealClock")
+	}
+}
 
 func TestDecideProbeHeartbeatArithmeticIsTimeControlled(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
