@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$STAGED_FILES" ]; then
+    exit 0
+fi
+
+# --- Fix trailing whitespace ---
+for f in $STAGED_FILES; do
+    if [ -f "$f" ] && grep -qP '\s+$' "$f" 2>/dev/null; then
+        sed -i 's/[[:space:]]*$//' "$f"
+        git add "$f"
+        echo "pre-commit: fixed trailing whitespace in $f"
+    fi
+done
+
+# --- Fix missing final newline ---
+for f in $STAGED_FILES; do
+    if [ -f "$f" ] && [ -s "$f" ] && [ "$(tail -c1 "$f" | wc -l)" -eq 0 ]; then
+        echo "" >> "$f"
+        git add "$f"
+        echo "pre-commit: added final newline to $f"
+    fi
+done
+
+# --- hadolint on changed Dockerfiles ---
+# Runs before golangci-lint because it is instant and that is not.
+STAGED_DOCKERFILES=$(echo "$STAGED_FILES" | grep -E '(^|/)Dockerfile(\..+)?$|\.dockerfile$' || true)
+
+if [ -n "$STAGED_DOCKERFILES" ]; then
+    if command -v hadolint >/dev/null 2>&1; then
+        echo "pre-commit: running hadolint on changed Dockerfiles..."
+        echo "$STAGED_DOCKERFILES" | xargs hadolint
+    else
+        # hadolint is Haskell, so unlike the Go tooling it cannot be installed
+        # via the Makefile. Warn rather than block a contributor who lacks it.
+        echo "pre-commit: hadolint not installed, skipping Dockerfile scan"
+        echo "            see https://github.com/hadolint/hadolint#install"
+    fi
+fi
+
+# --- golangci-lint on changed Go packages ---
+STAGED_GO_FILES=$(echo "$STAGED_FILES" | grep '\.go$' || true)
+
+if [ -n "$STAGED_GO_FILES" ]; then
+    PACKAGES=$(echo "$STAGED_GO_FILES" | xargs -I{} dirname {} | sort -u | sed 's|^|./|')
+    # Exclude packages that require build tags (e2e, kwok) — CI handles those.
+    PACKAGES=$(echo "$PACKAGES" | grep -v -E '^\./test/(e2e|kwok)' || true)
+    if [ -n "$PACKAGES" ]; then
+        echo "pre-commit: running golangci-lint on changed packages..."
+        golangci-lint run --new-from-rev=HEAD $PACKAGES
+    fi
+fi
+
+echo "pre-commit: checks passed"

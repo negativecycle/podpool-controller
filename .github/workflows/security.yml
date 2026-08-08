@@ -1,0 +1,81 @@
+name: Security
+
+on:
+  pull_request:
+  schedule:
+    # Weekly, so newly disclosed CVEs surface without waiting for a push.
+    - cron: '0 6 * * 1'
+
+# A force-push supersedes the run it interrupted; without this the obsolete
+# one keeps a runner busy to no purpose.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  govulncheck:
+    permissions:
+      contents: read
+    name: Go vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run govulncheck
+        run: make vulncheck
+
+  dockerfile-scan:
+    permissions:
+      contents: read
+    name: Dockerfile lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # Backstops the pre-commit hook, which is local, skippable, and silently
+      # skips when hadolint is not installed. This action bundles hadolint
+      # v2.15.0, matching what the hook runs, so findings do not diverge.
+      - name: Run hadolint
+        uses: hadolint/hadolint-action@2a66e89f53d0771bb131a7fa31f3136336094aa6 # v3.4.0
+        with:
+          dockerfile: Dockerfile
+          recursive: true
+          # hadolint's own default, and therefore what the hook enforces.
+          failure-threshold: info
+
+  image-scan:
+    permissions:
+      contents: read
+    name: Container image scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build the manager image
+        run: make docker-build IMG=podpools:scan
+
+      - name: Scan the image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: podpools:scan
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          # Unfixed CVEs are not actionable — fail only on ones we can remediate.
+          ignore-unfixed: true
