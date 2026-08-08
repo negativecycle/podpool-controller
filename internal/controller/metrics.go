@@ -130,6 +130,44 @@ type groupMetric struct {
 	lastProgressTime float64 // unix seconds; 0 means at target
 }
 
+// groupMetricsFrom projects a pool's published group statuses into the shape
+// the gauges take.
+func groupMetricsFrom(groups []podpoolsv1alpha1.GroupStatus) []groupMetric {
+	out := make([]groupMetric, len(groups))
+
+	for i, gs := range groups {
+		var lpt float64
+		if gs.LastProgressTime != nil {
+			lpt = float64(gs.LastProgressTime.Unix())
+		}
+
+		out[i] = groupMetric{
+			name:             gs.Name,
+			replicas:         gs.Replicas,
+			ready:            gs.ReadyReplicas,
+			sharePercent:     gs.SharePercent,
+			lastProgressTime: lpt,
+		}
+	}
+
+	return out
+}
+
+// recordPoolMetricsFromStatus publishes a pool's gauges from what it is about
+// to persist.
+//
+// Deriving from status rather than from the reconcile's local aggregates is
+// what lets this run on every exit, including the early returns that compute no
+// aggregates at all. Status carries every input by the time any exit is
+// reached, so there is one call site beside the one status write instead of one
+// per exit, which is how exits come to disagree in the first place.
+func recordPoolMetricsFromStatus(pool *podpoolsv1alpha1.PodPool) {
+	recordPoolMetrics(pool.Namespace, pool.Name,
+		pool.Spec.Replicas,
+		pool.Status.Replicas, pool.Status.ReadyReplicas, pool.Status.UnplacedReplicas,
+		groupMetricsFrom(pool.Status.Groups), pool.Status.Conditions)
+}
+
 func recordPoolMetrics(
 	namespace, name string,
 	spec, replicas, ready, unplaced int32,

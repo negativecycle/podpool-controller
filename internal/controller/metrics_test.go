@@ -259,6 +259,48 @@ func TestReconcileRetiresADroppedGroupsSeries(t *testing.T) {
 	}
 }
 
+// The exits that compute nothing are the ones that matter. A pool whose
+// template stops parsing returns before any aggregate exists, so a recording
+// call placed at the bottom of Reconcile never runs and the gauges keep
+// reporting the pool's last healthy numbers. Alerting keyed on the metric never
+// fires; alerting keyed on the object cannot see the metric.
+func TestEarlyExitStillPublishesMetrics(t *testing.T) {
+	pool := fakeTestPool()
+	pool.Namespace = "metrics-earlyexit"
+	pool.Name = "pool-earlyexit"
+
+	r, cl := newFakeReconciler(t, nil, pool)
+	t.Cleanup(func() { deletePoolMetrics(pool.Namespace, pool.Name) })
+
+	// A healthy pass first, so there are values to go stale.
+	reconcilePool(t, r, pool)
+
+	if got := conditionSeries(t, pool.Namespace, pool.Name)[ConditionGroupsReady+"/true"]; got != 1 {
+		t.Fatalf("precondition: GroupsReady/true = %v, want 1", got)
+	}
+
+	live := getPool(t, cl, pool)
+	live.Spec.WorkloadTemplate.Raw = []byte(`{"not":"valid"}`)
+
+	if err := cl.Update(t.Context(), live); err != nil {
+		t.Fatalf("breaking the template: %v", err)
+	}
+
+	// This pass returns from the GVK check, long before any aggregate is
+	// computed.
+	reconcilePool(t, r, live)
+
+	series := conditionSeries(t, pool.Namespace, pool.Name)
+	if got := series[ConditionGroupsReady+"/false"]; got != 1 {
+		t.Errorf("GroupsReady/false = %v after the early exit, want 1 -- the gauges are "+
+			"frozen at the pool's last healthy values", got)
+	}
+
+	if got := series[ConditionGroupsReady+"/true"]; got != 0 {
+		t.Errorf("GroupsReady/true = %v after the early exit, want 0", got)
+	}
+}
+
 // A group standing at its target has no last-progress timestamp, and the gauge
 // must have no series rather than a series reading zero: zero is a real unix
 // timestamp, and "seconds since last progress" against it is 56 years.

@@ -208,6 +208,20 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	// on every exit path, and only when it actually differs from what we read.
 	before := pool.DeepCopy()
 	defer func() {
+		// Beside the single status write, deliberately, and in the same defer
+		// rather than a second one so the ordering stays obvious. Every exit
+		// that mutates conditions reaches here, which is what stops the next
+		// early return from silently freezing the gauges.
+		//
+		// The condition cleanup runs here rather than beside its group twin in
+		// the full path. Conditions are written on every exit, including the
+		// watch-failure one, so a type can disappear on a pass that never
+		// reaches the full path. Putting it below would rebuild the split this
+		// commit removes.
+		deleteStaleConditionMetrics(pool.Namespace, pool.Name,
+			pool.Status.Conditions, before.Status.Conditions)
+		recordPoolMetricsFromStatus(&pool)
+
 		if err := r.patchStatus(ctx, before, &pool); err != nil {
 			reterr = kerrors.NewAggregate([]error{reterr, err})
 		}
@@ -434,32 +448,11 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		}
 	}
 
+	// Only the removal half stays here: it is the one thing that needs the
+	// previous pass's groups, which the deferred recording does not have. The
+	// gauges themselves are published from status in the defer.
 	deleteStaleGroupMetrics(pool.Namespace, pool.Name,
 		groupNames(groupStatuses), groupNames(before.Status.Groups))
-	deleteStaleConditionMetrics(pool.Namespace, pool.Name,
-		pool.Status.Conditions, before.Status.Conditions)
-
-	metricGroups := make([]groupMetric, len(groupStatuses))
-
-	for i, gs := range groupStatuses {
-		var lpt float64
-		if gs.LastProgressTime != nil {
-			lpt = float64(gs.LastProgressTime.Unix())
-		}
-
-		metricGroups[i] = groupMetric{
-			name:             gs.Name,
-			replicas:         gs.Replicas,
-			ready:            gs.ReadyReplicas,
-			sharePercent:     gs.SharePercent,
-			lastProgressTime: lpt,
-		}
-	}
-
-	recordPoolMetrics(pool.Namespace, pool.Name,
-		pool.Spec.Replicas,
-		pool.Status.Replicas, pool.Status.ReadyReplicas, pool.Status.UnplacedReplicas,
-		metricGroups, pool.Status.Conditions)
 
 	if err := kerrors.NewAggregate(errs); err != nil {
 		return ctrl.Result{}, err
