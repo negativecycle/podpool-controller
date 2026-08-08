@@ -1,34 +1,73 @@
 version: "2"
 run:
   allow-parallel-runners: true
+  build-tags:
+    - kwok
 linters:
   default: none
   enable:
+    - asciicheck
+    - bidichk
     - copyloopvar
     - depguard
     - dupl
+    - dupword
+    - embeddedstructfieldcheck
+    - durationcheck
     - errcheck
+    - errname
+    - errchkjson
+    # errorlint: #28's terminal-error classification is built on errors.As, and
+    # a single fmt.Errorf("...: %v", err) silently converts a terminal failure
+    # into one that retries forever. This linter prevents that.
+    - errorlint
+    - exptostd
+    - fatcontext
+    - forbidigo
+    - forcetypeassert
+    - funcorder
     - ginkgolinter
+    - gocheckcompilerdirectives
     - goconst
     - gocyclo
+    - godot
+    - gosec
     - govet
+    - inamedparam
     - ineffassign
+    - intrange
     - lll
+    - loggercheck
     - modernize
     - misspell
     - nakedret
+    - nilerr
+    - nilnesserr
+    - nlreturn
+    - nolintlint
+    - perfsprint
     - prealloc
+    - predeclared
+    - reassign
+    - recvcheck
     - revive
     - staticcheck
+    # tparallel guards the two level t.Parallel pattern: a test that opts into
+    # parallelism must mark its subtests too, and the reverse. Serial packages
+    # (internal/controller, deliberately) are untouched by it.
+    - tparallel
     - unconvert
     - unparam
     - unused
-    - logcheck
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - wsl_v5
   settings:
-    custom:
-      logcheck:
-        type: "module"
-        description: Checks Go logging calls for Kubernetes logging conventions.
+    forbidigo:
+      forbid:
+        - pattern: ^time\.Now$
+          msg: take the time from the reconciler's clock.PassiveClock so tests can control it
     depguard:
       rules:
         forbid-sort-pkg:
@@ -43,6 +82,27 @@ linters:
       disable:
         - omitzero
         - newexpr
+    gocyclo:
+      min-complexity: 35
+    nolintlint:
+      require-specific: true
+      require-explanation: true
+    # The option names matter: `make lint-config` validates them against the
+    # JSON schema, and a misspelled key (str-concat, klogr) is silently ignored
+    # by `run` while failing `config verify` — the setting you think you have
+    # is the one that is not applied.
+    perfsprint:
+      strconcat: false
+      err-error: true
+    loggercheck:
+      klog: true
+    # The context checks are off by default. t.Context() is canceled when the
+    # test ends, so work leaking past its test fails inside the test that owns
+    # it instead of poisoning a neighbour.
+    usetesting:
+      context-background: true
+      context-todo: true
+      os-temp-dir: true
   exclusions:
     generated: lax
     rules:
@@ -53,6 +113,35 @@ linters:
           - dupl
           - lll
         path: internal/*
+      - linters:
+          - goconst
+          - lll
+        path: ^test/
+      # The kwok tier's helpers serve test-time and t.Cleanup-time callers
+      # alike, and t.Context() is canceled before Cleanup callbacks run: a
+      # mechanical rewrite would hand the topology restore path a dead
+      # context. Only a live kwok cluster can catch that, so this tier keeps
+      # context.Background.
+      - linters:
+          - usetesting
+        path: ^test/
+      # gosec findings in test code are triaged wholesale: InsecureSkipVerify
+      # against a local envtest webhook, exec'ing kubectl in e2e helpers, and
+      # index assertions on fixtures are the point of that code, not defects.
+      # Accepted cost: a real security bug in a test helper goes unflagged.
+      - linters:
+          - gosec
+        path: _test\.go$
+      - linters:
+          - gosec
+        path: ^test/
+      - linters:
+          - errchkjson
+          - fatcontext
+          - forbidigo
+          - forcetypeassert
+          - godot
+        path: _test\.go$
     paths:
       - third_party$
       - builtin$

@@ -40,5 +40,7 @@ jobs:
         run: make lint-config
       - name: Run linter
         run: make lint
+      - name: Lint API types (kube-api-linter)
+        run: make lint-api
       - name: Verify generated output
         run: make verify-generate

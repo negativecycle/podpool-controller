@@ -143,6 +143,10 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
 
+.PHONY: lint-api
+lint-api: golangci-lint-kal ## Lint API types with kube-api-linter
+	"$(GOLANGCI_KAL)" run --config .golangci-kal.yml ./api/...
+
 .PHONY: verify-generate
 verify-generate: manifests generate ## Fail if generated output differs from what is committed.
 	go mod tidy
@@ -244,6 +248,7 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+GOLANGCI_KAL = $(LOCALBIN)/golangci-lint-kube-api-linter
 GOVULNCHECK ?= $(LOCALBIN)/govulncheck
 
 ## Tool Versions
@@ -261,6 +266,9 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
 GOLANGCI_LINT_VERSION ?= v2.12.2
+# KAL has no tagged releases; this is main HEAD as of 2026-07-16. Revisit when
+# the project cuts a tag — its release workflow exists but has never fired.
+KAL_VERSION ?= v0.0.0-20260716143926-092fe0c72997
 GOVULNCHECK_VERSION ?= v1.6.0
 
 .PHONY: kustomize
@@ -290,11 +298,11 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
-	@test -f .custom-gcl.yml && { \
-		echo "Building custom golangci-lint with plugins..." && \
-		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
-		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
-	} || true
+
+.PHONY: golangci-lint-kal
+golangci-lint-kal: $(GOLANGCI_KAL) ## Download kube-api-linter locally if necessary.
+$(GOLANGCI_KAL): $(LOCALBIN)
+	$(call go-install-tool,$(GOLANGCI_KAL),sigs.k8s.io/kube-api-linter/cmd/golangci-lint-kube-api-linter,$(KAL_VERSION))
 
 .PHONY: govulncheck
 govulncheck: $(GOVULNCHECK) ## Download govulncheck locally if necessary.
