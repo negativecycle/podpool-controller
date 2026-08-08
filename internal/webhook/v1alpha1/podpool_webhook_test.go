@@ -7,26 +7,28 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
 
 const (
-	testGroupBase   = "base"
-	testGroupBurst  = "burst"
-	fieldSpec       = "spec"
-	fieldAPIVersion = "apiVersion"
-	fieldKind       = "kind"
-	fieldTemplate   = "template"
-	fieldContainers = "containers"
-	fieldApp        = "app"
-	fieldImage      = "image"
-	fieldName       = "name"
-	appsV1          = "apps/v1"
-	kindDeployment  = "Deployment"
-	imageNginx      = "nginx"
-	shapeEmpty      = "empty"
+	testGroupBase      = "base"
+	testGroupBurst     = "burst"
+	testGroupScavenger = "scavenger"
+	fieldSpec          = "spec"
+	fieldAPIVersion    = "apiVersion"
+	fieldKind          = "kind"
+	fieldTemplate      = "template"
+	fieldContainers    = "containers"
+	fieldApp           = "app"
+	fieldImage         = "image"
+	fieldName          = "name"
+	appsV1             = "apps/v1"
+	kindDeployment     = "Deployment"
+	imageNginx         = "nginx"
+	shapeEmpty         = "empty"
 )
 
 func validWorkloadTemplate() runtime.RawExtension {
@@ -46,6 +48,15 @@ func validWorkloadTemplate() runtime.RawExtension {
 	raw, _ := json.Marshal(tmpl)
 
 	return runtime.RawExtension{Raw: raw}
+}
+
+// rawTarget builds a target the CEL rule would reject, which is the only way
+// such a value reaches this code: on a stored object admitted before the rule,
+// or against a stale CRD.
+func rawTarget(s string) *intstr.IntOrString {
+	v := intstr.FromString(s)
+
+	return &v
 }
 
 func opportunisticPtr() *bool {
@@ -474,5 +485,106 @@ func TestDefaulterLeavesMinAloneWhenMaxIsSet(t *testing.T) {
 
 	if got := pool.Spec.Groups[0].Scaling.Min; got != nil {
 		t.Errorf("defaulter injected min=%d into a group that declared max; want it left unset", *got)
+	}
+}
+
+// The cross-group rules: displaced replicas need somewhere to go.
+func TestValidateOpportunisticAcrossGroups(t *testing.T) {
+	t.Parallel()
+
+	opp := podpoolsv1alpha1.GroupSpec{
+		Name:    testGroupScavenger,
+		Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Opportunistic: opportunisticPtr()},
+	}
+	overflow := podpoolsv1alpha1.GroupSpec{
+		Name:    testGroupBurst,
+		Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)},
+	}
+	secondOpp := podpoolsv1alpha1.GroupSpec{
+		Name:    "scavenger-two",
+		Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Opportunistic: opportunisticPtr()},
+	}
+	capped := podpoolsv1alpha1.GroupSpec{
+		Name:    testGroupBase,
+		Scaling: podpoolsv1alpha1.ScalingConstraints{Max: ptr.To[int32](5), Target: pctStr(30)},
+	}
+
+	tests := []struct {
+		name    string
+		groups  []podpoolsv1alpha1.GroupSpec
+		wantErr bool
+	}{
+		{
+			name:   "an opportunistic group followed by an overflow is fine",
+			groups: []podpoolsv1alpha1.GroupSpec{opp, overflow},
+		},
+		{
+			// The group ahead of it is capped on purpose. An unbounded one
+			// would trip the second rule as well, and a row that two rules
+			// can satisfy proves neither.
+			name:    "an opportunistic group last has nowhere to spill",
+			groups:  []podpoolsv1alpha1.GroupSpec{capped, opp},
+			wantErr: true,
+		},
+		{
+			// Overflow goes to the first unbounded group in list order. An
+			// uncapped group ahead of the opportunistic one intercepts the
+			// displaced replicas — demonstrated on kwok, where an uncapped
+			// base absorbed the whole pool.
+			name: "an unbounded group before the opportunistic one steals the spill",
+			groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](2)}},
+				opp,
+				overflow,
+			},
+			wantErr: true,
+		},
+		{
+			name: "a capped group before the opportunistic one is fine",
+			groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](2), Target: pctStr(20)}},
+				opp,
+				overflow,
+			},
+		},
+		{
+			name:   "a max+target group before the opportunistic one is fine",
+			groups: []podpoolsv1alpha1.GroupSpec{capped, opp, overflow},
+		},
+		{
+			// An opportunistic group cannot steal another one's spill, because
+			// it has no static ceiling to absorb it with — phase 4 skips both.
+			// This is the row that distinguishes the shared IsBounded from
+			// asking GroupCeiling, which reports an opportunistic group as
+			// unbounded and would reject this legal pool.
+			name:   "an opportunistic group before another one is not an interceptor",
+			groups: []podpoolsv1alpha1.GroupSpec{opp, secondOpp, overflow},
+		},
+		{
+			// A target nobody can parse is still a cap: the distributor binds
+			// the group at zero, so it cannot intercept anything. Reading it
+			// as unbounded would reject a legal pool — and reading it the
+			// other way round, in the distributor, is the bug that made this
+			// predicate shared in the first place.
+			name: "an unreadable target before the opportunistic one is still a cap",
+			groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{
+					Min: ptr.To[int32](2), Target: rawTarget("thirty percent"),
+				}},
+				opp,
+				overflow,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			errs := validateOpportunistic(field.NewPath("spec", "groups"), tt.groups)
+			if got := len(errs) > 0; got != tt.wantErr {
+				t.Errorf("error = %v, want %v (%v)", got, tt.wantErr, errs)
+			}
+		})
 	}
 }

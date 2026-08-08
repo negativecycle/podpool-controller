@@ -102,6 +102,57 @@ func validateWorkloadTemplate(fp *field.Path, raw []byte) field.ErrorList {
 	return allErrs
 }
 
+// validateOpportunistic enforces the two rules that span groups rather than
+// living inside one.
+func validateOpportunistic(groupsPath *field.Path, groups []podpoolsv1alpha1.GroupSpec) field.ErrorList {
+	var allErrs field.ErrorList
+
+	var anyOpportunistic bool
+
+	for _, g := range groups {
+		if g.Scaling.Opportunistic != nil && *g.Scaling.Opportunistic {
+			anyOpportunistic = true
+		}
+	}
+
+	if !anyOpportunistic {
+		return nil
+	}
+
+	for i, g := range groups {
+		if g.Scaling.Opportunistic == nil || !*g.Scaling.Opportunistic {
+			continue
+		}
+		// Replicas this group cannot place have to land somewhere. Without a
+		// later group they would simply go missing, and the pool would run
+		// below spec.replicas with no indication why.
+		if i == len(groups)-1 {
+			allErrs = append(allErrs, field.Invalid(
+				groupsPath.Index(i).Child("scaling", "opportunistic"), true,
+				"an opportunistic group must be followed by a group that can absorb what it cannot place"))
+		}
+		// Overflow lands on the first unbounded group in LIST order. One
+		// placed before this group intercepts the displaced replicas and (as
+		// it shares no capacity discovery) pins them Pending on a tier that
+		// is already full. Found empirically: an uncapped base swallowed the
+		// whole pool while burst sat at zero.
+		//
+		// workload.IsBounded rather than a local presence check: this guard is
+		// only as good as its agreement with the distributor, and a local copy
+		// that read a malformed target as a cap let exactly the case it was
+		// written for through (#71).
+		for j := range i {
+			if !workload.IsBounded(groups[j].Scaling) {
+				allErrs = append(allErrs, field.Invalid(
+					groupsPath.Index(j).Child("scaling"), groups[j].Name,
+					"a group without max or target placed before an opportunistic group would absorb its displaced replicas; cap it or move it after"))
+			}
+		}
+	}
+
+	return allErrs
+}
+
 func validatePodPoolSpec(pp *podpoolsv1alpha1.PodPool) field.ErrorList {
 	var allErrs field.ErrorList
 
@@ -138,6 +189,8 @@ func validatePodPoolSpec(pp *podpoolsv1alpha1.PodPool) field.ErrorList {
 
 		allErrs = append(allErrs, validateScaling(gp.Child("scaling"), &g.Scaling)...)
 	}
+
+	allErrs = append(allErrs, validateOpportunistic(groupsPath, pp.Spec.Groups)...)
 
 	return allErrs
 }
