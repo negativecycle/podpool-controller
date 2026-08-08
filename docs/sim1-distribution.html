@@ -1,0 +1,757 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Replica distribution — PodPool Sim 1</title>
+<meta name="description" content="Explore how a PodPool splits its replicas across groups under min, target and max constraints.">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Replica distribution — PodPool Sim 1">
+<meta property="og:description" content="Explore how a PodPool splits its replicas across groups under min, target and max constraints.">
+<meta name="twitter:card" content="summary">
+<style>
+:root {
+  --ground:  #F2F4F6;
+  --surface: #FFFFFF;
+  --sunken:  #E9ECEF;
+  --ink:     #161B1F;
+  --ink-2:   #545F6B;
+  --ink-3:   #7C8894;
+  --rule:    #D8DDE3;
+  --accent:  #0F5F6E;
+  --go:      #63549C;
+  --detour:  #B0761B;
+  --warn:    #A03428;
+  --code-bg: #EDF0F3;
+  --go-wash:     rgba(99, 84, 156, .07);
+  --detour-wash: rgba(176, 118, 27, .08);
+  --accent-wash: rgba(15, 95, 110, .06);
+  /* Simulator bar segments carry text, so these are the darker cousins of
+     --detour and friends: on --ground they clear 4.5:1, which the mid-tone
+     amber the detour asides use does not. */
+  /* Aliases. These four are what the components ask for by name -- a fold
+     wants an edge, not a rule -- and they were being used without ever being
+     declared, so every border, background and mono font that named one was
+     silently dropped. Defined through var() so the dark scheme's overrides
+     below carry to them without being restated. */
+  --edge:  var(--rule);
+  --wash:  var(--sunken);
+  --faint: var(--ink-3);
+  --mono:  ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo,
+           Consolas, monospace;
+  --t-comment: #6C7A87;
+  --t-string:  #1F6B4C;
+  --t-keyword: #7A4CA8;
+  --t-literal: #A03428;
+  --t-number:  #8A5A12;
+  --t-key:     #0F5F6E;
+  --t-cmd:     #7A4CA8;
+  --t-flag:    #8A5A12;
+  --sim-c:   #8A5A12;
+  --sim-d:   #35684A;
+  --sim-e:   #9A5068;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground:  #0F1318;
+    --surface: #161C23;
+    --sunken:  #1B222B;
+    --ink:     #E3E9EF;
+    --ink-2:   #9BA7B4;
+    --ink-3:   #6E7B89;
+    --rule:    #262F3A;
+    --accent:  #52BFD2;
+    --go:      #A296CE;
+    --detour:  #E0A845;
+    --warn:    #E8796B;
+    --code-bg: #10161D;
+    --go-wash:     rgba(162, 150, 206, .10);
+    --detour-wash: rgba(224, 168, 69, .10);
+    --accent-wash: rgba(82, 191, 210, .08);
+    --t-comment: #6E7B89;
+    --t-string:  #7FC8A0;
+    --t-keyword: #C0A0E8;
+    --t-literal: #E8796B;
+    --t-number:  #E0A845;
+    --t-key:     #52BFD2;
+    --t-cmd:     #C0A0E8;
+    --t-flag:    #E0A845;
+    --sim-c:   #E0A845;
+    --sim-d:   #6FBF93;
+    --sim-e:   #D98FA5;
+  }
+}
+:root[data-theme="light"] {
+  --ground:#F2F4F6; --surface:#FFFFFF; --sunken:#E9ECEF; --ink:#161B1F; --ink-2:#545F6B;
+  --ink-3:#7C8894; --rule:#D8DDE3; --accent:#0F5F6E; --go:#63549C; --detour:#B0761B;
+  --warn:#A03428; --code-bg:#EDF0F3;
+  --go-wash:rgba(99,84,156,.07); --detour-wash:rgba(176,118,27,.08); --accent-wash:rgba(15,95,110,.06);
+  --sim-c:#8A5A12; --sim-d:#35684A; --sim-e:#9A5068;
+}
+:root[data-theme="dark"] {
+  --ground:#0F1318; --surface:#161C23; --sunken:#1B222B; --ink:#E3E9EF; --ink-2:#9BA7B4;
+  --ink-3:#6E7B89; --rule:#262F3A; --accent:#52BFD2; --go:#A296CE; --detour:#E0A845;
+  --warn:#E8796B; --code-bg:#10161D;
+  --go-wash:rgba(162,150,206,.10); --detour-wash:rgba(224,168,69,.10); --accent-wash:rgba(82,191,210,.08);
+  --sim-c:#E0A845; --sim-d:#6FBF93; --sim-e:#D98FA5;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: Charter, "Bitstream Charter", "Sitka Text", Cambria, "Iowan Old Style", Georgia, serif;
+  font-size: 17px;
+  line-height: 1.68;
+  -webkit-font-smoothing: antialiased;
+}
+
+.mono, code, pre, h1, h2, h3, h4, .eyebrow, th, .num, figcaption, nav,
+.cp-label, .gn-label, .dt-label, .rail-part, .steptag {
+  font-family: var(--mono);
+}
+
+/* ---------- shell ---------- */
+.shell { display: grid; grid-template-columns: 1fr; }
+@media (min-width: 1100px) {
+  .shell {
+    grid-template-columns: 264px minmax(0, 1fr);
+    gap: 52px; max-width: 1220px; margin: 0 auto;
+  }
+}
+
+main { min-width: 0; padding: 56px 22px 120px; }
+@media (min-width: 1100px) { main { padding: 56px 32px 160px 0; } }
+
+/* ---------- step rail ---------- */
+nav.rail { display: none; }
+@media (min-width: 1100px) {
+  nav.rail {
+    display: block; position: sticky; top: 0; align-self: start;
+    max-height: 100vh; overflow-y: auto; padding: 56px 0 80px 28px;
+    font-size: 12.5px; line-height: 1.45;
+  }
+}
+nav.rail ol { list-style: none; margin: 0 0 18px; padding: 0; }
+nav.rail a {
+  display: flex; gap: 9px; padding: 4px 10px; color: var(--ink-3);
+  text-decoration: none; border-left: 2px solid transparent;
+  transition: color .15s, border-color .15s;
+}
+nav.rail a:hover { color: var(--ink); }
+nav.rail a.active { color: var(--accent); border-left-color: var(--accent); }
+nav.rail a .num { flex: none; opacity: .65; font-variant-numeric: tabular-nums; }
+.rail-part {
+  font-size: 10px; letter-spacing: .15em; text-transform: uppercase;
+  color: var(--ink-3); padding: 16px 10px 6px; opacity: .8;
+}
+.rail-head {
+  font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--ink-3); padding: 0 10px 12px; border-bottom: 1px solid var(--rule);
+  margin-bottom: 4px;
+}
+
+/* ---------- masthead ---------- */
+header.masthead { max-width: 74ch; margin-bottom: 64px; }
+.eyebrow {
+  font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--accent); margin-bottom: 18px;
+}
+h1 {
+  font-size: clamp(30px, 5vw, 44px); line-height: 1.15; margin: 0 0 20px;
+  letter-spacing: -.02em; text-wrap: balance; font-weight: 600;
+}
+.standfirst { font-size: 19px; color: var(--ink-2); margin: 0 0 26px; }
+
+.facts {
+  display: flex; flex-wrap: wrap; gap: 0; border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule); padding: 14px 0; margin-top: 30px;
+}
+.facts div { flex: 1 1 130px; padding-right: 18px; }
+.facts dt {
+  font-size: 10px; letter-spacing: .13em; text-transform: uppercase;
+  color: var(--ink-3); font-family: ui-monospace, Menlo, monospace;
+}
+.facts dd {
+  margin: 3px 0 0; font-size: 15px; font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, Menlo, monospace;
+}
+
+/* ---------- sections ---------- */
+section { max-width: 74ch; margin-bottom: 76px; scroll-margin-top: 24px; }
+section > p, section > ul, section > ol, section > .tw { max-width: 68ch; }
+
+h2 {
+  font-size: 23px; line-height: 1.25; margin: 0 0 6px; font-weight: 600;
+  letter-spacing: -.01em; text-wrap: balance;
+}
+h3 {
+  font-size: 16px; margin: 40px 0 10px; font-weight: 600;
+  color: var(--ink); letter-spacing: -.005em;
+}
+h4 { font-size: 13.5px; margin: 0 0 6px; font-weight: 600; }
+
+.steptag {
+  display: inline-block; font-size: 11px; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: 10px;
+}
+.steptag b { color: var(--accent); font-weight: 600; }
+
+p { margin: 0 0 17px; }
+a { color: var(--accent); text-underline-offset: 2px; }
+ul, ol { margin: 0 0 17px; padding-left: 22px; }
+li { margin-bottom: 7px; }
+strong { font-weight: 600; }
+
+code {
+  font-size: .87em; background: var(--code-bg); padding: 1px 5px;
+  border-radius: 3px; word-break: break-word;
+}
+
+/* ---------- code figures ---------- */
+figure.code { margin: 24px 0; border: 1px solid var(--rule); border-radius: 5px; overflow: hidden; background: var(--surface); }
+figcaption {
+  display: flex; align-items: center; gap: 12px;
+  padding: 7px 12px; background: var(--sunken); border-bottom: 1px solid var(--rule);
+  font-size: 11.5px; color: var(--ink-2);
+}
+figcaption .fname { font-weight: 600; color: var(--ink); }
+figcaption .hint {
+  color: var(--ink-3); font-size: 10.5px; margin-left: auto;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+figcaption .copy {
+  flex: none; font: inherit; font-size: 10.5px; cursor: pointer;
+  background: var(--surface); color: var(--ink-2);
+  border: 1px solid var(--rule); border-radius: 3px; padding: 2px 9px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+figcaption .hint + .copy { margin-left: 0; }
+.t-comment { color: var(--t-comment); font-style: italic; }
+.t-string  { color: var(--t-string); }
+.t-keyword { color: var(--t-keyword); }
+.t-literal { color: var(--t-literal); }
+.t-number  { color: var(--t-number); }
+.t-key     { color: var(--t-key); }
+.t-cmd     { color: var(--t-cmd); font-weight: 600; }
+.t-flag    { color: var(--t-flag); }
+
+figcaption .copy:hover { color: var(--accent); border-color: var(--accent); }
+figcaption .copy.done { color: var(--accent); border-color: var(--accent); }
+figure.code pre {
+  margin: 0; padding: 14px 16px; overflow-x: auto;
+  background: var(--code-bg); font-size: 12.5px; line-height: 1.62;
+}
+figure.code pre code { background: none; padding: 0; font-size: inherit; }
+
+/* ---------- checkpoint ---------- */
+.checkpoint {
+  margin: 30px 0; padding: 18px 20px 6px; background: var(--sunken);
+  border-left: 3px solid var(--accent); border-radius: 0 5px 5px 0;
+}
+.cp-label {
+  font-size: 10px; letter-spacing: .15em; text-transform: uppercase;
+  color: var(--accent); margin-bottom: 10px;
+}
+.checkpoint figure.code { margin: 14px 0; }
+.checkpoint p:last-child { margin-bottom: 14px; }
+
+/* ---------- simulator ---------- */
+.sim {
+  margin: 30px 0; padding: 14px 18px 18px; background: var(--surface);
+  border: 1px solid var(--rule); border-radius: 5px;
+}
+.sim-head { display: flex; align-items: center; justify-content: space-between; }
+.sim-label {
+  font-size: 10px; letter-spacing: .15em; text-transform: uppercase;
+  color: var(--accent);
+  font-family: ui-monospace, Menlo, monospace;
+}
+.sim button {
+  font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+  color: var(--ink-3); background: none; border: 1px solid var(--rule);
+  border-radius: 3px; padding: 3px 8px; cursor: pointer;
+}
+.sim button:hover { color: var(--accent); border-color: var(--accent); }
+.sim button:disabled { opacity: .4; cursor: default; }
+.sim button:disabled:hover { color: var(--ink-3); border-color: var(--rule); }
+.sim .tw { margin: 12px 0 0; }
+.sim table { font-size: 13px; }
+.sim th, .sim td { padding: 6px 10px 6px 0; vertical-align: middle; }
+.sim input, .sim select {
+  font-family: ui-monospace, Menlo, monospace; font-size: 12.5px;
+  color: var(--ink); background: var(--code-bg);
+  border: 1px solid var(--rule); border-radius: 3px; padding: 4px 6px;
+}
+.sim input:focus, .sim select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.sim input[type="number"] { width: 62px; }
+.sim input[type="number"]:disabled {
+  background: none; border-color: transparent; color: var(--ink-3); opacity: .45;
+}
+.sim-name { white-space: nowrap; }
+.sim-name input { width: 92px; }
+.sim-dot {
+  display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+  margin-right: 7px; vertical-align: baseline;
+}
+.sim-ops { white-space: nowrap; }
+.sim-ops button { padding: 2px 6px; margin-left: 3px; }
+.sim-add { display: flex; align-items: baseline; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+.sim-hint { font-size: 12.5px; color: var(--ink-3); line-height: 1.5; }
+.sim-total {
+  display: flex; align-items: center; gap: 12px;
+  margin: 20px 0 14px; padding-top: 16px; border-top: 1px solid var(--rule);
+}
+.sim-total label {
+  font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--ink-3); white-space: nowrap;
+}
+.sim-total input[type="range"] { flex: 1; max-width: 320px; accent-color: var(--accent); }
+.sim-tv {
+  font-family: ui-monospace, Menlo, monospace; font-size: 15px;
+  color: var(--accent); min-width: 2.4em;
+}
+.sim-bar {
+  display: flex; height: 34px; border-radius: 4px; overflow: hidden;
+  background: var(--sunken); gap: 1px;
+}
+.sim-seg {
+  display: flex; align-items: center; justify-content: center;
+  min-width: 0; transition: flex-grow .12s ease;
+}
+.sim-seg span {
+  font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;
+  color: var(--ground); font-weight: 600;
+}
+.sim-empty {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  font-size: 12px; color: var(--ink-3);
+}
+.sim-keys { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px; }
+.sim-key { font-size: 13px; color: var(--ink-2); }
+.sim-key b { color: var(--ink); font-family: ui-monospace, Menlo, monospace; }
+.sim-pct { color: var(--ink-3); margin-left: 7px; font-size: 12px; }
+.sim-notes { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; min-height: 1px; }
+.sim-note {
+  font-size: 11.5px; padding: 2px 8px; border-radius: 3px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+.sim-degraded { color: var(--detour); background: var(--detour-wash); }
+.sim-short { color: var(--warn); background: rgba(160, 52, 40, .09); }
+.sim-tracewrap { margin-top: 20px; padding-top: 4px; border-top: 1px solid var(--rule); }
+.sim-tr td { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
+.sim-tr td:first-child { color: var(--ink-3); }
+.sim-flag { color: var(--detour); font-size: 11px !important; }
+.sim-dot[data-c="0"], .sim-seg[data-c="0"] { background: var(--accent); }
+.sim-dot[data-c="1"], .sim-seg[data-c="1"] { background: var(--go); }
+.sim-dot[data-c="2"], .sim-seg[data-c="2"] { background: var(--sim-c); }
+.sim-dot[data-c="3"], .sim-seg[data-c="3"] { background: var(--sim-d); }
+.sim-dot[data-c="4"], .sim-seg[data-c="4"] { background: var(--sim-e); }
+
+/* ---------- go note ---------- */
+.gonote {
+  margin: 26px 0; padding: 16px 20px 4px; background: var(--go-wash);
+  border-left: 3px solid var(--go); border-radius: 0 5px 5px 0;
+}
+.gn-label, .dt-label {
+  font-size: 10px; letter-spacing: .15em; text-transform: uppercase;
+  margin-bottom: 8px;
+}
+.gn-label { color: var(--go); }
+.gonote h4 { color: var(--go); }
+.gonote figure.code { margin: 13px 0; }
+
+/* ---------- detour ---------- */
+.detour {
+  margin: 26px 0; padding: 15px 20px 4px; background: var(--detour-wash);
+  border-left: 3px solid var(--detour); border-radius: 0 5px 5px 0;
+  font-size: 15.5px;
+}
+.dt-label { color: var(--detour); }
+.detour a { color: var(--detour); }
+
+/* ---------- tables ---------- */
+.tw { overflow-x: auto; margin: 22px 0; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td {
+  text-align: left; padding: 8px 14px 8px 0;
+  border-bottom: 1px solid var(--rule); vertical-align: top;
+}
+th {
+  font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--ink-3); font-weight: 500; white-space: nowrap;
+}
+td code { font-size: .84em; }
+td:first-child { white-space: nowrap; }
+
+/* ---------- rules ---------- */
+hr.part {
+  border: 0; border-top: 1px solid var(--rule); margin: 0 0 56px;
+  max-width: 74ch;
+}
+.partmark {
+  font-size: 10.5px; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--ink-3); margin-bottom: 14px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
+
+.figpage { max-width:940px; margin:0 auto; padding:38px 24px 72px; }
+.figpage .backlink { font:12px/1 var(--mono); letter-spacing:.06em;
+  text-transform:uppercase; color:var(--faint); text-decoration:none; }
+.figpage .backlink:hover { color:var(--accent); }
+.figpage h1 { margin:18px 0 6px; }
+.figpage .standfirst { color:var(--faint); margin:0 0 26px; max-width:62ch; }
+.figpage footer { margin-top:44px; padding-top:18px;
+  border-top:1px solid var(--edge); color:var(--faint); font-size:14px; }
+
+.sim1 { border:1px solid var(--edge); border-radius:8px; padding:16px 18px;
+  margin:22px 0; background:var(--wash); }
+.s1-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+.s1-label { font:600 12px/1 var(--mono); letter-spacing:.12em;
+  text-transform:uppercase; color:var(--accent); }
+.s1-badge { font:11px/1 var(--mono); padding:3px 8px; border-radius:99px;
+  border:1px solid var(--edge); color:var(--faint); }
+.s1-badge.ok { color:var(--accent); border-color:var(--accent); }
+.s1-badge.bad { color:#b4232a; border-color:#b4232a; font-weight:700; }
+.s1-reset { margin-left:auto; font:11px var(--mono); padding:3px 10px;
+  border:1px solid var(--edge); background:transparent; border-radius:5px;
+  cursor:pointer; color:var(--faint); }
+.s1-in input, .s1-in select { font:12px var(--mono); padding:3px 5px;
+  border:1px solid var(--edge); border-radius:4px; background:var(--surface);
+  color:inherit; }
+.s1-in input[type=number] { width:4.5em; }
+.s1-in input[disabled] { opacity:.3; }
+.s1-n, .s1-opp { text-align:center; }
+.s1-opp { color:var(--accent); font-weight:700; }
+.s1-dot { display:inline-block; width:9px; height:9px; border-radius:99px;
+  margin-right:6px; vertical-align:baseline; }
+.s1-dot[data-c="0"], .s1-seg[data-c="0"] { background:#3f7fbf; }
+.s1-dot[data-c="1"], .s1-seg[data-c="1"] { background:#2fa4a0; }
+.s1-dot[data-c="2"], .s1-seg[data-c="2"] { background:#d98032; }
+.s1-dot[data-c="3"], .s1-seg[data-c="3"] { background:#8f6bb8; }
+.s1-dot[data-c="4"], .s1-seg[data-c="4"] { background:#7c8a4f; }
+.s1-ops button { font:12px var(--mono); border:1px solid var(--edge);
+  background:transparent; border-radius:4px; cursor:pointer; padding:1px 7px;
+  color:var(--faint); }
+.s1-ops button[disabled] { opacity:.3; cursor:default; }
+.s1-add { display:flex; align-items:baseline; gap:12px; margin:8px 0 14px; }
+.s1-addbtn { font:12px var(--mono); padding:3px 10px; border:1px dashed var(--edge);
+  background:transparent; border-radius:5px; cursor:pointer; color:var(--faint); }
+.s1-hint { font-size:12.5px; color:var(--faint); }
+.s1-total { display:flex; align-items:center; gap:12px; margin:10px 0; }
+.s1-total label { font:600 12px var(--mono); color:var(--faint); }
+.s1-total input[type=range] { flex:1; }
+.s1-tv { font:700 14px var(--mono); min-width:2ch; }
+.s1-bar { display:flex; height:38px; border-radius:6px; overflow:hidden;
+  border:1px solid var(--edge); }
+.s1-seg { display:flex; align-items:center; justify-content:center;
+  color:#fff; font:700 12px var(--mono); min-width:1.4em; }
+.s1-seg.s1-offered { background-image:repeating-linear-gradient(45deg,
+  rgba(255,255,255,.28) 0 6px, transparent 6px 12px); }
+.s1-empty { margin:auto; font:12px var(--mono); color:var(--faint); }
+.s1-keys { display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:8px; }
+.s1-key { font:12.5px var(--mono); }
+.s1-key b { font-size:14px; }
+.s1-offer { display:block; font-size:11px; color:var(--faint); }
+.s1-notes { margin-top:6px; display:flex; gap:12px; }
+.s1-note { font:12px var(--mono); padding:2px 8px; border-radius:4px; }
+.s1-short { background:#fdf0e0; color:#8a4b12; }
+.s1-degraded { background:#f6e2e2; color:#8a1f1f; }
+.s1-tr td, .s1-tr th { text-align:right; font:12.5px var(--mono); }
+.s1-tr td:first-child, .s1-tr th:first-child { text-align:left; }
+.s1-flag { color:#8a1f1f; }
+@media (prefers-color-scheme: dark) {
+  .s1-short { background:#3a2a14; color:#e8b478; }
+  .s1-degraded { background:#3a1c1c; color:#e89a9a; }
+}
+</style>
+</head>
+<body>
+<div class="figpage">
+<a class="backlink" href="tutorial-v2.html">&#8592; PodPool tutorial</a>
+<h1>Replica distribution</h1>
+<p class="standfirst">One call to the distributor, with every constraint combination the CRD admits. Set a pool size and each group's <code>(min, target, max)</code> triple and read back the split the controller would compute. The JavaScript is a transliteration of <code>workload.ComputeGroupTargets</code>, checked against the Go tests' own fixture rows every time this page loads &#8212; the badge says so. There is no clock here: a walk-up, a backoff and a runaway are properties of a <em>sequence</em>, which is what Sim 2 is for.</p>
+<div class="sim1" data-default="[{&quot;name&quot;: &quot;base&quot;, &quot;shape&quot;: &quot;min+target&quot;, &quot;scaling&quot;: {&quot;min&quot;: 3, &quot;max&quot;: null, &quot;target&quot;: &quot;30%&quot;, &quot;opportunistic&quot;: null}}, {&quot;name&quot;: &quot;scav&quot;, &quot;shape&quot;: &quot;min+target&quot;, &quot;scaling&quot;: {&quot;min&quot;: 0, &quot;max&quot;: null, &quot;target&quot;: &quot;50%&quot;, &quot;opportunistic&quot;: null}}, {&quot;name&quot;: &quot;burst&quot;, &quot;shape&quot;: &quot;min&quot;, &quot;scaling&quot;: {&quot;min&quot;: 0, &quot;max&quot;: null, &quot;target&quot;: null, &quot;opportunistic&quot;: null}}]" data-totals="[1, 3, 4, 5, 7, 10, 12, 15, 20, 25, 30]" data-maxgroups="5"><div class="s1-head"><span class="s1-label">Simulator</span><span id="s1-badge" class="s1-badge">checking port&hellip;</span><button type="button" class="s1-reset">reset</button></div><div class="tw"><table class="s1-in"><thead><tr><th>group</th><th>constraints</th><th><code>min</code></th><th><code>max</code></th><th><code>target</code></th><th><code>opportunistic</code></th><th></th></tr></thead><tbody class="s1-body"><tr data-i="0"><td class="s1-name"><span class="s1-dot" data-c="0"></span><input type="text" data-field="name" value="base" maxlength="20" aria-label="name, group 1"></td><td class="s1-shape"><select data-field="shape" aria-label="constraints, group 1"><option value="min">min</option><option value="min+target" selected>min + target</option><option value="max+target">max + target</option><option value="opportunistic+min">opportunistic + min</option></select></td><td class="s1-n"><input type="number" min="0" step="1" data-field="min" value="3" aria-label="min, group 1"></td><td class="s1-n"><input type="number" min="0" step="1" data-field="max" value="" disabled aria-label="max, group 1"></td><td class="s1-n"><input type="text" data-field="target" value="30%" size="5" maxlength="4" placeholder="30%" aria-label="target, group 1"></td><td class="s1-n s1-opp"></td><td class="s1-ops"><button type="button" data-op="up" disabled aria-label="move group 1 earlier">&uarr;</button><button type="button" data-op="del" aria-label="remove group 1">&times;</button></td></tr><tr data-i="1"><td class="s1-name"><span class="s1-dot" data-c="1"></span><input type="text" data-field="name" value="scav" maxlength="20" aria-label="name, group 2"></td><td class="s1-shape"><select data-field="shape" aria-label="constraints, group 2"><option value="min">min</option><option value="min+target" selected>min + target</option><option value="max+target">max + target</option><option value="opportunistic+min">opportunistic + min</option></select></td><td class="s1-n"><input type="number" min="0" step="1" data-field="min" value="0" aria-label="min, group 2"></td><td class="s1-n"><input type="number" min="0" step="1" data-field="max" value="" disabled aria-label="max, group 2"></td><td class="s1-n"><input type="text" data-field="target" value="50%" size="5" maxlength="4" placeholder="30%" aria-label="target, group 2"></td><td class="s1-n s1-opp"></td><td class="s1-ops"><button type="button" data-op="up" aria-label="move group 2 earlier">&uarr;</button><button type="button" data-op="del" aria-label="remove group 2">&times;</button></td></tr><tr data-i="2"><td class="s1-name"><span class="s1-dot" data-c="2"></span><input type="text" data-field="name" value="burst" maxlength="20" aria-label="name, group 3"></td><td class="s1-shape"><select data-field="shape" aria-label="constraints, group 3"><option value="min" selected>min</option><option value="min+target">min + target</option><option value="max+target">max + target</option><option value="opportunistic+min">opportunistic + min</option></select></td><td class="s1-n"><input type="number" min="0" step="1" data-field="min" value="0" aria-label="min, group 3"></td><td class="s1-n"><input type="number" min="0" step="1" data-field="max" value="" disabled aria-label="max, group 3"></td><td class="s1-n"><input type="text" data-field="target" value="" size="5" maxlength="4" placeholder="30%" disabled aria-label="target, group 3"></td><td class="s1-n s1-opp"></td><td class="s1-ops"><button type="button" data-op="up" aria-label="move group 3 earlier">&uarr;</button><button type="button" data-op="del" aria-label="remove group 3">&times;</button></td></tr></tbody></table></div><div class="s1-add"><button type="button" class="s1-addbtn">+ group</button><span class="s1-hint">An empty box is an unset pointer, exactly as in Go. The shape selector offers only the combinations the CEL rules admit.</span></div><div class="s1-total"><label for="s1-total">total replicas</label><input type="range" id="s1-total" min="0" max="40" value="10"><output class="s1-tv">10</output></div><div class="s1-out"><div class="s1-bar"><div class="s1-seg" data-c="0" style="flex:3"><span>3</span></div><div class="s1-seg" data-c="1" style="flex:5"><span>5</span></div><div class="s1-seg" data-c="2" style="flex:2"><span>2</span></div></div><div class="s1-keys"><span class="s1-key"><span class="s1-dot" data-c="0"></span>base <b>3</b></span><span class="s1-key"><span class="s1-dot" data-c="1"></span>scav <b>5</b></span><span class="s1-key"><span class="s1-dot" data-c="2"></span>burst <b>2</b></span></div><div class="s1-notes"></div></div><div class="s1-tracewrap"></div></div>
+<footer>Generated from the <code>tutorial-v2</code> branch. The same figure is
+embedded in <a href="tutorial-v2.html">PodPool tutorial</a>.</footer>
+</div>
+<script>
+(function () {
+  var FIX = {"trace": {"groups": [{"name": "base", "scaling": {"min": 3}}, {"name": "scav", "scaling": {"min": 0, "target": "30%"}}, {"name": "burst", "scaling": {"min": 0, "target": "50%"}}], "rows": [[1, [1, 0, 0]], [3, [3, 0, 0]], [4, [3, 1, 0]], [5, [3, 1, 1]], [7, [3, 2, 2]], [10, [3, 3, 4]], [12, [3, 3, 6]], [15, [4, 4, 7]], [20, [4, 6, 10]], [25, [6, 7, 12]], [30, [6, 9, 15]]]}, "capped": {"groups": [{"name": "a", "scaling": {"min": 0, "target": "20%"}}, {"name": "b", "scaling": {"min": 0, "target": "50%"}}], "rows": [[0, [0, 0], 0], [7, [1, 3], 3], [10, [2, 5], 3], [33, [6, 16], 11], [60, [12, 30], 18]]}, "opp": {"groups": [{"name": "base", "scaling": {"min": 3, "target": "35%"}}, {"name": "scav", "scaling": {"min": 0, "opportunistic": true}}, {"name": "burst", "scaling": {"min": 0}}], "rows": [[100, null, [35, 65, 0]], [100, {"scav": 30}, [35, 30, 35]], [100, {"scav": 90}, [35, 65, 0]], [20, {"scav": 4}, [7, 4, 9]], [100, {"scav": 10}, [35, 10, 55]], [100, {"scav": 0}, [35, 0, 65]]]}};
+  var root = document.querySelector('.sim1');
+  if (!root) return;
+
+  // ---- port of internal/workload/algorithm.go (kept in step with the
+  // Python port in sim2_prototype.py; both are checked against the same rows,
+  // which reach this side as FIX) ----
+  function targetPercent(s) {
+    var t = s.target;
+    if (t == null || typeof t !== 'string' || !/%$/.test(t)) return null;
+    var pct = parseInt(t.slice(0, -1), 10);
+    if (isNaN(pct) || pct < 1 || pct > 100) return null;
+    return pct;
+  }
+  function groupTarget(total, s) {
+    var pct = targetPercent(s);
+    if (pct == null) return null;
+    if (s.max != null) return Math.min(Math.ceil(total * pct / 100), s.max);
+    return Math.floor(total * pct / 100);
+  }
+  function isOpp(s) { return s.opportunistic === true; }
+  function hasStaticCeiling(s) { return s.max != null || s.target != null; }
+  function groupCeiling(total, s) {
+    if (!hasStaticCeiling(s)) return [0, false];
+    if (s.max != null) return [s.max, true];
+    var pct = targetPercent(s);
+    if (pct == null) return [0, true];
+    return [Math.floor(total * pct / 100), true];
+  }
+  function checkDegraded(total, targets, groups) {
+    if (total <= 0) return false;
+    for (var i = 0; i < groups.length; i++) {
+      var s = groups[i].scaling, pct = targetPercent(s);
+      if (pct == null) continue;
+      var actual = targets[i] / total * 100;
+      if (s.max == null && actual > pct + 0.5) return true;
+      if (s.max != null && actual < pct - 0.5) return true;
+    }
+    return false;
+  }
+  function compute(total, groups, observed) {
+    observed = observed || {};
+    var n = groups.length, targets = [], i, g, give;
+    for (i = 0; i < n; i++) targets.push(0);
+    if (n === 0 || total <= 0)
+      return { targets: targets, degraded: false, unplaced: 0 };
+    var remaining = total;
+    for (i = 0; i < n; i++) {
+      var floor = groups[i].scaling.min != null ? groups[i].scaling.min : 0;
+      if (floor > 0) { var t = Math.min(floor, remaining); targets[i] = t; remaining -= t; }
+    }
+    if (remaining <= 0)
+      return { targets: targets, degraded: checkDegraded(total, targets, groups), unplaced: 0 };
+    for (i = 0; i < n; i++) {
+      var want = groupTarget(total, groups[i].scaling);
+      if (want == null) continue;
+      var add = want - targets[i];
+      if (add <= 0) continue;
+      give = Math.min(add, remaining); targets[i] += give; remaining -= give;
+      if (remaining <= 0) break;
+    }
+    for (i = 0; i < n; i++) {
+      if (remaining <= 0) break;
+      g = groups[i];
+      if (!isOpp(g.scaling)) continue;
+      var cap = (g.name in observed) ? observed[g.name] : remaining;
+      var add3 = cap - targets[i];
+      if (add3 <= 0) continue;
+      give = Math.min(add3, remaining); targets[i] += give; remaining -= give;
+    }
+    for (i = 0; i < n; i++) {
+      if (remaining <= 0) break;
+      if (isOpp(groups[i].scaling)) continue;
+      var cb = groupCeiling(total, groups[i].scaling);
+      if (!cb[1]) { targets[i] += remaining; remaining = 0; continue; }
+      var head = cb[0] - targets[i];
+      if (head <= 0) continue;
+      give = Math.min(head, remaining); targets[i] += give; remaining -= give;
+    }
+    return { targets: targets, degraded: checkDegraded(total, targets, groups),
+             unplaced: remaining };
+  }
+
+  // ---- self-check against the emitted fixtures ----
+  function same(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+  function checkPort() {
+    var fails = 0;
+    FIX.trace.rows.forEach(function (row) {
+      if (!same(compute(row[0], FIX.trace.groups).targets, row[1])) fails++;
+    });
+    FIX.capped.rows.forEach(function (row) {
+      var r = compute(row[0], FIX.capped.groups);
+      if (!same(r.targets, row[1]) || r.unplaced !== row[2]) fails++;
+    });
+    FIX.opp.rows.forEach(function (row) {
+      var obs = row[1] || {};
+      if (!same(compute(row[0], FIX.opp.groups, obs).targets, row[2])) fails++;
+    });
+    return fails;
+  }
+  var badge = document.getElementById('s1-badge');
+  var fails = checkPort();
+  if (fails) {
+    badge.className = 's1-badge bad';
+    badge.textContent = 'port drifted: ' + fails + ' fixture rows fail';
+  } else {
+    badge.className = 's1-badge ok';
+    badge.textContent = 'port verified against ' +
+      (FIX.trace.rows.length + FIX.capped.rows.length + FIX.opp.rows.length) +
+      ' Go test rows';
+  }
+
+  // ---- interactive state ----
+  var SHAPES = { 'min': ['min'], 'min+target': ['min', 'target'],
+                 'max+target': ['max', 'target'], 'opportunistic+min': ['min'] };
+  var COLS = ['min', 'max', 'target', 'opportunistic'];
+  var state = JSON.parse(root.dataset.default);
+  var totals = JSON.parse(root.dataset.totals);
+  var maxGroups = parseInt(root.dataset.maxgroups, 10);
+  var total = parseInt(root.querySelector('#s1-total').value, 10);
+
+  function scaling(g) {
+    var active = SHAPES[g.shape], out = {};
+    active.forEach(function (f) { if (g.scaling[f] != null) out[f] = g.scaling[f]; });
+    if (g.shape === 'opportunistic+min') out.opportunistic = true;
+    return out;
+  }
+  function groupsForCompute() {
+    return state.map(function (g) { return { name: g.name, scaling: scaling(g) }; });
+  }
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
+  function renderRows() {
+    var body = root.querySelector('.s1-body');
+    body.innerHTML = state.map(function (g, i) {
+      var opts = [['min', 'min'], ['min+target', 'min + target'],
+                  ['max+target', 'max + target'],
+                  ['opportunistic+min', 'opportunistic + min']]
+        .map(function (o) {
+          return '<option value="' + o[0] + '"' +
+            (g.shape === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
+        }).join('');
+      var cells = COLS.map(function (f) {
+        var active = SHAPES[g.shape].indexOf(f) >= 0;
+        if (f === 'opportunistic') {
+          return '<td class="s1-n s1-opp">' +
+            (g.shape === 'opportunistic+min' ? '&#10003;' : '') + '</td>';
+        }
+        if (f === 'target') {
+          return '<td class="s1-n"><input type="text" data-field="target" value="' +
+            esc(g.scaling.target || '') + '" size="5" maxlength="4" placeholder="30%"' +
+            (active ? '' : ' disabled') + ' aria-label="target, group ' + (i + 1) + '"></td>';
+        }
+        var v = g.scaling[f];
+        return '<td class="s1-n"><input type="number" min="0" step="1" data-field="' + f +
+          '" value="' + (v == null ? '' : v) + '"' + (active ? '' : ' disabled') +
+          ' aria-label="' + f + ', group ' + (i + 1) + '"></td>';
+      }).join('');
+      return '<tr data-i="' + i + '">' +
+        '<td class="s1-name"><span class="s1-dot" data-c="' + (i % 5) + '"></span>' +
+        '<input type="text" data-field="name" value="' + esc(g.name) +
+        '" maxlength="20" aria-label="name, group ' + (i + 1) + '"></td>' +
+        '<td class="s1-shape"><select data-field="shape" aria-label="constraints, group ' +
+        (i + 1) + '">' + opts + '</select></td>' + cells +
+        '<td class="s1-ops"><button type="button" data-op="up"' +
+        (i === 0 ? ' disabled' : '') + ' aria-label="move group ' + (i + 1) +
+        ' earlier">&uarr;</button><button type="button" data-op="del"' +
+        (state.length === 1 ? ' disabled' : '') + ' aria-label="remove group ' +
+        (i + 1) + '">&times;</button></td></tr>';
+    }).join('');
+  }
+
+  function renderOut() {
+    var groups = groupsForCompute();
+    var r = compute(total, groups);
+    var placed = r.targets.reduce(function (a, b) { return a + b; }, 0);
+    var bar;
+    if (placed <= 0) {
+      bar = '<div class="s1-bar"><div class="s1-empty">nothing to place</div></div>';
+    } else {
+      bar = '<div class="s1-bar">' + state.map(function (g, i) {
+        var t = r.targets[i];
+        if (t <= 0) return '';
+        var opp = g.shape === 'opportunistic+min' ? ' s1-offered' : '';
+        return '<div class="s1-seg' + opp + '" data-c="' + (i % 5) +
+          '" style="flex:' + t + '"><span>' + t + '</span></div>';
+      }).join('') + '</div>';
+    }
+    var keys = state.map(function (g, i) {
+      var extra = g.shape === 'opportunistic+min'
+        ? '<span class="s1-offer">offered &mdash; the scheduler decides what sticks (Sim&nbsp;2)</span>'
+        : '';
+      return '<span class="s1-key"><span class="s1-dot" data-c="' + (i % 5) + '"></span>' +
+        esc(g.name) + ' <b>' + r.targets[i] + '</b>' + extra + '</span>';
+    }).join('');
+    var notes = '';
+    if (r.unplaced > 0)
+      notes += '<span class="s1-note s1-short">' + r.unplaced +
+        ' unplaced &mdash; no ceiling accepts them</span>';
+    if (r.degraded)
+      notes += '<span class="s1-note s1-degraded">TargetDegraded</span>';
+    root.querySelector('.s1-out').innerHTML =
+      bar + '<div class="s1-keys">' + keys + '</div>' +
+      '<div class="s1-notes">' + notes + '</div>';
+
+    var head = state.map(function (g) { return '<th>' + esc(g.name) + '</th>'; }).join('');
+    var rows = totals.map(function (tt) {
+      var rr = compute(tt, groups);
+      return '<tr><td>' + tt + '</td>' +
+        rr.targets.map(function (v) { return '<td>' + v + '</td>'; }).join('') +
+        (rr.degraded ? '<td class="s1-flag">degraded</td>' : '<td></td>') + '</tr>';
+    }).join('');
+    root.querySelector('.s1-tracewrap').innerHTML =
+      '<div class="tw"><table class="s1-tr"><thead><tr><th>total</th>' + head +
+      '<th></th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+  }
+
+  function renderAll() { renderRows(); renderOut(); }
+
+  root.addEventListener('input', function (e) {
+    var tr = e.target.closest('tr[data-i]');
+    if (e.target.id === 's1-total') {
+      total = parseInt(e.target.value, 10);
+      root.querySelector('.s1-tv').textContent = total;
+      renderOut();
+      return;
+    }
+    if (!tr) return;
+    var g = state[parseInt(tr.dataset.i, 10)];
+    var f = e.target.dataset.field;
+    if (!f) return;
+    if (f === 'name') { g.name = e.target.value || 'group'; renderOut(); return; }
+    if (f === 'shape') { g.shape = e.target.value; renderAll(); return; }
+    if (f === 'target') {
+      g.scaling.target = e.target.value.trim() || null; renderOut(); return;
+    }
+    g.scaling[f] = e.target.value === '' ? null : parseInt(e.target.value, 10);
+    renderOut();
+  });
+
+  root.addEventListener('click', function (e) {
+    var b = e.target.closest('button');
+    if (!b) return;
+    if (b.classList.contains('s1-reset')) {
+      state = JSON.parse(root.dataset.default);
+      total = 10; root.querySelector('#s1-total').value = 10;
+      root.querySelector('.s1-tv').textContent = 10;
+      renderAll(); return;
+    }
+    if (b.classList.contains('s1-addbtn')) {
+      if (state.length >= maxGroups) return;
+      state.push({ name: 'group' + (state.length + 1), shape: 'min',
+                   scaling: { min: 0, max: null, target: null, opportunistic: null } });
+      renderAll(); return;
+    }
+    var tr = e.target.closest('tr[data-i]');
+    if (!tr) return;
+    var i = parseInt(tr.dataset.i, 10);
+    if (b.dataset.op === 'del' && state.length > 1) { state.splice(i, 1); renderAll(); }
+    if (b.dataset.op === 'up' && i > 0) {
+      var tmp = state[i - 1]; state[i - 1] = state[i]; state[i] = tmp; renderAll();
+    }
+  });
+
+  renderOut();
+})();
+</script></body>
+</html>

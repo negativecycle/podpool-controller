@@ -37,3 +37,7 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
+
+# Python bytecode from the docs/ toolchain
+__pycache__/
+*.pyc
