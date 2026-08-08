@@ -26,6 +26,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	authzv1 "k8s.io/api/authorization/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -650,6 +651,38 @@ func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoo
 
 func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *podpoolsv1alpha1.PodPool, newObj *podpoolsv1alpha1.PodPool) (admission.Warnings, error) {
 	logf.FromContext(ctx).Info("Validation for PodPool upon update", "name", newObj.GetName())
+
+	// An unchanged spec cannot change any verdict below, so return before
+	// reaching any of them.
+	//
+	// This is load-bearing, not an optimisation: pause is a metadata annotation
+	// (workload.AnnotationPaused), so setting it is a metadata-only update and
+	// was therefore gated on full spec validation. A pool was unpausable in
+	// exactly the states that make an operator want to pause it. The general
+	// shape is worse: any rule tightened after a pool was admitted turned every
+	// future metadata write to that pool into a rejection, which makes
+	// tightening validation retroactively destructive in a way that is
+	// invisible at review time. The API server solved the same problem for CRD
+	// schemas with validation ratcheting; a webhook has to do it itself.
+	//
+	// What licenses it: everything below is a function of spec plus
+	// metadata.name, metadata.namespace and metadata.uid, all three immutable
+	// for an object's lifetime. BuildChildWorkload reads those three and
+	// nothing else; in particular it does not inherit pool labels or
+	// annotations into the child. Recheck this argument if that ever changes.
+	//
+	// Semantic rather than reflect.DeepEqual: the two agree on PodPoolSpec as
+	// it stands, but Semantic is the convention and is the one that stays
+	// correct if a resource.Quantity or a metav1.Time is ever added. Do not
+	// simplify it.
+	//
+	// Best-effort by construction: a semantically-equal but byte-different spec
+	// (re-serialised whitespace, a populated RawExtension.Object) compares
+	// unequal and pays full validation. That is the safe direction, and the
+	// reason this is a DeepEqual rather than a canonicalising comparison.
+	if apiequality.Semantic.DeepEqual(oldObj.Spec, newObj.Spec) {
+		return nil, nil
+	}
 
 	allErrs := validatePodPoolSpec(newObj)
 

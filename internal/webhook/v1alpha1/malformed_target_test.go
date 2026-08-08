@@ -216,8 +216,8 @@ func TestUnreadableTargetWarnsRatherThanRejects(t *testing.T) {
 		}},
 	}
 
-	// The ordinary scale: `scaling` is untouched, so CEL would have ratcheted
-	// past it and the object reaches this validator intact.
+	// The ordinary scale: spec changes, so the short-circuit does not engage,
+	// and `scaling` is untouched, so CEL would have ratcheted past it.
 	scaled := stored.DeepCopy()
 	scaled.Spec.Replicas = stored.Spec.Replicas + 5
 
