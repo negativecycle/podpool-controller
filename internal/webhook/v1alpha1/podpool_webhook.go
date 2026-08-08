@@ -21,7 +21,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -195,6 +197,32 @@ func validatePodPoolSpec(pp *podpoolsv1alpha1.PodPool) field.ErrorList {
 	return allErrs
 }
 
+const fmtUnset = "unset"
+
+func fmtI32(p *int32) string {
+	if p == nil {
+		return fmtUnset
+	}
+
+	return strconv.FormatInt(int64(*p), 10)
+}
+
+func fmtBool(p *bool) string {
+	if p == nil {
+		return fmtUnset
+	}
+
+	return strconv.FormatBool(*p)
+}
+
+func fmtTarget(t *intstr.IntOrString) string {
+	if t == nil {
+		return fmtUnset
+	}
+
+	return t.String()
+}
+
 func validateScaling(fp *field.Path, s *podpoolsv1alpha1.ScalingConstraints) field.ErrorList {
 	var allErrs field.ErrorList
 
@@ -206,8 +234,8 @@ func validateScaling(fp *field.Path, s *podpoolsv1alpha1.ScalingConstraints) fie
 	// schema rejects it first. Kept for direct-call unit tests and clusters
 	// running a stale CRD, like the duplicate-name check in validatePodPoolSpec.
 	if hasOpportunistic && (s.Max != nil || s.Target != nil) {
-		allErrs = append(allErrs, field.Invalid(fp, fmt.Sprintf("min=%v max=%v target=%v opportunistic=%v",
-			s.Min, s.Max, s.Target, s.Opportunistic),
+		allErrs = append(allErrs, field.Invalid(fp, fmt.Sprintf("min=%s max=%s target=%s opportunistic=%s",
+			fmtI32(s.Min), fmtI32(s.Max), fmtTarget(s.Target), fmtBool(s.Opportunistic)),
 			"opportunistic is itself the ceiling; it cannot be combined with max or target"))
 	}
 
@@ -215,8 +243,8 @@ func validateScaling(fp *field.Path, s *podpoolsv1alpha1.ScalingConstraints) fie
 	// self.min <= self.max" (podpool_types.go). Same unreachability and same
 	// reason to keep it as the opportunistic check above.
 	if s.Min != nil && s.Max != nil && *s.Min > *s.Max {
-		allErrs = append(allErrs, field.Invalid(fp, fmt.Sprintf("min=%v max=%v",
-			s.Min, s.Max),
+		allErrs = append(allErrs, field.Invalid(fp, fmt.Sprintf("min=%s max=%s",
+			fmtI32(s.Min), fmtI32(s.Max)),
 			"min must not exceed max"))
 	}
 

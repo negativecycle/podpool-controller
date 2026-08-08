@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -420,6 +421,72 @@ func TestValidateUpdateGVKImmutability(t *testing.T) {
 	_, err = v.ValidateUpdate(ctx, deploymentPool, scaledDeploymentPool)
 	if err != nil {
 		t.Errorf("ValidateUpdate should accept same GVK: %v", err)
+	}
+}
+
+func scalingMessage(t *testing.T, s podpoolsv1alpha1.ScalingConstraints) string {
+	t.Helper()
+
+	errs := validateScaling(field.NewPath("spec", "groups").Index(0).Child("scaling"), &s)
+	if len(errs) == 0 {
+		t.Fatalf("expected validateScaling to reject %+v, it accepted", s)
+	}
+
+	return errs.ToAggregate().Error()
+}
+
+// The headline case: a *int32 rendered with %v is an address.
+func TestScalingMessageHasNoPointerAddresses(t *testing.T) {
+	t.Parallel()
+
+	msg := scalingMessage(t, podpoolsv1alpha1.ScalingConstraints{
+		Target:        pctStr(30),
+		Opportunistic: ptr.To(true),
+	})
+
+	if strings.Contains(msg, "0x") {
+		t.Errorf("message renders a pointer address: %s", msg)
+	}
+
+	if !strings.Contains(msg, "target=30%") {
+		t.Errorf("message does not contain target=30%%: %s", msg)
+	}
+}
+
+// TestScalingMessageSaysUnsetForAbsentFields pins the other half: a nil pointer
+// currently renders as "<nil>", which reads as a value rather than an absence.
+func TestScalingMessageSaysUnsetForAbsentFields(t *testing.T) {
+	t.Parallel()
+
+	msg := scalingMessage(t, podpoolsv1alpha1.ScalingConstraints{
+		Target:        pctStr(30),
+		Opportunistic: ptr.To(true),
+	})
+
+	for _, want := range []string{"min=unset", "max=unset"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message does not contain %q: %s", want, msg)
+		}
+	}
+}
+
+// TestScalingMessageRendersZeroNotEmpty guards the fix rather than the bug: a
+// helper that returns "" for the zero value would satisfy the nil-only tests
+// above while losing min=0, which is the value the defaulter injects and
+// therefore the one most likely to appear.
+func TestScalingMessageRendersZeroNotEmpty(t *testing.T) {
+	t.Parallel()
+
+	msg := scalingMessage(t, podpoolsv1alpha1.ScalingConstraints{
+		Min:           ptr.To(int32(0)),
+		Target:        pctStr(30),
+		Opportunistic: ptr.To(true),
+	})
+
+	// Delimited deliberately: "min=0" is a prefix of "min=0x8567eae718", so an
+	// undelimited Contains passes against the very bug this file exists to pin.
+	if !strings.Contains(msg, "min=0 ") {
+		t.Errorf("message does not render an explicit zero as min=0: %s", msg)
 	}
 }
 
