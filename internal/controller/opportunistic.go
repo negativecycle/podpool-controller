@@ -31,6 +31,13 @@ const defaultOpportunisticHeartbeat = time.Duration(defaultOpportunisticHeartbea
 // scheduling cycle, short enough that a refusal is acted on promptly.
 const probeVerdictRequeue = 15 * time.Second
 
+// probeVerdictTimeout bounds how long a probe may stay outstanding. The
+// scheduler answers a schedulable-or-not question in seconds; a probe still
+// unanswered after this has hit something that will not answer at all (pod
+// creation blocked by quota, scheduler down), and waiting forever pins the
+// group one replica below capacity while spinning on a 15s requeue.
+const probeVerdictTimeout = 2 * time.Minute
+
 // maxUnschedulableProbe caps how many Pending pods a single capacity probe
 // will page in. A group short by more than this is already telling us
 // everything we need to know.
@@ -76,6 +83,11 @@ type probeState struct {
 	// heartbeat from here; a *successful* probe deliberately does not touch
 	// it, which is what makes the walk-up immediate.
 	lastFailed time.Time
+
+	// startedAt is when the outstanding probe was issued. Used only to
+	// bound the wait: a probe unanswered after probeVerdictTimeout is
+	// treated as refused and withdrawn.
+	startedAt time.Time
 }
 
 // probeDecision is decideProbe's verdict.
@@ -90,6 +102,7 @@ type probeDecision struct {
 	target       int32
 	issued       bool // a new probe started this pass
 	awaitVerdict bool // a probe is outstanding; look again soon
+	abandoned    bool // an outstanding probe timed out and was withdrawn
 }
 
 // observeOpportunistic reads each opportunistic group's child and, only when
@@ -270,6 +283,19 @@ func (r *PodPoolReconciler) decideProbe(
 		}
 	}
 
+	// An unanswered probe does not wait forever. Deliberately outside the
+	// obs.found guard: a child that has become unreadable mid-probe can never
+	// deliver a verdict, and is exactly the case that must not hold the
+	// record open indefinitely. A verdict on the same pass wins: the switch
+	// above runs first and clears outstanding.
+	if st.outstanding && now.Sub(st.startedAt) >= probeVerdictTimeout {
+		st.outstanding = false
+		st.lastFailed = now
+		r.probes[key] = st
+
+		return probeDecision{target: target, abandoned: true}
+	}
+
 	if st.outstanding {
 		r.probes[key] = st
 
@@ -287,6 +313,7 @@ func (r *PodPoolReconciler) decideProbe(
 	settled := obs.found && obs.asked == target && obs.ready >= obs.asked
 	if settled && now.Sub(st.lastFailed) >= opportunisticHeartbeat(pool) {
 		st.outstanding = true
+		st.startedAt = now
 		r.probes[key] = st
 
 		return probeDecision{target: target + 1, issued: true, awaitVerdict: true}

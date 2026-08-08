@@ -969,6 +969,11 @@ func (r *PodPoolReconciler) applyProbes(
 				"group", group.Name)
 		}
 
+		if d.abandoned {
+			logf.FromContext(ctx).Info("Probe got no scheduler verdict in time; treating it as refused",
+				"group", group.Name, "timeout", probeVerdictTimeout)
+		}
+
 		finalTargets[i] = d.target
 		probePending = probePending || d.awaitVerdict
 	}

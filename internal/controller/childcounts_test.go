@@ -253,7 +253,7 @@ func TestUnreadObservationDoesNotResolveAProbe(t *testing.T) {
 	pool := probePool(60)
 	r := &PodPoolReconciler{
 		Clock:  clocktesting.NewFakePassiveClock(probeTestBase),
-		probes: map[string]probeState{probeKey(pool, testGroupScav): {outstanding: true}},
+		probes: map[string]probeState{probeKey(pool, testGroupScav): {outstanding: true, startedAt: probeTestBase}},
 	}
 
 	d := r.decideProbe(pool, testGroupScav, 4, opportunisticObservation{}, probeTestBase)

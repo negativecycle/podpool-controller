@@ -199,3 +199,112 @@ func TestForgetProbesDropsOnlyThatPool(t *testing.T) {
 		t.Error("pool b's probe record was collateral damage")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// an unanswered probe must not wait forever
+// ---------------------------------------------------------------------------
+
+// settledAt4 is a group sitting exactly at its target with everything ready:
+// the only state from which a probe may be issued. pendingAt4 is the probe
+// written but unanswered: one more asked than ready, and no pod the scheduler
+// has refused.
+var (
+	settledAt4 = opportunisticObservation{found: true, asked: 4, ready: 4}
+	pendingAt4 = opportunisticObservation{found: true, asked: 5, ready: 4}
+)
+
+// TestProbeDecisionDistinguishesIssuanceFromWaiting pins the field semantics
+// directly: issuance is the only pass that announces, and every outstanding
+// pass keeps asking for the short requeue.
+func TestProbeDecisionDistinguishesIssuanceFromWaiting(t *testing.T) {
+	r := &PodPoolReconciler{Clock: clocktesting.NewFakePassiveClock(probeTestBase)}
+	pool := probePool(60)
+
+	d := r.decideProbe(pool, testGroupScav, 4, settledAt4, probeTestBase)
+	if !d.issued || !d.awaitVerdict || d.target != 5 {
+		t.Fatalf("issuing pass: %+v, want issued+awaitVerdict, target 5", d)
+	}
+
+	d = r.decideProbe(pool, testGroupScav, 4, pendingAt4, probeTestBase.Add(probeVerdictRequeue))
+	if d.issued || !d.awaitVerdict || d.target != 5 {
+		t.Fatalf("waiting pass: %+v, want awaitVerdict only, target 5", d)
+	}
+
+	if d.abandoned {
+		t.Fatal("nothing has timed out yet")
+	}
+}
+
+// TestProbeDecisionTimesOutAnUnansweredProbe is the reason the bound exists.
+// countUnschedulable only counts pods that EXIST carrying
+// PodScheduled=False/Unschedulable, so a pod that was never created — blocked
+// by a ResourceQuota, say — produces no verdict of any kind. Without a bound
+// the group sits one replica below its capacity, spinning on a 15s requeue,
+// with nothing in status or events to say why.
+func TestProbeDecisionTimesOutAnUnansweredProbe(t *testing.T) {
+	r := &PodPoolReconciler{Clock: clocktesting.NewFakePassiveClock(probeTestBase)}
+	pool := probePool(60)
+
+	r.decideProbe(pool, testGroupScav, 4, settledAt4, probeTestBase)
+
+	// Just inside the bound: still waiting, nothing announced.
+	d := r.decideProbe(pool, testGroupScav, 4, pendingAt4, probeTestBase.Add(probeVerdictTimeout-time.Second))
+	if d.abandoned || !d.awaitVerdict {
+		t.Fatalf("inside the bound: %+v, want a plain wait", d)
+	}
+
+	// Past it: withdrawn, and the withdrawal starts the heartbeat backoff so
+	// the next attempt is not immediate.
+	d = r.decideProbe(pool, testGroupScav, 4, pendingAt4, probeTestBase.Add(probeVerdictTimeout+time.Second))
+	if !d.abandoned || d.target != 4 || d.awaitVerdict {
+		t.Fatalf("past the bound: %+v, want abandoned at 4 with no further wait", d)
+	}
+
+	if r.probeOutstanding(pool, testGroupScav) {
+		t.Error("an abandoned probe must not stay on the books")
+	}
+}
+
+// TestProbeDecisionUnreadableChildHoldsWithoutSpin is why the timeout sits
+// outside the obs.found guard: an outstanding probe on a child that has become
+// unreadable can never produce a verdict, so it is precisely the case that
+// would otherwise wait forever.
+func TestProbeDecisionUnreadableChildHoldsWithoutSpin(t *testing.T) {
+	r := &PodPoolReconciler{Clock: clocktesting.NewFakePassiveClock(probeTestBase)}
+	pool := probePool(60)
+
+	r.decideProbe(pool, testGroupScav, 4, settledAt4, probeTestBase)
+
+	unread := opportunisticObservation{}
+
+	d := r.decideProbe(pool, testGroupScav, 4, unread, probeTestBase.Add(time.Second))
+	if d.target != 4 || d.issued || d.awaitVerdict || d.abandoned {
+		t.Fatalf("unreadable child: %+v, want bare hold at 4", d)
+	}
+
+	if !r.probeOutstanding(pool, testGroupScav) {
+		t.Fatal("the probe record must survive an unreadable pass")
+	}
+
+	d = r.decideProbe(pool, testGroupScav, 4, unread, probeTestBase.Add(probeVerdictTimeout+time.Second))
+	if !d.abandoned || d.target != 4 {
+		t.Fatalf("past timeout while unreadable: %+v, want abandoned at 4", d)
+	}
+}
+
+// TestProbeDecisionVerdictBeatsTimeout: a verdict arriving on the same pass
+// the deadline expires resolves normally; abandoned stays false. An answer is
+// an answer whenever it turns up.
+func TestProbeDecisionVerdictBeatsTimeout(t *testing.T) {
+	r := &PodPoolReconciler{Clock: clocktesting.NewFakePassiveClock(probeTestBase)}
+	pool := probePool(60)
+
+	r.decideProbe(pool, testGroupScav, 4, settledAt4, probeTestBase)
+
+	succeeded := opportunisticObservation{found: true, asked: 5, ready: 5}
+
+	d := r.decideProbe(pool, testGroupScav, 5, succeeded, probeTestBase.Add(probeVerdictTimeout))
+	if d.abandoned {
+		t.Fatalf("verdict and deadline on the same pass: %+v; the answer is real, use it", d)
+	}
+}
