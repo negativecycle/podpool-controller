@@ -301,8 +301,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	var errs []error
 
 	var (
-		failedGroups, notOwnedGroups []string
-		pendingGroupEvents           []pendingEvent
+		failedGroups, terminalGroups, notOwnedGroups []string
+		pendingGroupEvents                           []pendingEvent
 	)
 
 	// The deep copy taken at the top is the status this pass read, before
@@ -321,7 +321,10 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 			errs = append(errs, fmt.Errorf("group %s: %w", group.Name, err))
 			failedGroups = append(failedGroups, group.Name)
 
-			pe := classifyGroupError(group.Name, err)
+			terminalErr, pe := classifyGroupError(group.Name, err)
+			if terminalErr {
+				terminalGroups = append(terminalGroups, group.Name)
+			}
 
 			// Reading the classifier's verdict back rather than running a
 			// second errors.As: one place decides the class, so the condition
@@ -442,6 +445,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		ready:          pool.Status.ReadyReplicas,
 		desired:        pool.Spec.Replicas,
 		failedGroups:   failedGroups,
+		terminalGroups: terminalGroups,
 		stalledGroups:  stalledGroups,
 		notOwnedGroups: notOwnedGroups,
 	})
@@ -462,7 +466,15 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		groupNames(groupStatuses), groupNames(before.Status.Groups))
 
 	if err := kerrors.NewAggregate(errs); err != nil {
-		return ctrl.Result{}, err
+		// Suppress the requeue only when EVERY collected error is terminal.
+		// One retryable failure among them, or a failed orphan delete (which is
+		// in errs but never in terminalGroups), and the pool still needs the
+		// workqueue.
+		if len(errs) != len(terminalGroups) {
+			return ctrl.Result{}, err
+		}
+
+		log.Info("All group errors are terminal; suppressing requeue", "groups", failedGroups)
 	}
 
 	// An outstanding probe is the one thing that cannot wait for the ordinary
@@ -604,7 +616,9 @@ func (r *PodPoolReconciler) reconcileGroup(
 ) (groupReconcileResult, error) {
 	desired, err := workload.BuildChildWorkload(tmpl, group, pool, target)
 	if err != nil {
-		return groupReconcileResult{}, fmt.Errorf("building workload: %w", err)
+		// Terminal: a template that cannot be rendered for this group will not
+		// render on the next pass either. Only an edit changes the answer.
+		return groupReconcileResult{}, terminal(fmt.Errorf("building workload: %w", err))
 	}
 
 	obs, err := r.reconcileWorkload(ctx, pool, desired)
@@ -1084,20 +1098,31 @@ func conditionTupleChanged(prev []metav1.Condition, cur []metav1.Condition, cond
 
 // classifyGroupError decides what a failed group's failure *is*, once, so the
 // condition reason and the event can never disagree about it.
-func classifyGroupError(groupName string, err error) pendingEvent {
+func classifyGroupError(groupName string, err error) (terminalErr bool, event pendingEvent) {
 	var notOwned *workloadNotOwnedError
-	if errors.As(err, &notOwned) {
-		return pendingEvent{
+	switch {
+	// First, though the arms are disjoint today: an ownership conflict is
+	// never wrapped terminal, because deleting the conflicting object resolves
+	// it without touching the spec. Ordering it here means that stays true by
+	// construction if a future path ever wraps one.
+	case errors.As(err, &notOwned):
+		return false, pendingEvent{
 			groupName,
 			corev1.EventTypeWarning, ReasonWorkloadNotOwned, actionReconcileGroup,
 			fmt.Sprintf("Refusing to manage group %s: %v", groupName, err),
 		}
-	}
-
-	return pendingEvent{
-		groupName,
-		corev1.EventTypeWarning, ReasonGroupReconcileFailed, actionReconcileGroup,
-		fmt.Sprintf("Failed to reconcile group %s: %v", groupName, err),
+	case isTerminal(err):
+		return true, pendingEvent{
+			groupName,
+			corev1.EventTypeWarning, ReasonGroupSpecInvalid, actionReconcileGroup,
+			fmt.Sprintf("Group %s has a spec error that will not resolve without a change: %v", groupName, err),
+		}
+	default:
+		return false, pendingEvent{
+			groupName,
+			corev1.EventTypeWarning, ReasonGroupReconcileFailed, actionReconcileGroup,
+			fmt.Sprintf("Failed to reconcile group %s: %v", groupName, err),
+		}
 	}
 }
 

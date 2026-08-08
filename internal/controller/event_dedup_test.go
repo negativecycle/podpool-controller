@@ -262,10 +262,12 @@ func TestRecoveryThenRefailEmitsTwice(t *testing.T) {
 
 	evts := drainEvents(rec.Events)
 
-	count := countEventsByReason(evts, ReasonGroupReconcileFailed)
+	// breakGroup is a render failure, which is terminal: the reason is
+	// GroupSpecInvalid, and the gate's behaviour is the same either way.
+	count := countEventsByReason(evts, ReasonGroupSpecInvalid)
 	if count != 2 {
 		t.Errorf("got %d %s events across fail→recover→fail, want 2; events: %v",
-			count, ReasonGroupReconcileFailed, evts)
+			count, ReasonGroupSpecInvalid, evts)
 	}
 }
 

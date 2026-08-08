@@ -318,12 +318,15 @@ func TestGroupsReadyNamesAnOwnershipConflict(t *testing.T) {
 			wantInMsg:  []string{testGroupBase, "another controller"},
 		},
 		{
-			// The ordering trade-off, pinned. Ownership outranks another
-			// group's ordinary failure because it points at another actor in
-			// the cluster, but that failure must not vanish from the summary.
-			name: "ownership outranks another failure and still counts it",
+			// The ordering trade-off, pinned. Ownership outranks a spec error
+			// because it points at another actor in the cluster, but the spec
+			// error must not vanish from the summary. The trade-off is that it
+			// is demoted to a count; notOwnedMessage says how many so the
+			// summary does not imply ownership is the only problem.
+			name: "ownership outranks a spec error and still counts it",
 			in: conditionInputs{
 				failedGroups:   []string{testGroupBase, testGroupSpot},
+				terminalGroups: []string{testGroupSpot},
 				notOwnedGroups: []string{testGroupBase},
 			},
 			wantReason: ReasonWorkloadNotOwned,
@@ -346,6 +349,14 @@ func TestGroupsReadyNamesAnOwnershipConflict(t *testing.T) {
 				failedGroups: []string{testGroupBase},
 			},
 			wantReason: ReasonGroupReconcileFailed,
+		},
+		{
+			name: "an all-terminal pool reports the spec error",
+			in: conditionInputs{
+				failedGroups:   []string{testGroupBase},
+				terminalGroups: []string{testGroupBase},
+			},
+			wantReason: ReasonGroupSpecInvalid,
 		},
 		{
 			// The pool's own template is broken, so no group name is invented.
