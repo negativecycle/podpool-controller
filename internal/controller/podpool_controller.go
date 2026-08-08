@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -230,11 +231,32 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	}()
 
 	// Above every early return, deliberately. The scale subresource's
-	// selectorpath points here, so a pool created with an unparseable
-	// template would otherwise expose an empty selector to every HPA reading
-	// /scale for as long as it stayed in that state. It is derived from the
-	// pool name alone, so no early path lacks anything it needs.
+	// selectorpath points here, so a pool created paused or created with an
+	// unparseable template would otherwise expose an empty selector to an HPA
+	// for as long as it stayed in that state. It is derived from the pool name
+	// alone, so no early path is missing anything it needs.
 	pool.Status.Selector = labels.Set{workload.LabelPool: pool.Name}.String()
+
+	if isPaused(&pool) {
+		pool.Status.ObservedGeneration = pool.Generation
+
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               ConditionProgressing,
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonPaused,
+			Message:            "Reconciliation paused",
+			ObservedGeneration: pool.Generation,
+		})
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               ConditionReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonPaused,
+			Message:            "Reconciliation paused",
+			ObservedGeneration: pool.Generation,
+		})
+
+		return ctrl.Result{}, nil
+	}
 
 	// Asked before any expensive work: a template that is not even
 	// addressable (no apiVersion or kind) cannot be rendered for any group.
@@ -1097,6 +1119,30 @@ type pendingEvent struct {
 // Passing this pass's own status compares each reason against itself, silences
 // every group event, and does so in a way no "emits exactly one" test would
 // catch, because zero also satisfies "not more than one".
+// isPaused reports whether the pause annotation asks for a pause.
+//
+// The value is honoured, not merely its presence. Presence-only meant
+// `podpools.dev/paused: "false"` froze the pool, which is exactly what a GitOps
+// chart rendering `paused: {{ .Values.paused }}` produces, and the manifest
+// then says the opposite of what the cluster does.
+//
+// A value that will not parse pauses. Someone who typed something meaning to
+// pause should get a pause, not a silently running pool, and "" is what people
+// write when they just want the annotation to be there.
+func isPaused(pool *podpoolsv1alpha1.PodPool) bool {
+	v, ok := pool.Annotations[workload.AnnotationPaused]
+	if !ok {
+		return false
+	}
+
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return true
+	}
+
+	return parsed
+}
+
 func groupEventChanged(before []podpoolsv1alpha1.GroupStatus, groupName, reason string) bool {
 	prev := findGroupStatus(before, groupName)
 

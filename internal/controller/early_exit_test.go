@@ -7,18 +7,21 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
+	"github.com/negativecycle/podpool-controller/internal/workload"
 )
 
-// Reconcile has two exits above its main body: an unparseable workload
-// template, and a watch that will not come up. The full path maintains
-// invariants that neither of them does, so tests here name the invariant
-// rather than the exit: the next early return added will break the same ones.
+// Reconcile has three exits above its main body: paused, an unparseable
+// workload template, and a watch that will not come up. The full path
+// maintains invariants that none of them does, so tests here name the
+// invariant rather than the exit: the next early return added will break the
+// same ones.
 
 // pendingInformer reports unsynced until synced is flipped. The embedded nil
 // panics on anything ensureWatch does not call, which is the point: it fails
@@ -165,6 +168,209 @@ func TestInformerSyncCompletesQuietly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// The scale subresource's selector
+// ---------------------------------------------------------------------------
+
+// The CRD points the scale subresource's selectorpath at status.selector, and
+// the assignment sits above every early return. A pool created paused, or
+// created with a template the controller cannot parse, has never run the full
+// path, so it would otherwise expose an empty selector to anything reading
+// /scale. The field is derived from the pool name alone, so no early path
+// lacks anything it needs.
+func TestSelectorIsSetOnEveryExit(t *testing.T) {
+	tests := []struct {
+		name string
+		mut  func(*podpoolsv1alpha1.PodPool)
+	}{
+		{
+			name: "created paused",
+			mut: func(pp *podpoolsv1alpha1.PodPool) {
+				pp.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+			},
+		},
+		{
+			name: "created with an unparseable template",
+			mut: func(pp *podpoolsv1alpha1.PodPool) {
+				pp.Spec.WorkloadTemplate.Raw = []byte(`{"spec":{"template":{}}}`)
+			},
+		},
+		{
+			name: "the ordinary path",
+			// Green by construction: the point of the shared assignment is
+			// that the full path and the exits cannot drift apart.
+			mut: func(*podpoolsv1alpha1.PodPool) {},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := fakeTestPool()
+			tt.mut(pool)
+
+			r, cl := newFakeReconciler(t, nil, pool)
+
+			// Errors are beside the point: an unparseable template is a
+			// non-error early return, and the selector must survive either way.
+			_ = tryReconcilePool(r, pool)
+
+			got := getPool(t, cl, pool)
+
+			want := labels.Set{workload.LabelPool: pool.Name}.String()
+			if got.Status.Selector != want {
+				t.Errorf("status.selector = %q, want %q: /scale reports this to "+
+					"an HPA, which cannot find pods without it", got.Status.Selector, want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The pause annotation's value
+// ---------------------------------------------------------------------------
+
+// Presence-only means podpools.dev/paused: "false" pauses the pool. That is a
+// real trap for GitOps templating: a chart rendering `paused: {{ .Values.paused
+// }}` produces the literal string false and silently freezes reconciliation
+// while the manifest says the opposite.
+//
+// Unparseable values pause deliberately. An operator who typed something
+// meaning to pause gets a pause rather than a silently running pool.
+func TestIsPausedHonoursTheAnnotationValue(t *testing.T) {
+	tests := []struct {
+		value string
+		want  bool
+		why   string
+	}{
+		{value: "\x00absent", want: false, why: "no annotation at all"},
+		{value: valueTrue, want: true},
+		{value: "TRUE", want: true},
+		{value: "1", want: true},
+		{value: "t", want: true},
+		{value: valueFalse, want: false, why: "the templating trap this rule exists for"},
+		{value: "FALSE", want: false},
+		{value: "0", want: false},
+		{value: "f", want: false},
+		{value: "", want: true, why: "unparseable, and the value people write to mean 'just pause'"},
+		{value: "on", want: true, why: "unparseable: do not guess, and do not silently run"},
+		{value: "paused", want: true, why: "unparseable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			pool := fakeTestPool()
+			if tt.value != "\x00absent" {
+				pool.Annotations = map[string]string{workload.AnnotationPaused: tt.value}
+			}
+
+			if got := isPaused(pool); got != tt.want {
+				t.Errorf("isPaused(%q) = %v, want %v (%s)", tt.value, got, tt.want, tt.why)
+			}
+		})
+	}
+}
+
+// The same claim end to end, because isPaused could be right while Reconcile
+// consults the annotation map directly.
+func TestPausedFalseReconcilesNormally(t *testing.T) {
+	pool := fakeTestPool()
+	pool.Annotations = map[string]string{workload.AnnotationPaused: valueFalse}
+
+	r, cl := newFakeReconciler(t, nil, pool)
+
+	reconcilePool(t, r, pool)
+
+	got := getPool(t, cl, pool)
+
+	ready := meta.FindStatusCondition(got.Status.Conditions, ConditionReady)
+	if ready == nil {
+		t.Fatal("no Ready condition")
+	}
+
+	if ready.Reason == ReasonPaused {
+		t.Error("a pool annotated paused=false is paused; a GitOps template " +
+			"rendering a boolean freezes the pool while the manifest says it should run")
+	}
+
+	if len(got.Status.Groups) == 0 {
+		t.Error("no groups were reconciled, so the pool did not actually run")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metrics on every path that mutates conditions
+// ---------------------------------------------------------------------------
+
+// The pause exit mutates conditions and returns above the whole group loop.
+// Publishing metrics from the status defer -- derived from pool.Status, not
+// from reconcile-local aggregates -- is what makes these two pass by
+// construction rather than by anyone remembering the new exit. In the real
+// history this was a bug found after pause shipped: a dashboard showed a
+// paused pool still progressing.
+func TestPausedPoolPublishesItsMetrics(t *testing.T) {
+	const ns, name = "metrics-pause-ns", "metrics-pause-pool"
+
+	t.Cleanup(func() { deletePoolMetrics(ns, name) })
+
+	pool := fakeTestPool()
+	pool.Namespace = ns
+	pool.Name = name
+
+	r, cl := newFakeReconciler(t, nil, pool)
+
+	reconcilePool(t, r, pool)
+
+	if v := conditionSeries(t, ns, name)[ConditionProgressing+"/true"]; v != 1 {
+		t.Fatalf("Progressing=true gauge is %v before the pause, want 1", v)
+	}
+
+	live := getPool(t, cl, pool)
+	live.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+
+	if err := r.Update(t.Context(), live); err != nil {
+		t.Fatalf("pausing: %v", err)
+	}
+
+	reconcilePool(t, r, pool)
+
+	series := conditionSeries(t, ns, name)
+
+	if v := series[ConditionProgressing+"/true"]; v != 0 {
+		t.Errorf("Progressing=true gauge is %v after the pause, want 0: the metric "+
+			"still reports the pool as making progress", v)
+	}
+
+	if v := series[ConditionProgressing+"/false"]; v != 1 {
+		t.Errorf("Progressing=false gauge is %v after the pause, want 1", v)
+	}
+}
+
+// The sharper case: a pool that has never run the full path has no series
+// whatsoever, so it is invisible to monitoring rather than merely stale.
+func TestPoolCreatedPausedPublishesMetricsAtAll(t *testing.T) {
+	const ns, name = "metrics-born-paused-ns", "metrics-born-paused-pool"
+
+	t.Cleanup(func() { deletePoolMetrics(ns, name) })
+
+	pool := fakeTestPool()
+	pool.Namespace = ns
+	pool.Name = name
+	pool.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+
+	r, _ := newFakeReconciler(t, nil, pool)
+
+	reconcilePool(t, r, pool)
+
+	if n := seriesFor(specReplicas, ns, name); n == 0 {
+		t.Error("a pool created paused publishes no metrics at all; it cannot be " +
+			"alerted on, and its absence is indistinguishable from not existing")
+	}
+
+	if v := conditionSeries(t, ns, name)[ConditionReady+"/false"]; v != 1 {
+		t.Errorf("Ready=false gauge is %v, want 1", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The watch-failure exit
 // ---------------------------------------------------------------------------
 
@@ -251,7 +457,7 @@ func TestWatchFailureDoesNotObserveTheGeneration(t *testing.T) {
 
 // TestEveryEarlyExitWritesReady is a class guard rather than a bug
 // reproducer. Every exit leaving a Ready condition is what makes the fix
-// above work, and a third early return that forgets would silently reopen it.
+// above work, and a fourth early return that forgets would silently reopen it.
 // Reading the code will not catch that; this will.
 func TestEveryEarlyExitWritesReady(t *testing.T) {
 	tests := []struct {
@@ -259,6 +465,19 @@ func TestEveryEarlyExitWritesReady(t *testing.T) {
 		wantReason string
 		build      func(*testing.T) (*PodPoolReconciler, *podpoolsv1alpha1.PodPool)
 	}{
+		{
+			name:       "paused",
+			wantReason: ReasonPaused,
+			build: func(t *testing.T) (*PodPoolReconciler, *podpoolsv1alpha1.PodPool) {
+				t.Helper()
+
+				pool := fakeTestPool()
+				pool.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+				r, _ := newFakeReconciler(t, nil, pool)
+
+				return r, pool
+			},
+		},
 		{
 			name: "unparseable workload template",
 			// Ready aggregates rather than naming the fault; GroupsReady is

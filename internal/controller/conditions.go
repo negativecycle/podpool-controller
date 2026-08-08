@@ -34,6 +34,7 @@ const (
 	ReasonPoolReady                  = "PoolReady"
 	ReasonWorkloadUpdating           = "WorkloadUpdating"
 	ReasonWorkloadTemplateInvalid    = "WorkloadTemplateInvalid"
+	ReasonPaused                     = "Paused"
 	// Used as both a condition reason and an event reason, from one constant so
 	// the two cannot drift.
 	ReasonWatchSetupFailed = "WatchSetupFailed"

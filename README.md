@@ -4,6 +4,29 @@
 ## Description
 // TODO(user): An in-depth paragraph about your project and overview of use
 
+## Annotations
+
+Set on the PodPool itself, not on children.
+
+| Annotation | Effect |
+|------------|--------|
+| `podpools.dev/paused` | The controller stops reconciling the pool. Children are left exactly as they are, and `Ready` reports the pause as its reason. Remove the annotation to resume. |
+
+The **value** is honoured, not just the annotation's presence:
+
+| Value | Paused? |
+|-------|---------|
+| annotation absent | no |
+| `true`, `True`, `1`, `t` | yes |
+| `false`, `False`, `0`, `f` | **no** |
+| `""` or anything else (`yes`, `paused`, ...) | yes |
+
+`false` really does mean "do not pause", so a chart rendering `paused: {{ .Values.paused }}` behaves the way the manifest reads. Anything that is not a recognisable boolean pauses: if you typed something meaning to pause, you get a pause rather than a pool that silently keeps running.
+
+A paused pool does not stop reporting. It keeps publishing its metrics and its `status.selector`.
+
+Pause is an annotation rather than a spec field, and the validating webhook returns early on any update that does not change `spec`. Together these guarantee that a pool can be paused **regardless of whether its spec still passes validation** -- which is when you are most likely to want to. A pool admitted under an older ruleset, or one whose `workloadTemplate` the controller can no longer read, remains pausable. The same applies to every other metadata write: labels, annotations, and finalizers.
+
 ## Getting Started
 
 ### Prerequisites
