@@ -618,6 +618,30 @@ func warnPoolNameUpdate(pp *podpoolsv1alpha1.PodPool) admission.Warnings {
 	}
 }
 
+func warnStatefulSetOrdinalBudget(pp *podpoolsv1alpha1.PodPool) admission.Warnings {
+	gvk, err := workload.ExtractGVK(pp.Spec.WorkloadTemplate.Raw)
+	if err != nil || gvk.Kind != "StatefulSet" {
+		return nil
+	}
+
+	maxOrdinalLen := len(strconv.FormatInt(int64(pp.Spec.Replicas), 10))
+
+	var warnings admission.Warnings
+
+	for _, g := range pp.Spec.Groups {
+		child := workload.ChildName(pp.Name, g.Name)
+
+		hostnameLen := len(child) + 1 + maxOrdinalLen
+		if hostnameLen > maxPoolNameLen {
+			warnings = append(warnings, fmt.Sprintf(
+				"group %q: StatefulSet pods will be named %s-<ordinal>, up to %d characters, exceeding the 63-byte hostname limit; pods with high ordinals will fail to schedule",
+				g.Name, child, hostnameLen))
+		}
+	}
+
+	return warnings
+}
+
 func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoolsv1alpha1.PodPool) (admission.Warnings, error) {
 	logf.FromContext(ctx).Info("Validation for PodPool upon creation", "name", obj.GetName())
 
@@ -645,6 +669,7 @@ func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoo
 	warnings := rcResult.warnings
 	warnings = append(warnings, warnOnFullyCappedPool(obj)...)
 	warnings = append(warnings, warnOnUnreadableTarget(obj)...)
+	warnings = append(warnings, warnStatefulSetOrdinalBudget(obj)...)
 
 	return warnings, nil
 }
@@ -749,6 +774,7 @@ func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *pod
 	warnings = append(warnings, warnOnFullyCappedPool(newObj)...)
 	warnings = append(warnings, warnOnUnreadableTarget(newObj)...)
 	warnings = append(warnings, warnPoolNameUpdate(newObj)...)
+	warnings = append(warnings, warnStatefulSetOrdinalBudget(newObj)...)
 
 	return warnings, nil
 }
