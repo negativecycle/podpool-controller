@@ -23,17 +23,27 @@ import (
 	"regexp"
 	"strconv"
 
+	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+	kjson "sigs.k8s.io/json"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 	"github.com/negativecycle/podpool-controller/internal/workload"
 )
 
 var dnsLabelRegexp = regexp.MustCompile(`^[a-z][a-z0-9-]*[a-z0-9]$`)
+
+var childScheme = func() *runtime.Scheme {
+	s := runtime.NewScheme()
+	_ = appsv1.AddToScheme(s)
+
+	return s
+}()
 
 // SetupPodPoolWebhookWithManager registers the defaulting and validating webhooks for PodPool.
 func SetupPodPoolWebhookWithManager(mgr ctrl.Manager) error {
@@ -364,6 +374,7 @@ func warnOnUnreadableTarget(pp *podpoolsv1alpha1.PodPool) admission.Warnings {
 type renderedChildResult struct {
 	globalErrs field.ErrorList
 	groupErrs  map[string]field.ErrorList
+	warnings   admission.Warnings
 }
 
 func (r renderedChildResult) allErrors() field.ErrorList {
@@ -397,6 +408,9 @@ func validateRenderedChildren(pp *podpoolsv1alpha1.PodPool) renderedChildResult 
 		return result
 	}
 
+	_, schemeCheckErr := childScheme.New(gvk)
+	knownGVK := schemeCheckErr == nil
+
 	dist := workload.ComputeGroupTargets(pp.Spec.Replicas, pp.Spec.Groups, nil)
 	groupsPath := field.NewPath("spec", "groups")
 
@@ -410,7 +424,7 @@ func validateRenderedChildren(pp *podpoolsv1alpha1.PodPool) renderedChildResult 
 			replicas = dist.Targets[i]
 		}
 
-		_, renderErr := workload.BuildChildWorkload(tmpl, g, pp, replicas)
+		child, renderErr := workload.BuildChildWorkload(tmpl, g, pp, replicas)
 		if renderErr != nil {
 			groupErrs = append(groupErrs, field.Invalid(gp, g.Name,
 				fmt.Sprintf("cannot render child workload: %v", renderErr)))
@@ -419,6 +433,22 @@ func validateRenderedChildren(pp *podpoolsv1alpha1.PodPool) renderedChildResult 
 			}
 
 			continue
+		}
+
+		if knownGVK {
+			typed, _ := childScheme.New(gvk)
+			childJSON, _ := json.Marshal(child.Object) //nolint:errchkjson // unstructured objects always marshal cleanly
+
+			strictErrs, decodeErr := kjson.UnmarshalStrict(childJSON, typed)
+			if decodeErr != nil {
+				groupErrs = append(groupErrs, field.Invalid(gp, g.Name,
+					fmt.Sprintf("rendered child has type errors: %v", decodeErr)))
+			}
+
+			for _, se := range strictErrs {
+				result.warnings = append(result.warnings,
+					fmt.Sprintf("group %q: %v", g.Name, se))
+			}
 		}
 
 		if len(groupErrs) > 0 {
@@ -485,13 +515,15 @@ func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoo
 		allErrs = append(allErrs, nameErr)
 	}
 
-	allErrs = append(allErrs, validateRenderedChildren(obj).allErrors()...)
+	rcResult := validateRenderedChildren(obj)
+	allErrs = append(allErrs, rcResult.allErrors()...)
 
 	if len(allErrs) > 0 {
 		return nil, allErrs.ToAggregate()
 	}
 
-	warnings := warnOnFullyCappedPool(obj)
+	warnings := rcResult.warnings
+	warnings = append(warnings, warnOnFullyCappedPool(obj)...)
 	warnings = append(warnings, warnOnUnreadableTarget(obj)...)
 
 	return warnings, nil

@@ -1020,6 +1020,108 @@ func templateJSON(obj map[string]any) runtime.RawExtension {
 	return runtime.RawExtension{Raw: raw}
 }
 
+func validDeploymentMap() map[string]any {
+	return map[string]any{
+		fieldAPIVersion: appsV1,
+		fieldKind:       kindDeployment,
+		fieldSpec: map[string]any{
+			fieldTemplate: map[string]any{
+				fieldSpec: map[string]any{
+					fieldContainers: []any{
+						map[string]any{fieldName: fieldApp, fieldImage: imageNginx},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestRenderedChildTypedDecode(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	v := &PodPoolCustomValidator{}
+
+	pool := func(tmpl runtime.RawExtension) *podpoolsv1alpha1.PodPool {
+		return &podpoolsv1alpha1.PodPool{
+			Spec: podpoolsv1alpha1.PodPoolSpec{
+				Replicas:         3,
+				WorkloadTemplate: tmpl,
+				Groups: []podpoolsv1alpha1.GroupSpec{
+					{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)}},
+				},
+			},
+		}
+	}
+
+	t.Run("type error rejects", func(t *testing.T) {
+		t.Parallel()
+
+		tmpl := validDeploymentMap()
+		tmpl[fieldSpec].(map[string]any)["minReadySeconds"] = "ten"
+
+		_, err := v.ValidateCreate(ctx, pool(templateJSON(tmpl)))
+		if err == nil {
+			t.Error("expected rejection for minReadySeconds: \"ten\"")
+		}
+	})
+
+	t.Run("bad quantity rejects", func(t *testing.T) {
+		t.Parallel()
+
+		tmpl := validDeploymentMap()
+		containers := tmpl[fieldSpec].(map[string]any)["template"].(map[string]any)[fieldSpec].(map[string]any)["containers"].([]any)
+		containers[0].(map[string]any)["resources"] = map[string]any{
+			"limits": map[string]any{"cpu": "not-a-quantity"},
+		}
+
+		_, err := v.ValidateCreate(ctx, pool(templateJSON(tmpl)))
+		if err == nil {
+			t.Error("expected rejection for cpu: \"not-a-quantity\"")
+		}
+	})
+
+	t.Run("unknown field warns, not rejects", func(t *testing.T) {
+		t.Parallel()
+
+		tmpl := validDeploymentMap()
+		tmpl[fieldSpec].(map[string]any)["containerz"] = "typo"
+
+		warnings, err := v.ValidateCreate(ctx, pool(templateJSON(tmpl)))
+		if err != nil {
+			t.Errorf("unknown fields must warn, not reject (version skew): %v", err)
+		}
+
+		if len(warnings) == 0 {
+			t.Error("expected warning about unknown field")
+		}
+	})
+
+	t.Run("CRD GVK skips typed decode", func(t *testing.T) {
+		t.Parallel()
+
+		tmpl := map[string]any{
+			fieldAPIVersion: "argoproj.io/v1alpha1",
+			fieldKind:       "Rollout",
+			fieldSpec: map[string]any{
+				"minReadySeconds": "would-fail-if-decoded",
+				fieldTemplate: map[string]any{
+					fieldSpec: map[string]any{
+						fieldContainers: []any{
+							map[string]any{fieldName: fieldApp, fieldImage: imageNginx},
+						},
+					},
+				},
+			},
+		}
+
+		_, err := v.ValidateCreate(ctx, pool(templateJSON(tmpl)))
+		if err != nil {
+			t.Errorf("CRD GVK should skip typed decode: %v", err)
+		}
+	})
+}
+
 func TestPodPoolAsTemplate(t *testing.T) {
 	t.Parallel()
 
