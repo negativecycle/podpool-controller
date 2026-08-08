@@ -23,6 +23,126 @@ import (
 // invariant rather than the exit: the next early return added will break the
 // same ones.
 
+// ---------------------------------------------------------------------------
+// The paused pool's observedGeneration
+// ---------------------------------------------------------------------------
+
+// pauseEditResume drives the sequence every stamp assertion needs: reconcile a
+// healthy pool, then pause it and edit its spec so the generation moves while
+// nothing is reconciled.
+func pauseEditResume(t *testing.T, r *PodPoolReconciler, cl client.Client,
+	pool *podpoolsv1alpha1.PodPool,
+) *podpoolsv1alpha1.PodPool {
+	t.Helper()
+
+	reconcilePool(t, r, pool)
+
+	live := getPool(t, cl, pool)
+	live.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+	live.Spec.Replicas = 7
+	// Set explicitly: the fake client does not maintain metadata.generation the
+	// way the API server does, and an edit that does not move the generation
+	// would make every assertion here vacuous.
+	live.Generation = pool.Generation + 1
+
+	if err := cl.Update(t.Context(), live); err != nil {
+		t.Fatalf("pausing and editing the pool: %v", err)
+	}
+
+	if bumped := getPool(t, cl, pool); bumped.Generation != pool.Generation+1 {
+		t.Fatalf("generation is %d after the edit, want %d", bumped.Generation, pool.Generation+1)
+	}
+
+	reconcilePool(t, r, pool)
+
+	return getPool(t, cl, pool)
+}
+
+// observedGeneration == generation is the API's way of saying the controller
+// has acted on this spec. A paused pool has not. Anything gating on the
+// equality reads the pool as settled: kubectl wait, CI gates, Argo health
+// assessment.
+func TestPausedDoesNotObserveNewGeneration(t *testing.T) {
+	pool := fakeTestPool()
+
+	r, cl := newFakeReconciler(t, nil, pool)
+
+	got := pauseEditResume(t, r, cl, pool)
+
+	if got.Generation == got.Status.ObservedGeneration {
+		t.Errorf("observedGeneration = %d at generation %d: the pool reports the "+
+			"edit as observed, but it was paused and nothing was reconciled",
+			got.Status.ObservedGeneration, got.Generation)
+	}
+}
+
+// The invariant setConditions' own doc comment claims: the top-level field and
+// the conditions can never disagree. The paused branch writes two of the five,
+// so advancing the top-level field strands the other three at the generation
+// before it.
+func TestPausedConditionsAgreeWithObservedGeneration(t *testing.T) {
+	pool := fakeTestPool()
+
+	r, cl := newFakeReconciler(t, nil, pool)
+
+	got := pauseEditResume(t, r, cl, pool)
+
+	for _, c := range got.Status.Conditions {
+		if c.ObservedGeneration != got.Status.ObservedGeneration {
+			t.Errorf("condition %s carries generation %d, status.observedGeneration "+
+				"is %d: a reader cannot tell which one describes the object",
+				c.Type, c.ObservedGeneration, got.Status.ObservedGeneration)
+		}
+	}
+}
+
+// Why the stamp is the half that corrupts persisted state rather than merely
+// misreporting it.
+//
+// Reconcile derives genChanged from the stored observedGeneration, and
+// stampGroupProgress re-stamps LastProgressTime when the spec moved. Stamping
+// the generation during the pause makes genChanged false on resume, so
+// LastProgressTime keeps its pre-pause value and evaluateStalled measures the
+// new rollout against a clock that started before the pause. A pause longer
+// than the deadline therefore reports ProgressDeadlineExceeded the instant it
+// resumes, before the rollout has had any time at all.
+func TestResumeAfterLongPauseDoesNotTripProgressDeadline(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	pool := fakeTestPool()
+
+	r, cl := newFakeReconciler(t, nil, pool)
+	fake := clocktesting.NewFakePassiveClock(base)
+	r.Clock = fake
+
+	pauseEditResume(t, r, cl, pool)
+
+	// Longer than the 600s default deadline, which is the point: a maintenance
+	// pause is routinely longer than a rollout is allowed to take.
+	fake.SetTime(base.Add(2 * progressDeadline(pool)))
+
+	live := getPool(t, cl, pool)
+	live.Annotations = nil
+
+	if err := cl.Update(t.Context(), live); err != nil {
+		t.Fatalf("unpausing: %v", err)
+	}
+
+	reconcilePool(t, r, pool)
+
+	got := getPool(t, cl, pool)
+
+	progressing := meta.FindStatusCondition(got.Status.Conditions, ConditionProgressing)
+	if progressing == nil {
+		t.Fatal("no Progressing condition after resume")
+	}
+
+	if progressing.Reason == ReasonProgressDeadlineExceeded {
+		t.Errorf("pool reports %s immediately on resume: the deadline is being "+
+			"measured from before the pause, so a long pause fails the rollout "+
+			"that follows it", ReasonProgressDeadlineExceeded)
+	}
+}
+
 // pendingInformer reports unsynced until synced is flipped. The embedded nil
 // panics on anything ensureWatch does not call, which is the point: it fails
 // loudly if this path grows a dependency the fake does not model.
