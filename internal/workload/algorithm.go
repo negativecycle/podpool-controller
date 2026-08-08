@@ -81,18 +81,23 @@ func GroupTarget(total int32, s podpoolsv1alpha1.ScalingConstraints) (int32, boo
 	return t, true
 }
 
-// ComputeGroupTargets distributes total replicas across groups using their
-// scaling constraints.
+// ComputeGroupTargets distributes total replicas across groups using their scaling constraints.
 //
 // Algorithm:
 //  1. Satisfy cascade thresholds (floor) in list order, constrained by total.
 //  2. Chase percentage-based targets for groups that have one.
-//  3. Distribute the remainder in list order, up to each group's ceiling.
+//  3. Fill opportunistic groups up to the capacity last observed.
+//  4. Distribute the remainder in list order, up to each group's ceiling.
 //
-// Anything still unplaced after the overflow phase stays unplaced. Ceilings
-// are honoured absolutely: a user who put a limit on every tier meant it, and
-// quietly overspending on the expensive one is the failure this controller
-// exists to prevent.
+// Phase 3 sits where it does deliberately, and both boundaries matter. *After*
+// targets, so a declared share is honoured before free capacity is consumed: an
+// opportunistic tier must not undercut the reliable one. *Before* the overflow,
+// so free capacity is used before an unbounded group buys more.
+//
+// Anything still unplaced after phase 4 stays unplaced. Ceilings are honoured
+// absolutely: a user who put a limit on every tier meant it, and quietly
+// overspending on the expensive one is the failure this controller exists to
+// prevent.
 //
 // This runs on stored objects: a pool admitted before a validation rule existed,
 // or written while the webhook was unreachable, still has to distribute sanely.
@@ -156,14 +161,51 @@ func ComputeGroupTargets(
 		}
 	}
 
-	// The overflow phase: distribute the remainder in list order, respecting
-	// ceilings.
+	// Phase 3: fill opportunistic groups up to their observed capacity.
+	//
+	// Before the overflow phase, so free capacity is consumed before an
+	// unbounded group grows and buys more. After the target phase, so a declared
+	// share is never undercut by it.
+	for i, g := range groups {
+		if remaining <= 0 {
+			break
+		}
+
+		if !IsOpportunistic(g.Scaling) {
+			continue
+		}
+
+		// Absent from the map means never sized. Offer everything left and let
+		// the scheduler say how much of it lands. That is the cold start, and
+		// it converges in one round trip rather than one replica per heartbeat.
+		want, seen := observed[g.Name]
+		if !seen {
+			want = remaining
+		}
+
+		additional := want - targets[i]
+		if additional <= 0 {
+			continue
+		}
+
+		give := min(additional, remaining)
+		targets[i] += give
+		remaining -= give
+	}
+
+	// Phase 4: distribute the remainder in list order, respecting ceilings.
 	//
 	// Earlier groups are filled first, so the overflow lands on the tier the
 	// user ranked highest: the same cascade as phase 1.
 	for i := range groups {
 		if remaining <= 0 {
 			break
+		}
+		// Phase 3 owns opportunistic groups. Falling through would read them as
+		// unbounded and let one swallow the whole remainder: the same shape of
+		// bug #21 fixed for target.
+		if IsOpportunistic(groups[i].Scaling) {
+			continue
 		}
 
 		limit, bounded := GroupCeiling(total, groups[i].Scaling)
@@ -189,6 +231,75 @@ func ComputeGroupTargets(
 		TargetDegraded: checkTargetDegraded(total, targets, groups),
 		Unplaced:       remaining,
 	}
+}
+
+// IsOpportunistic reports whether a group is sized from observed capacity.
+func IsOpportunistic(s podpoolsv1alpha1.ScalingConstraints) bool {
+	return s.Opportunistic != nil && *s.Opportunistic
+}
+
+// IsBounded reports whether a group has an effective ceiling, and so cannot
+// become the pool's overflow sink.
+//
+// This is the single definition. Any layer asking "could this group swallow
+// the remainder?" must ask here: two implementations of that question always
+// drift, and a group one layer believes is capped becoming the other's
+// overflow sink is exactly the failure the previous commit closed. It is
+// possible to share at all because the previous commit made the distributor's
+// definition presence-based; before it, presence and parsing disagreed.
+//
+// Opportunistic is folded in because its ceiling is real but not static: phase 3
+// sizes such a group from observed capacity and phase 4 skips it, so it never
+// absorbs an overflow either. A caller asking "could this group swallow the
+// remainder?" needs one answer, not two.
+func IsBounded(s podpoolsv1alpha1.ScalingConstraints) bool {
+	return hasStaticCeiling(s) || IsOpportunistic(s)
+}
+
+// hasStaticCeiling reports whether a group declares a ceiling at all.
+//
+// Declaring one and declaring a readable one are different questions, and this
+// answers the first. It is deliberately about presence: a target nobody can
+// parse is still the user saying they wanted this tier capped, and reading it
+// as "no cap" turns a typo into the overflow sink.
+func hasStaticCeiling(s podpoolsv1alpha1.ScalingConstraints) bool {
+	return s.Max != nil || s.Target != nil
+}
+
+// GroupCeiling reports the largest target a group may hold, and whether it is
+// bounded at all.
+//
+// The ceiling is max if set, otherwise the target itself (resolved at the
+// current total). A group with neither is unbounded: the overflow bucket. That
+// case must stay exactly as broad as it is — an absent target is a deliberate
+// statement that this tier absorbs what the others cannot, and the whole
+// overflow design rests on it.
+//
+// An opportunistic group has no *static* ceiling (its bound is whatever phase 3
+// observed), so it is not expressible here. Phase 4 skips those groups outright
+// rather than asking. Callers reasoning about ceilings must do the same.
+func GroupCeiling(total int32, s podpoolsv1alpha1.ScalingConstraints) (limit int32, bounded bool) {
+	if !hasStaticCeiling(s) {
+		return 0, false
+	}
+
+	if s.Max != nil {
+		return *s.Max, true
+	}
+
+	// A target that is present but unreadable binds at zero: the group keeps
+	// its floor and grows no further. Every other reading is worse. Treating it
+	// as absent makes the group unbounded, so a typo on the tier the user was
+	// trying to cap silently makes it the one that absorbs the whole pool —
+	// measured at a 33% overspend on a three-tier pool, and invisible because
+	// nothing reports it. Binding at zero surfaces the same mistake through
+	// status.unplacedReplicas instead.
+	pct, ok := TargetPercent(s.Target)
+	if !ok {
+		return 0, true
+	}
+
+	return percentOf(total, pct), true
 }
 
 // targetTolerancePct is the slack allowed before a target counts as violated.
@@ -237,61 +348,6 @@ func checkTargetDegraded(total int32, targets []int32, groups []podpoolsv1alpha1
 	}
 
 	return false
-}
-
-// IsBounded reports whether a group has an effective ceiling, and so cannot
-// become the pool's overflow sink.
-//
-// This is the single definition. Any layer asking "could this group swallow
-// the remainder?" must ask here: two implementations of that question always
-// drift, and a group one layer believes is capped becoming the other's
-// overflow sink is exactly the failure the previous commit closed. It is
-// possible to share at all because the previous commit made the distributor's
-// definition presence-based; before it, presence and parsing disagreed.
-func IsBounded(s podpoolsv1alpha1.ScalingConstraints) bool {
-	return hasStaticCeiling(s)
-}
-
-// hasStaticCeiling reports whether a group declares a ceiling at all.
-//
-// Declaring one and declaring a readable one are different questions, and this
-// answers the first. It is deliberately about presence: a target nobody can
-// parse is still the user saying they wanted this tier capped, and reading it
-// as "no cap" turns a typo into the overflow sink.
-func hasStaticCeiling(s podpoolsv1alpha1.ScalingConstraints) bool {
-	return s.Max != nil || s.Target != nil
-}
-
-// GroupCeiling reports the largest target a group may hold, and whether it is
-// bounded at all.
-//
-// The ceiling is max if set, otherwise the target itself (resolved at the
-// current total). A group with neither is unbounded: the overflow bucket. That
-// case must stay exactly as broad as it is — an absent target is a deliberate
-// statement that this tier absorbs what the others cannot, and the whole
-// overflow design rests on it.
-func GroupCeiling(total int32, s podpoolsv1alpha1.ScalingConstraints) (limit int32, bounded bool) {
-	if !hasStaticCeiling(s) {
-		return 0, false
-	}
-
-	if s.Max != nil {
-		return *s.Max, true
-	}
-
-	// A target that is present but unreadable binds at zero: the group keeps
-	// its floor and grows no further. Every other reading is worse. Treating it
-	// as absent makes the group unbounded, so a typo on the tier the user was
-	// trying to cap silently makes it the one that absorbs the whole pool —
-	// measured at a 33% overspend on a three-tier pool, and invisible because
-	// nothing reports it. Binding at zero surfaces the same mistake through
-	// status.unplacedReplicas instead.
-	pct, ok := TargetPercent(s.Target)
-	if !ok {
-		return 0, true
-	}
-
-	return percentOf(total, pct), true
 }
 
 // percentOf returns total × pct / 100 rounded down.

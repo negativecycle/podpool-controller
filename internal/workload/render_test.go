@@ -13,6 +13,7 @@ import (
 
 const (
 	testGroupBurst = "burst"
+	testGroupScav  = "scavenger"
 
 	fieldStatus          = "status"
 	fieldReplicas        = "replicas"
