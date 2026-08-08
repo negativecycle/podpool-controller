@@ -251,10 +251,62 @@ func validateScaling(fp *field.Path, s *podpoolsv1alpha1.ScalingConstraints) fie
 	return allErrs
 }
 
+func warnOnGroupRemoval(oldPP, newPP *podpoolsv1alpha1.PodPool) admission.Warnings {
+	newNames := make(map[string]bool)
+	for _, g := range newPP.Spec.Groups {
+		newNames[g.Name] = true
+	}
+
+	var warnings admission.Warnings
+
+	for _, g := range oldPP.Spec.Groups {
+		if !newNames[g.Name] {
+			warnings = append(warnings, fmt.Sprintf(
+				"group %q was removed: its child workload %s will be deleted and its replicas will move to other groups",
+				g.Name, workload.ChildName(oldPP.Name, g.Name)))
+		}
+	}
+
+	return warnings
+}
+
+const maxPoolNameLen = 63
+
+func validatePoolNameCreate(pp *podpoolsv1alpha1.PodPool) *field.Error {
+	name := pp.Name
+	if len(name) <= maxPoolNameLen {
+		return nil
+	}
+
+	detail := fmt.Sprintf("must be at most %d characters (it becomes the %s label value, which is bounded by the Kubernetes label value limit)",
+		maxPoolNameLen, workload.LabelPool)
+	if pp.GenerateName != "" {
+		detail = fmt.Sprintf("generated name %q is %d characters; %s", name, len(name), detail)
+	}
+
+	return field.Invalid(field.NewPath("metadata", "name"), name, detail)
+}
+
+func warnPoolNameUpdate(pp *podpoolsv1alpha1.PodPool) admission.Warnings {
+	if len(pp.Name) <= maxPoolNameLen {
+		return nil
+	}
+
+	return admission.Warnings{
+		fmt.Sprintf("pool name %q is %d characters, exceeding the %d-character label value limit; it was admitted before this check existed and cannot be renamed. Consider recreating with a shorter name",
+			pp.Name, len(pp.Name), maxPoolNameLen),
+	}
+}
+
 func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoolsv1alpha1.PodPool) (admission.Warnings, error) {
 	logf.FromContext(ctx).Info("Validation for PodPool upon creation", "name", obj.GetName())
 
 	allErrs := validatePodPoolSpec(obj)
+
+	if nameErr := validatePoolNameCreate(obj); nameErr != nil {
+		allErrs = append(allErrs, nameErr)
+	}
+
 	if len(allErrs) > 0 {
 		return nil, allErrs.ToAggregate()
 	}
@@ -289,7 +341,10 @@ func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *pod
 		return nil, allErrs.ToAggregate()
 	}
 
-	return nil, nil
+	warnings := warnOnGroupRemoval(oldObj, newObj)
+	warnings = append(warnings, warnPoolNameUpdate(newObj)...)
+
+	return warnings, nil
 }
 
 // ValidateDelete is registered because the framework requires the interface to

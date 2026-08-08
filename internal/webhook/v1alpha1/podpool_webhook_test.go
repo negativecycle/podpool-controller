@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -58,6 +59,32 @@ func rawTarget(s string) *intstr.IntOrString {
 	v := intstr.FromString(s)
 
 	return &v
+}
+
+// templateRaw builds a minimal valid template. It takes no kind yet: nothing
+// here cares which workload type it is, and a parameter with one caller and one
+// value is a claim the tests do not make.
+func templateRaw() runtime.RawExtension {
+	return runtime.RawExtension{Raw: []byte(`{
+		"apiVersion": "apps/v1",
+		"kind": "Deployment",
+		"spec": {"template": {"spec": {"containers": [{"name": "app", "image": "nginx"}]}}}
+	}`)}
+}
+
+// poolWith builds a minimally valid pool so that a test asserting on one rule
+// is not tripped by an unrelated one.
+func poolWith(name string, replicas int32) *podpoolsv1alpha1.PodPool {
+	return &podpoolsv1alpha1.PodPool{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         replicas,
+			WorkloadTemplate: templateRaw(),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To(int32(1))}},
+			},
+		},
+	}
 }
 
 func opportunisticPtr() *bool {
@@ -655,3 +682,113 @@ func TestValidateOpportunisticAcrossGroups(t *testing.T) {
 		})
 	}
 }
+
+const (
+	nameAt63 = "a23456789012345678901234567890123456789012345678901234567890123"  // 63
+	nameAt64 = "a234567890123456789012345678901234567890123456789012345678901234" // 64
+)
+
+func TestPoolNameLengthBoundary(t *testing.T) {
+	t.Parallel()
+
+	if len(nameAt63) != 63 || len(nameAt64) != 64 {
+		t.Fatalf("fixture lengths wrong: %d, %d", len(nameAt63), len(nameAt64))
+	}
+
+	t.Run("63 is accepted", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := (&PodPoolCustomValidator{}).ValidateCreate(t.Context(), poolWith(nameAt63, 3))
+		if err != nil {
+			t.Errorf("63-character name rejected: %v", err)
+		}
+	})
+
+	t.Run("64 is rejected", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := (&PodPoolCustomValidator{}).ValidateCreate(t.Context(), poolWith(nameAt64, 3))
+		if err == nil {
+			t.Fatal("64-character name admitted; it becomes an over-long podpools.dev/pool label value and every group fails at apply time")
+		}
+
+		if !strings.Contains(err.Error(), "63") {
+			t.Errorf("rejection does not state the limit: %v", err)
+		}
+	})
+}
+
+// TestOverLongNameOnUpdateWarnsButDoesNotBlock is the trap this item most needs
+// a guard for. metadata.name is immutable, so rejecting on update would leave
+// an already-created over-long pool permanently un-editable — the user could
+// not even scale it to zero.
+func TestOverLongNameOnUpdateWarnsButDoesNotBlock(t *testing.T) {
+	t.Parallel()
+
+	old := poolWith(nameAt64, 3)
+	updated := poolWith(nameAt64, 5)
+
+	warnings, err := (&PodPoolCustomValidator{}).ValidateUpdate(t.Context(), old, updated)
+	if err != nil {
+		t.Fatalf("update to an existing over-long pool was rejected, trapping the object: %v", err)
+	}
+
+	if len(warnings) == 0 {
+		t.Error("update to an over-long pool produced no warning; the user gets no signal at all")
+	}
+}
+
+func TestGroupRemovalWarning(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	v := &PodPoolCustomValidator{}
+
+	oldPool := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         10,
+			WorkloadTemplate: validWorkloadTemplate(),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)}},
+				{Name: testGroupBurst, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)}},
+			},
+		},
+	}
+	oldPool.Name = "my-pool"
+
+	newPool := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         10,
+			WorkloadTemplate: validWorkloadTemplate(),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)}},
+			},
+		},
+	}
+	newPool.Name = "my-pool"
+
+	warnings, err := v.ValidateUpdate(ctx, oldPool, newPool)
+	if err != nil {
+		t.Fatalf("removing a group should warn, not reject: %v", err)
+	}
+
+	found := false
+
+	for _, w := range warnings {
+		if strings.Contains(w, testGroupBurst) && strings.Contains(w, "removed") {
+			found = true
+
+			break
+		}
+	}
+
+	if !found {
+		t.Errorf("expected warning about removed group %q, got: %v", testGroupBurst, warnings)
+	}
+}
+
+// The overflow-sink rule: at most one group may be unbounded.
+//
+// Phase 4 of the distributor absorbs the entire remainder into the FIRST
+// unbounded group. A second unbounded group receives zero overflow at every
+// scale — its unbounded status is provably dead.
