@@ -52,15 +52,6 @@ func validWorkloadTemplate() runtime.RawExtension {
 	return runtime.RawExtension{Raw: raw}
 }
 
-// rawTarget builds a target the CEL rule would reject, which is the only way
-// such a value reaches this code: on a stored object admitted before the rule,
-// or against a stale CRD.
-func rawTarget(s string) *intstr.IntOrString {
-	v := intstr.FromString(s)
-
-	return &v
-}
-
 // templateRaw builds a minimal valid template. It takes no kind yet: nothing
 // here cares which workload type it is, and a parameter with one caller and one
 // value is a claim the tests do not make.
@@ -682,7 +673,7 @@ func TestValidateOpportunisticAcrossGroups(t *testing.T) {
 			name: "an unreadable target before the opportunistic one is still a cap",
 			groups: []podpoolsv1alpha1.GroupSpec{
 				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{
-					Min: ptr.To[int32](2), Target: rawTarget("thirty percent"),
+					Min: ptr.To[int32](2), Target: strTarget("thirty percent"),
 				}},
 				opp,
 				overflow,

@@ -318,6 +318,49 @@ func warnOnFullyCappedPool(pp *podpoolsv1alpha1.PodPool) admission.Warnings {
 	}
 }
 
+// warnOnUnreadableTarget flags a target the distributor cannot parse.
+//
+// A warning and not an error, deliberately. The CRD's CEL rule already rejects
+// these on create, so anything reaching here is a stored object: one admitted
+// before the rule existed, or written against a stale CRD. Validation ratcheting
+// keeps such an object alive — an update that leaves `scaling` untouched never
+// re-runs the rule, so the pool goes on scaling indefinitely — while any edit
+// that does touch `scaling` is rejected. The pool is scalable but not editable.
+//
+// Rejecting here would close the one operation still available, on an object
+// whose operator may need to scale it down precisely because it is overspending.
+// Repair stays possible because fixing target is itself a `scaling`
+// edit, and CEL admits an edit that makes the object valid.
+//
+// The wording deliberately echoes the CEL rule's message: an operator who meets
+// both should not have to work out that they are the same complaint.
+func warnOnUnreadableTarget(pp *podpoolsv1alpha1.PodPool) admission.Warnings {
+	// Kept identical, en-dash included, to the XValidation message on
+	// ScalingConstraints.Target in api/v1alpha1/podpool_types.go. A CEL rule
+	// message cannot reference a Go constant, so this is two copies of one
+	// sentence; grep the phrase to find both.
+	const grammar = `is not a percentage string like "30%" (1%–100%)`
+
+	var warnings admission.Warnings
+
+	for _, g := range pp.Spec.Groups {
+		if g.Scaling.Target == nil {
+			continue
+		}
+
+		if _, ok := workload.TargetPercent(g.Scaling.Target); ok {
+			continue
+		}
+
+		warnings = append(warnings, fmt.Sprintf(
+			"group %q: target %q %s, so the group is capped at 0 and will not "+
+				"grow beyond its min. Set a valid target or remove the field",
+			g.Name, fmtTarget(g.Scaling.Target), grammar))
+	}
+
+	return warnings
+}
+
 func warnOnGroupRemoval(oldPP, newPP *podpoolsv1alpha1.PodPool) admission.Warnings {
 	newNames := make(map[string]bool)
 	for _, g := range newPP.Spec.Groups {
@@ -378,7 +421,10 @@ func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoo
 		return nil, allErrs.ToAggregate()
 	}
 
-	return warnOnFullyCappedPool(obj), nil
+	warnings := warnOnFullyCappedPool(obj)
+	warnings = append(warnings, warnOnUnreadableTarget(obj)...)
+
+	return warnings, nil
 }
 
 func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *podpoolsv1alpha1.PodPool, newObj *podpoolsv1alpha1.PodPool) (admission.Warnings, error) {
@@ -410,6 +456,7 @@ func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *pod
 
 	warnings := warnOnGroupRemoval(oldObj, newObj)
 	warnings = append(warnings, warnOnFullyCappedPool(newObj)...)
+	warnings = append(warnings, warnOnUnreadableTarget(newObj)...)
 	warnings = append(warnings, warnPoolNameUpdate(newObj)...)
 
 	return warnings, nil

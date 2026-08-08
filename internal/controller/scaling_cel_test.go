@@ -16,13 +16,13 @@ limitations under the License.
 
 package controller
 
-// These live in the controller suite rather than a webhook suite on purpose:
+// These live in the controller suite rather than the webhook suite on purpose:
 // suite_test.go installs the CRDs and does NOT install webhook configurations,
 // so this envtest *is* the "webhook is down" scenario the schema rules exist
 // for. Any rejection here came from the schema, unambiguously. The same
-// assertions in a webhook suite could not distinguish CEL from webhook
-// validation, and a test that cannot say which layer rejected cannot prove
-// the schema does anything.
+// assertions in webhook_suite_test.go could not distinguish CEL from
+// validateScaling, and a test that cannot say which layer rejected cannot
+// prove the schema does anything.
 
 import (
 	"fmt"
