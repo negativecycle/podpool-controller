@@ -26,6 +26,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	authzv1 "k8s.io/api/authorization/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -53,7 +54,8 @@ var childScheme = func() *runtime.Scheme {
 func SetupPodPoolWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, &podpoolsv1alpha1.PodPool{}).
 		WithValidator(&PodPoolCustomValidator{
-			Client: mgr.GetClient(),
+			Client:     mgr.GetClient(),
+			RESTMapper: mgr.GetRESTMapper(),
 		}).
 		WithDefaulter(&PodPoolCustomDefaulter{}).
 		Complete()
@@ -82,7 +84,8 @@ func (d *PodPoolCustomDefaulter) Default(ctx context.Context, obj *podpoolsv1alp
 
 // PodPoolCustomValidator validates PodPool resources during admission.
 type PodPoolCustomValidator struct {
-	Client client.Client
+	Client     client.Client
+	RESTMapper meta.RESTMapper
 }
 
 func validateWorkloadTemplate(fp *field.Path, raw []byte) field.ErrorList {
@@ -718,20 +721,37 @@ var builtinPluralResources = map[schema.GroupKind]string{
 // pluralResource resolves a Kind to the resource name the SubjectAccessReview
 // must name.
 //
-// A SAR authorizes a *resource*, not a Kind, and the two are related only by a
-// convention the API server does not enforce. This table is the whole
-// resolution for now, so a kind outside it cannot be authorized at all and the
-// caller turns that into a denial.
+// Discovery is asked first because it is authoritative: a plural comes from the
+// CRD's own spec.names.plural and is not computable from the Kind. The builtin
+// table is the discovery-outage fallback, which is the only role a hardcoded
+// plural should ever play in an authorization decision.
 //
-// Every resolution failure ends in the same place on purpose. Branching on the
-// error class here would let an attacker-influencable condition select a
-// different code path in an authorization check.
+// Every resolution failure ends in the same place, and the caller turns it into
+// a denial. Branching on the error class here would let an attacker-influencable
+// condition select a different code path in an authz check.
 func (v *PodPoolCustomValidator) pluralResource(gvk schema.GroupVersionKind) (string, error) {
-	if plural, ok := builtinPluralResources[gvk.GroupKind()]; ok {
+	gk := gvk.GroupKind()
+
+	if v.RESTMapper == nil {
+		if plural, ok := builtinPluralResources[gk]; ok {
+			return plural, nil
+		}
+
+		return "", fmt.Errorf("cannot resolve %s: no RESTMapper available", gvk.Kind)
+	}
+
+	mapping, err := v.RESTMapper.RESTMapping(gk, gvk.Version)
+	if err == nil {
+		return mapping.Resource.Resource, nil
+	}
+
+	// The table covers only apps/v1, whose plurals cannot change, so a
+	// discovery outage does not take the built-in workload kinds down with it.
+	if plural, ok := builtinPluralResources[gk]; ok {
 		return plural, nil
 	}
 
-	return "", fmt.Errorf("cannot resolve %s to a resource name", gvk.Kind)
+	return "", fmt.Errorf("cannot resolve %s to a resource name: %w", gvk.Kind, err)
 }
 
 // The admission guard below creates a SubjectAccessReview to confirm the
