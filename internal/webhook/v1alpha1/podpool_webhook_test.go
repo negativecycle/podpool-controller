@@ -1,16 +1,26 @@
 package v1alpha1
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+
+	admissionv1 "k8s.io/api/admission/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	authzv1 "k8s.io/api/authorization/v1"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
@@ -35,6 +45,8 @@ const (
 	fieldMatchLabels   = "matchLabels"
 	fieldMetadata      = "metadata"
 	valueMine          = "mine"
+	argoV1alpha1       = "argoproj.io/v1alpha1"
+	kindRollout        = "Rollout"
 )
 
 func validWorkloadTemplate() runtime.RawExtension {
@@ -420,8 +432,8 @@ func TestValidateUpdateGVKImmutability(t *testing.T) {
 	}
 
 	rolloutTmpl := map[string]any{
-		fieldAPIVersion: "argoproj.io/v1alpha1",
-		fieldKind:       "Rollout",
+		fieldAPIVersion: argoV1alpha1,
+		fieldKind:       kindRollout,
 		fieldSpec: map[string]any{
 			fieldTemplate: map[string]any{
 				fieldSpec: map[string]any{
@@ -1105,8 +1117,8 @@ func TestRenderedChildTypedDecode(t *testing.T) {
 		t.Parallel()
 
 		tmpl := map[string]any{
-			fieldAPIVersion: "argoproj.io/v1alpha1",
-			fieldKind:       "Rollout",
+			fieldAPIVersion: argoV1alpha1,
+			fieldKind:       kindRollout,
 			fieldSpec: map[string]any{
 				"minReadySeconds": "would-fail-if-decoded",
 				fieldTemplate: map[string]any{
@@ -1318,4 +1330,212 @@ func TestPreExistingBrokenPoolUpdate(t *testing.T) {
 			t.Error("a newly introduced failure must still be rejected")
 		}
 	})
+}
+
+// --------------------------------------------------------------------------
+// the authorization guard
+// --------------------------------------------------------------------------
+
+const (
+	sarTestUser = "developer@example.com"
+	sarTestNS   = "production"
+)
+
+func sarAdmissionCtx() context.Context {
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			UserInfo: authenticationv1.UserInfo{
+				Username: sarTestUser,
+				Groups:   []string{"system:authenticated"},
+			},
+			Namespace: sarTestNS,
+		},
+	}
+
+	return admission.NewContextWithRequest(context.Background(), req)
+}
+
+func sarInterceptor(allowed bool, sarErr error) client.WithWatch {
+	return (&sarProbe{allowed: allowed, err: sarErr}).client()
+}
+
+// sarProbe stands in for the authorizer and records what the admission guard
+// actually asked it.
+//
+// Both halves are load-bearing. The count is #63's: an outcome assertion cannot
+// distinguish "the check ran and allowed" from "the check never ran", so a
+// regression that re-skips the guard passes every allow-path test that only
+// looks at the returned error. The captured review is #64's: the guard can
+// issue a perfectly well-formed SAR about entirely the wrong resource, and the
+// only way to catch that is to read the ResourceAttributes it sent.
+type sarProbe struct {
+	// allowed is the verdict to return; err makes the review itself fail.
+	allowed bool
+	err     error
+
+	count int
+	last  *authzv1.SubjectAccessReview
+
+	// allow, when set, decides per review instead of the flat allowed field,
+	// so a test can grant one resource and deny every other.
+	allow func(*authzv1.SubjectAccessReview) bool
+}
+
+func (p *sarProbe) client() client.WithWatch {
+	s := runtime.NewScheme()
+	_ = authzv1.AddToScheme(s)
+	_ = podpoolsv1alpha1.AddToScheme(s)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).Build()
+
+	return interceptor.NewClient(fakeClient, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			sar, ok := obj.(*authzv1.SubjectAccessReview)
+			if !ok {
+				return c.Create(ctx, obj, opts...)
+			}
+
+			p.count++
+			p.last = sar.DeepCopy()
+
+			if p.err != nil {
+				return p.err
+			}
+
+			if p.allow != nil {
+				sar.Status.Allowed = p.allow(sar)
+			} else {
+				sar.Status.Allowed = p.allowed
+			}
+
+			return nil
+		},
+	})
+}
+
+func sarPool() *podpoolsv1alpha1.PodPool {
+	pp := &podpoolsv1alpha1.PodPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pool", Namespace: sarTestNS},
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         3,
+			WorkloadTemplate: validWorkloadTemplate(),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](1)}},
+			},
+		},
+	}
+
+	return pp
+}
+
+func TestSARGuardAllowedWorkload(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{Client: sarInterceptor(true, nil)}
+	ctx := sarAdmissionCtx()
+
+	_, err := v.ValidateCreate(ctx, sarPool())
+	if err != nil {
+		t.Errorf("expected allowed workload to pass: %v", err)
+	}
+}
+
+func TestSARGuardDeniedWorkload(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{Client: sarInterceptor(false, nil)}
+	ctx := sarAdmissionCtx()
+
+	_, err := v.ValidateCreate(ctx, sarPool())
+	if err == nil {
+		t.Fatal("expected denied workload to be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "not authorized") {
+		t.Errorf("rejection message should mention authorization: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), sarTestUser) {
+		t.Errorf("rejection message should name the user: %v", err)
+	}
+}
+
+func TestSARGuardFailClosed(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{Client: sarInterceptor(false, errors.New("API server unreachable"))}
+	ctx := sarAdmissionCtx()
+
+	_, err := v.ValidateCreate(ctx, sarPool())
+	if err == nil {
+		t.Fatal("expected SAR failure to reject (fail-closed)")
+	}
+
+	if !strings.Contains(err.Error(), "authorization check failed") {
+		t.Errorf("rejection should distinguish operational failure from denial: %v", err)
+	}
+}
+
+// A kind whose resource name cannot be resolved cannot be authorized, and an
+// authorization that cannot be performed is a denial. Failing open here would
+// be the whole escalation path back: point a pool at any CRD workload the
+// resolver does not know and the guard stops asking.
+func TestSARGuardUnresolvablePluralDenies(t *testing.T) {
+	t.Parallel()
+
+	pp := sarPool()
+	pp.Spec.WorkloadTemplate = templateJSON(map[string]any{
+		fieldAPIVersion: argoV1alpha1,
+		fieldKind:       kindRollout,
+		fieldSpec: map[string]any{
+			fieldTemplate: map[string]any{
+				fieldSpec: map[string]any{
+					fieldContainers: []any{
+						map[string]any{fieldName: fieldApp, fieldImage: imageNginx},
+					},
+				},
+			},
+		},
+	})
+
+	probe := &sarProbe{allowed: true}
+	v := &PodPoolCustomValidator{Client: probe.client()}
+
+	_, err := v.ValidateCreate(sarAdmissionCtx(), pp)
+	if err == nil {
+		t.Fatal("a workload kind whose resource name cannot be resolved was admitted; " +
+			"the guard silently stopped applying")
+	}
+
+	if !strings.Contains(err.Error(), "Rollout") {
+		t.Errorf("rejection should name the unresolvable kind: %v", err)
+	}
+
+	if probe.count != 0 {
+		t.Errorf("a SubjectAccessReview was sent for an unresolved resource (%d); "+
+			"it would have authorized the wrong noun", probe.count)
+	}
+}
+
+func TestSARGuardNoClientIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{}
+	ctx := sarAdmissionCtx()
+
+	_, err := v.ValidateCreate(ctx, sarPool())
+	if err != nil {
+		t.Errorf("without a client the SAR check should be a no-op: %v", err)
+	}
+}
+
+func TestSARGuardNoAdmissionContextIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{Client: sarInterceptor(false, nil)}
+
+	_, err := v.ValidateCreate(t.Context(), sarPool())
+	if err != nil {
+		t.Errorf("without admission context the SAR check should be a no-op: %v", err)
+	}
 }

@@ -25,10 +25,13 @@ import (
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
+	authzv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	kjson "sigs.k8s.io/json"
@@ -49,7 +52,9 @@ var childScheme = func() *runtime.Scheme {
 // SetupPodPoolWebhookWithManager registers the defaulting and validating webhooks for PodPool.
 func SetupPodPoolWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, &podpoolsv1alpha1.PodPool{}).
-		WithValidator(&PodPoolCustomValidator{}).
+		WithValidator(&PodPoolCustomValidator{
+			Client: mgr.GetClient(),
+		}).
 		WithDefaulter(&PodPoolCustomDefaulter{}).
 		Complete()
 }
@@ -76,7 +81,9 @@ func (d *PodPoolCustomDefaulter) Default(ctx context.Context, obj *podpoolsv1alp
 // +kubebuilder:webhook:path=/validate-podpools-dev-v1alpha1-podpool,mutating=false,failurePolicy=fail,sideEffects=None,groups=podpools.dev,resources=podpools,verbs=create;update,versions=v1alpha1,name=vpodpool-v1alpha1.kb.io,admissionReviewVersions=v1
 
 // PodPoolCustomValidator validates PodPool resources during admission.
-type PodPoolCustomValidator struct{}
+type PodPoolCustomValidator struct {
+	Client client.Client
+}
 
 func validateWorkloadTemplate(fp *field.Path, raw []byte) field.ErrorList {
 	var allErrs field.ErrorList
@@ -619,6 +626,14 @@ func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoo
 	rcResult := validateRenderedChildren(obj)
 	allErrs = append(allErrs, rcResult.allErrors()...)
 
+	// An unparseable template has already been rejected by validatePodPoolSpec,
+	// so a parse failure here means there is nothing left to authorize.
+	if gvk, err := workload.ExtractGVK(obj.Spec.WorkloadTemplate.Raw); err == nil {
+		if authErr := v.checkWorkloadAuthorization(ctx, obj, gvk, ""); authErr != nil {
+			allErrs = append(allErrs, authErr)
+		}
+	}
+
 	if len(allErrs) > 0 {
 		return nil, allErrs.ToAggregate()
 	}
@@ -690,4 +705,125 @@ func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *pod
 // operator no way to remove a broken pool.
 func (v *PodPoolCustomValidator) ValidateDelete(_ context.Context, _ *podpoolsv1alpha1.PodPool) (admission.Warnings, error) {
 	return nil, nil
+}
+
+const groupApps = "apps"
+
+var builtinPluralResources = map[schema.GroupKind]string{
+	{Group: groupApps, Kind: "Deployment"}:  "deployments",
+	{Group: groupApps, Kind: "StatefulSet"}: "statefulsets",
+	{Group: groupApps, Kind: "DaemonSet"}:   "daemonsets",
+}
+
+// pluralResource resolves a Kind to the resource name the SubjectAccessReview
+// must name.
+//
+// A SAR authorizes a *resource*, not a Kind, and the two are related only by a
+// convention the API server does not enforce. This table is the whole
+// resolution for now, so a kind outside it cannot be authorized at all and the
+// caller turns that into a denial.
+//
+// Every resolution failure ends in the same place on purpose. Branching on the
+// error class here would let an attacker-influencable condition select a
+// different code path in an authorization check.
+func (v *PodPoolCustomValidator) pluralResource(gvk schema.GroupVersionKind) (string, error) {
+	if plural, ok := builtinPluralResources[gvk.GroupKind()]; ok {
+		return plural, nil
+	}
+
+	return "", fmt.Errorf("cannot resolve %s to a resource name", gvk.Kind)
+}
+
+// The admission guard below creates a SubjectAccessReview to confirm the
+// requesting user may create the workload kind the pool renders. This grant
+// must be declared here, not only inherited from metrics_auth_role.yaml:
+// config/rbac/kustomization.yaml documents that role as safe to comment out
+// when metrics protection is unwanted, and following that instruction would
+// otherwise leave the webhook unable to authorize anything. With
+// failurePolicy=fail that makes every PodPool write fail admission,
+// cluster-wide, for a reason the instruction never mentions.
+//
+// The duplicate grant is deliberate and costs nothing. RBAC is additive, both
+// roles bind the same ServiceAccount, and metrics_auth_role needs its own copy
+// because the metrics authz filter issues SubjectAccessReviews too.
+// +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
+
+// checkWorkloadAuthorization asks whether the requesting user could create the
+// workload kind this pool renders, and denies if not.
+//
+// The GVK is a parameter rather than re-extracted here: every caller has
+// already parsed it, and taking it in removes a third failure mode from a
+// security-critical function. Callers must not invoke this with a GVK they
+// could not parse; the spec validation rejects those first.
+//
+// reason names why the check is running. It is empty on create, where being
+// asked to authorize a new object needs no explanation, and set on update,
+// where the user did not think they were creating anything.
+func (v *PodPoolCustomValidator) checkWorkloadAuthorization(
+	ctx context.Context,
+	pp *podpoolsv1alpha1.PodPool,
+	gvk schema.GroupVersionKind,
+	reason string,
+) *field.Error {
+	if v.Client == nil {
+		return nil
+	}
+
+	req, err := admission.RequestFromContext(ctx)
+	if err != nil {
+		return nil //nolint:nilerr // skip auth check when admission request unavailable
+	}
+
+	plural, err := v.pluralResource(gvk)
+	if err != nil {
+		return field.Forbidden(
+			field.NewPath("spec", "workloadTemplate"),
+			fmt.Sprintf("cannot verify authorization: %v", err))
+	}
+
+	extra := make(map[string]authzv1.ExtraValue, len(req.UserInfo.Extra))
+	for k, vals := range req.UserInfo.Extra {
+		extra[k] = authzv1.ExtraValue(vals)
+	}
+
+	sar := &authzv1.SubjectAccessReview{
+		Spec: authzv1.SubjectAccessReviewSpec{
+			User:   req.UserInfo.Username,
+			Groups: req.UserInfo.Groups,
+			UID:    req.UserInfo.UID,
+			Extra:  extra,
+			ResourceAttributes: &authzv1.ResourceAttributes{
+				Namespace: pp.Namespace,
+				Verb:      "create",
+				Group:     gvk.Group,
+				Resource:  plural,
+				Version:   gvk.Version,
+			},
+		},
+	}
+
+	// A check that cannot be made is a check that failed. Failing open here
+	// would reintroduce the escalation path this guard exists to close, and
+	// would do it silently.
+	if err := v.Client.Create(ctx, sar); err != nil {
+		return field.Forbidden(
+			field.NewPath("spec", "workloadTemplate"),
+			fmt.Sprintf("authorization check failed for %s: %v", gvk.Kind, err))
+	}
+
+	if !sar.Status.Allowed {
+		// A security control that denies silently is half a control. The
+		// admission response reaches the API audit log either way, but a line
+		// here is greppable without audit policy configured.
+		logf.FromContext(ctx).Info("Denied PodPool write: user not authorized for workload type",
+			"user", req.UserInfo.Username, "resource", plural, "group", gvk.Group,
+			"namespace", pp.Namespace, "reason", reason)
+
+		return field.Forbidden(
+			field.NewPath("spec", "workloadTemplate"),
+			reason+fmt.Sprintf("user %q is not authorized to create %s.%s in namespace %q",
+				req.UserInfo.Username, plural, gvk.Group, pp.Namespace))
+	}
+
+	return nil
 }
