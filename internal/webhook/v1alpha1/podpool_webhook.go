@@ -155,6 +155,39 @@ func validateOpportunistic(groupsPath *field.Path, groups []podpoolsv1alpha1.Gro
 	return allErrs
 }
 
+// validateOverflowSink rejects a pool with more than one unbounded group.
+//
+// Phase 4 of the distributor iterates groups in list order. The first unbounded
+// group absorbs the entire remainder; any later unbounded group receives zero
+// overflow at every scale and every replica count. Its min still works (phase 1),
+// but the unbounded characteristic is provably dead weight — the user asked for
+// an overflow sink that can never overflow into.
+//
+// Uses workload.IsBounded so the predicate agrees with the distributor (#71).
+func validateOverflowSink(groupsPath *field.Path, groups []podpoolsv1alpha1.GroupSpec) field.ErrorList {
+	var allErrs field.ErrorList
+
+	firstUnbounded := -1
+
+	for i, g := range groups {
+		if workload.IsBounded(g.Scaling) {
+			continue
+		}
+
+		if firstUnbounded >= 0 {
+			allErrs = append(allErrs, field.Invalid(
+				groupsPath.Index(i).Child("scaling"), g.Name,
+				fmt.Sprintf("at most one group may be unbounded (no max, target, or opportunistic); "+
+					"group %q at index %d is already the overflow sink — cap this group with max or target, or remove it",
+					groups[firstUnbounded].Name, firstUnbounded)))
+		} else {
+			firstUnbounded = i
+		}
+	}
+
+	return allErrs
+}
+
 func validatePodPoolSpec(pp *podpoolsv1alpha1.PodPool) field.ErrorList {
 	var allErrs field.ErrorList
 
@@ -192,6 +225,7 @@ func validatePodPoolSpec(pp *podpoolsv1alpha1.PodPool) field.ErrorList {
 		allErrs = append(allErrs, validateScaling(gp.Child("scaling"), &g.Scaling)...)
 	}
 
+	allErrs = append(allErrs, validateOverflowSink(groupsPath, pp.Spec.Groups)...)
 	allErrs = append(allErrs, validateOpportunistic(groupsPath, pp.Spec.Groups)...)
 
 	return allErrs

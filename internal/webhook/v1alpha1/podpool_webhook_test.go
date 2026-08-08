@@ -310,6 +310,25 @@ func TestValidatePodPoolSpec(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "two unbounded groups — second is a dead overflow sink",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					WorkloadTemplate: validWorkloadTemplate(),
+					Groups: []podpoolsv1alpha1.GroupSpec{
+						{
+							Name:    testGroupBase,
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)},
+						},
+						{
+							Name:    testGroupBurst,
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
 			name: "invalid scaling in group — min > max",
 			pool: podpoolsv1alpha1.PodPool{
 				Spec: podpoolsv1alpha1.PodPoolSpec{
@@ -892,5 +911,114 @@ func TestWarnOnFullyCappedPool(t *testing.T) {
 				t.Errorf("update warned = %v, want %v", got, tt.wantWarn)
 			}
 		})
+	}
+}
+
+// The overflow-sink rule: at most one group may be unbounded.
+//
+// Phase 4 of the distributor absorbs the entire remainder into the FIRST
+// unbounded group. A second unbounded group receives zero overflow at every
+// scale — its unbounded status is provably dead.
+func TestValidateOverflowSink(t *testing.T) {
+	t.Parallel()
+
+	unbounded := func(name string) podpoolsv1alpha1.GroupSpec {
+		return podpoolsv1alpha1.GroupSpec{
+			Name:    name,
+			Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)},
+		}
+	}
+	capped := func(name string) podpoolsv1alpha1.GroupSpec {
+		return podpoolsv1alpha1.GroupSpec{
+			Name:    name,
+			Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctStr(50)},
+		}
+	}
+	opp := podpoolsv1alpha1.GroupSpec{
+		Name:    testGroupScavenger,
+		Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Opportunistic: opportunisticPtr()},
+	}
+
+	tests := []struct {
+		name    string
+		groups  []podpoolsv1alpha1.GroupSpec
+		wantErr bool
+	}{
+		{
+			name:   "one unbounded group is fine",
+			groups: []podpoolsv1alpha1.GroupSpec{capped(testGroupBase), unbounded(testGroupBurst)},
+		},
+		{
+			name:    "two unbounded groups rejected",
+			groups:  []podpoolsv1alpha1.GroupSpec{unbounded(testGroupBase), unbounded(testGroupBurst)},
+			wantErr: true,
+		},
+		{
+			name:    "three unbounded groups — second and third rejected",
+			groups:  []podpoolsv1alpha1.GroupSpec{unbounded(testGroupBase), unbounded(testGroupBurst), unbounded(testGroupScavenger)},
+			wantErr: true,
+		},
+		{
+			name:   "unbounded + opportunistic is fine — opportunistic is bounded",
+			groups: []podpoolsv1alpha1.GroupSpec{capped(testGroupBase), opp, unbounded(testGroupBurst)},
+		},
+		{
+			name:   "all groups capped is fine — no overflow sink, but warnOnFullyCappedPool handles that",
+			groups: []podpoolsv1alpha1.GroupSpec{capped(testGroupBase), capped(testGroupBurst)},
+		},
+		{
+			name:   "single unbounded group alone",
+			groups: []podpoolsv1alpha1.GroupSpec{unbounded(testGroupBase)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			errs := validateOverflowSink(field.NewPath("spec", "groups"), tt.groups)
+			if got := len(errs) > 0; got != tt.wantErr {
+				t.Errorf("error = %v, want %v (%v)", got, tt.wantErr, errs)
+			}
+		})
+	}
+}
+
+// TestValidateOverflowSinkIntegration verifies the rule fires through
+// ValidateCreate and ValidateUpdate, not just as a unit.
+func TestValidateOverflowSinkIntegration(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	v := &PodPoolCustomValidator{}
+
+	twoUnbounded := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         10,
+			WorkloadTemplate: validWorkloadTemplate(),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)}},
+				{Name: testGroupBurst, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)}},
+			},
+		},
+	}
+
+	if _, err := v.ValidateCreate(ctx, twoUnbounded); err == nil {
+		t.Error("ValidateCreate should reject two unbounded groups")
+	}
+
+	valid := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         10,
+			WorkloadTemplate: validWorkloadTemplate(),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3), Target: pctStr(50)}},
+				{Name: testGroupBurst, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)}},
+			},
+		},
+	}
+
+	if _, err := v.ValidateUpdate(ctx, valid, twoUnbounded); err == nil {
+		t.Error("ValidateUpdate should reject two unbounded groups")
 	}
 }
