@@ -26,11 +26,13 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/utils/clock"
 
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -40,6 +42,7 @@ import (
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 	"github.com/negativecycle/podpool-controller/internal/controller"
 	webhookv1alpha1 "github.com/negativecycle/podpool-controller/internal/webhook/v1alpha1"
+	"github.com/negativecycle/podpool-controller/internal/workload"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -184,6 +187,23 @@ func main() {
 			// cache. This applies to every informer, including the ones
 			// ensureWatch creates at runtime for workload GVKs.
 			DefaultTransform: controller.TransformStripCacheWeight(),
+			// Cache only objects this controller manages. Every child carries
+			// the managed-by label, and the informers ensureWatch creates for
+			// workload GVKs inherit this selector, so unmanaged Deployments in
+			// the cluster never enter the cache at all.
+			DefaultLabelSelector: labels.SelectorFromSet(labels.Set{
+				workload.LabelManagedBy: workload.ManagerName,
+			}),
+			ByObject: map[client.Object]cache.ByObject{
+				// The PodPool itself carries no managed-by label -- users
+				// create pools -- so it must opt OUT of the default selector.
+				// The trap: an empty ByObject{} entry does not opt out. A nil
+				// Label cascades to DefaultLabelSelector, the cache then
+				// filters every PodPool away, and the controller goes silently
+				// deaf: no reconciles, no errors, nothing. Only a non-nil
+				// selector stops the cascade.
+				&podpoolsv1alpha1.PodPool{}: {Label: labels.Everything()},
+			},
 		},
 	})
 	if err != nil {
