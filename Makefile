@@ -1,7 +1,7 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
-YEAR ?= $(shell date +%Y)
+YEAR ?= 2026
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -142,6 +142,16 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
+
+.PHONY: verify-generate
+verify-generate: manifests generate ## Fail if generated output differs from what is committed.
+	go mod tidy
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "Generated output is out of date. Run 'make manifests generate' and commit:"; \
+		git status --porcelain; \
+		git diff; \
+		exit 1; \
+	fi
 
 ##@ Build
 

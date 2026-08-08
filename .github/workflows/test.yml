@@ -37,6 +37,4 @@ jobs:
             tools-${{ runner.os }}-
 
       - name: Running Tests
-        run: |
-          go mod tidy
-          make test
+        run: make test
