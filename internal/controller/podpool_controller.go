@@ -181,6 +181,8 @@ type PodPoolReconciler struct {
 // starts from a fresh read of the pool: the request carries only a name, and
 // the object may have changed, or vanished, since the event that queued it.
 func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reterr error) {
+	log := logf.FromContext(ctx)
+
 	var pool podpoolsv1alpha1.PodPool
 	if err := r.Get(ctx, req.NamespacedName, &pool); err != nil {
 		// NotFound is not an error: the pool was deleted between the event
@@ -279,6 +281,11 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	}
 
 	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups, r.capacityFrom(&pool, observed))
+	// The line an operator wants when the distribution is doing something they
+	// did not expect, and the line that must never be on by default: it fires
+	// on every pass of every pool, whether or not anything changed.
+	// --zap-log-level=4 turns it on at runtime.
+	log.V(4).Info("Computed group targets", "total", pool.Spec.Replicas, "targets", result.Targets)
 
 	now := r.Clock.Now()
 
