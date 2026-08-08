@@ -240,8 +240,21 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	if isPaused(&pool) {
 		setConditions(&pool, conditionInputs{paused: true})
 
+		if conditionTupleChanged(before.Status.Conditions, pool.Status.Conditions, ConditionReady) {
+			r.event(&pool, corev1.EventTypeNormal, "Paused", "PauseReconciliation",
+				"Reconciliation paused via %s annotation", workload.AnnotationPaused)
+		}
+
 		return ctrl.Result{}, nil
 	}
+
+	// Read from what etcd held at the start of the pass. The event itself is
+	// emitted only where conditions have actually been rewritten away from
+	// Paused, so a pass that exits without writing does not announce a resume
+	// it did not complete. Announcing it here instead re-fires on every retry
+	// for as long as nothing writes -- measured at five Resumed events across
+	// one 30-second sync-grace window while a CRD was missing.
+	wasPaused := readyReasonIs(before.Status.Conditions, ReasonPaused)
 
 	// Asked before any expensive work: a template that is not even
 	// addressable (no apiVersion or kind) cannot be rendered for any group.
@@ -254,6 +267,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 			desired:     pool.Spec.Replicas,
 			poolInvalid: true,
 		})
+
+		r.announceResume(&pool, before, wasPaused)
 
 		if conditionTupleChanged(before.Status.Conditions, pool.Status.Conditions, ConditionGroupsReady) {
 			r.event(&pool, corev1.EventTypeWarning, ReasonWorkloadTemplateInvalid, "ParseWorkloadTemplate",
@@ -274,7 +289,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	// Registered before any child is written, so the first child of a kind is
 	// born observed: a child changing is the event a pool most needs to hear,
 	// and the pool watch alone cannot deliver it.
-	if res, handled, err := r.setUpWatch(ctx, &pool, gvk); handled {
+	if res, handled, err := r.setUpWatch(ctx, &pool, gvk, before, wasPaused); handled {
 		return res, err
 	}
 
@@ -425,6 +440,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		stalledGroups:  stalledGroups,
 		notOwnedGroups: notOwnedGroups,
 	})
+
+	r.announceResume(&pool, before, wasPaused)
 
 	// Per group, not per pool. `before` is the deep copy from the top of
 	// Reconcile; pool.Status.Groups already holds this pass's reasons and would
@@ -1104,6 +1121,27 @@ type pendingEvent struct {
 // Passing this pass's own status compares each reason against itself, silences
 // every group event, and does so in a way no "emits exactly one" test would
 // catch, because zero also satisfies "not more than one".
+// announceResume emits the Resumed event once conditions have moved off
+// Paused. What makes it edge-triggered is where it is called: only at exits
+// that have just rewritten conditions, never at the top of the pass, so a pass
+// that exits without writing cannot announce a resume it did not complete.
+// The tuple check is defensive -- every current call site sits after a write
+// that moves Ready off Paused, so wasPaused alone would do today -- but it
+// keeps the helper safe for an exit added later that calls it before writing.
+func (r *PodPoolReconciler) announceResume(pool, before *podpoolsv1alpha1.PodPool, wasPaused bool) {
+	if wasPaused && conditionTupleChanged(before.Status.Conditions, pool.Status.Conditions, ConditionReady) {
+		r.event(pool, corev1.EventTypeNormal, "Resumed", "ResumeReconciliation",
+			"Reconciliation resumed")
+	}
+}
+
+// readyReasonIs reports whether the Ready condition carries the given reason.
+func readyReasonIs(conds []metav1.Condition, reason string) bool {
+	c := meta.FindStatusCondition(conds, ConditionReady)
+
+	return c != nil && c.Reason == reason
+}
+
 // isPaused reports whether the pause annotation asks for a pause.
 //
 // The value is honoured, not merely its presence. Presence-only meant
@@ -1253,6 +1291,7 @@ func (r *PodPoolReconciler) reportOutOfRange(
 // should do about it.
 func (r *PodPoolReconciler) setUpWatch(
 	ctx context.Context, pool *podpoolsv1alpha1.PodPool, gvk schema.GroupVersionKind,
+	before *podpoolsv1alpha1.PodPool, wasPaused bool,
 ) (ctrl.Result, bool, error) {
 	err := r.ensureWatch(ctx, gvk)
 	if err == nil {
@@ -1271,9 +1310,11 @@ func (r *PodPoolReconciler) setUpWatch(
 
 	// Without this the pool keeps reporting whatever the last pass wrote,
 	// which for a pool that was healthy until its CRD was uninstalled is
-	// Ready. Nothing in the object mentions the watch, and the only other
-	// signal is deduped to one line per GVK per process.
+	// Ready, and for a pool that has just been unpaused is Paused. Nothing in
+	// the object mentions the watch, and the only other signal is deduped to
+	// one per GVK per process.
 	setConditions(pool, conditionInputs{watchFailed: true})
+	r.announceResume(pool, before, wasPaused)
 	r.handleWatchFailure(pool, gvk, err)
 
 	return ctrl.Result{}, true, fmt.Errorf("setting up watch for %s: %w", gvk, err)
