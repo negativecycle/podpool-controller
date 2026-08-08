@@ -792,3 +792,105 @@ func TestGroupRemovalWarning(t *testing.T) {
 // Phase 4 of the distributor absorbs the entire remainder into the FIRST
 // unbounded group. A second unbounded group receives zero overflow at every
 // scale — its unbounded status is provably dead.
+
+// TestWarnOnFullyCappedPool covers the advisory warning when every group is capped.
+//
+// Of the three legal scaling shapes only (min) alone is unbounded, so a pool
+// where every group carries a max or a target cannot absorb overflow and may
+// leave replicas unplaced. That is legitimate, so it warns rather than
+// rejecting — and the rejection half is asserted here too, because a warning
+// that quietly became an error would break running pools.
+func TestWarnOnFullyCappedPool(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		groups   []podpoolsv1alpha1.GroupSpec
+		wantWarn bool
+	}{
+		{
+			name: "every group capped by target",
+			groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctStr(20)}},
+				{Name: testGroupBurst, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctStr(50)}},
+			},
+			wantWarn: true,
+		},
+		{
+			name: "mixed max and target, still no overflow bucket",
+			groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Max: ptr.To[int32](5), Target: pctStr(30)}},
+				{Name: testGroupBurst, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctStr(50)}},
+			},
+			wantWarn: true,
+		},
+		{
+			name: "a (min)-only group absorbs overflow",
+			groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)}},
+				{Name: testGroupBurst, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctStr(50)}},
+			},
+			wantWarn: false,
+		},
+		{
+			name: "an opportunistic group is not an overflow bucket",
+			groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Opportunistic: ptr.To(true)}},
+				{Name: testGroupBurst, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctStr(50)}},
+			},
+			wantWarn: true,
+		},
+		{
+			// Order must not matter: the bucket is wherever it appears.
+			name: "the uncapped group is last",
+			groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctStr(50)}},
+				{Name: testGroupBurst, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)}},
+			},
+			wantWarn: false,
+		},
+	}
+
+	v := &PodPoolCustomValidator{}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			pool := &podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					Replicas:         10,
+					WorkloadTemplate: validWorkloadTemplate(),
+					Groups:           tt.groups,
+				},
+			}
+
+			warnings, err := v.ValidateCreate(t.Context(), pool)
+			if err != nil {
+				t.Fatalf("a fully-capped pool must be admitted, not rejected: %v", err)
+			}
+
+			if got := len(warnings) > 0; got != tt.wantWarn {
+				t.Errorf("warned = %v, want %v (warnings=%v)", got, tt.wantWarn, warnings)
+			}
+
+			// Updates warn on the same terms, or an existing pool edited into
+			// this shape would say nothing.
+			//
+			// The old pool has to differ: #66 returns early when the spec did
+			// not move, so passing the same object twice would assert nothing
+			// about the warning. Scaling the pool is the smallest real edit.
+			edited := pool.DeepCopy()
+			edited.Spec.Replicas = pool.Spec.Replicas + 1
+
+			warnings, err = v.ValidateUpdate(t.Context(), pool, edited)
+			if err != nil {
+				t.Fatalf("update rejected: %v", err)
+			}
+
+			if got := len(warnings) > 0; got != tt.wantWarn {
+				t.Errorf("update warned = %v, want %v", got, tt.wantWarn)
+			}
+		})
+	}
+}

@@ -251,6 +251,39 @@ func validateScaling(fp *field.Path, s *podpoolsv1alpha1.ScalingConstraints) fie
 	return allErrs
 }
 
+// warnOnFullyCappedPool returns a warning when no group can absorb overflow.
+//
+// Of the three legal scaling shapes only (min) alone is unbounded, so a pool
+// where every group carries a max or a target has a hard ceiling on what it
+// can place. Whenever that ceiling falls below spec.replicas the difference is
+// left unplaced and reported in status.unplacedReplicas. Deliberate, but
+// surprising if you have not met it before.
+//
+// A warning rather than a rejection: the configuration is legitimate, and
+// rejecting it would break pools that are already running.
+//
+// Shares workload.IsBounded with the distributor, so a group whose target is
+// present but unreadable counts as capped here too. It is: the distributor
+// binds it at zero. The presence check this replaced said otherwise and left
+// the warning silent about a pool that would run below spec.replicas (#71).
+func warnOnFullyCappedPool(pp *podpoolsv1alpha1.PodPool) admission.Warnings {
+	for _, g := range pp.Spec.Groups {
+		if !workload.IsBounded(g.Scaling) {
+			return nil
+		}
+	}
+
+	if len(pp.Spec.Groups) == 0 {
+		return nil
+	}
+
+	return admission.Warnings{
+		"every group sets max or target, so no group can absorb overflow: " +
+			"replicas beyond the combined ceiling will be left unplaced and reported " +
+			"in status.unplacedReplicas. Remove target from one group to make it the overflow bucket.",
+	}
+}
+
 func warnOnGroupRemoval(oldPP, newPP *podpoolsv1alpha1.PodPool) admission.Warnings {
 	newNames := make(map[string]bool)
 	for _, g := range newPP.Spec.Groups {
@@ -311,7 +344,7 @@ func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoo
 		return nil, allErrs.ToAggregate()
 	}
 
-	return nil, nil
+	return warnOnFullyCappedPool(obj), nil
 }
 
 func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *podpoolsv1alpha1.PodPool, newObj *podpoolsv1alpha1.PodPool) (admission.Warnings, error) {
@@ -342,6 +375,7 @@ func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *pod
 	}
 
 	warnings := warnOnGroupRemoval(oldObj, newObj)
+	warnings = append(warnings, warnOnFullyCappedPool(newObj)...)
 	warnings = append(warnings, warnPoolNameUpdate(newObj)...)
 
 	return warnings, nil
