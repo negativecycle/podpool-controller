@@ -6,6 +6,7 @@ resources:
 # subjects if changing service account names.
 - service_account.yaml
 - role.yaml
+- aggregate_manager_role.yaml
 - role_binding.yaml
 - leader_election_role.yaml
 - leader_election_role_binding.yaml
@@ -26,3 +27,18 @@ resources:
 - podpool_editor_role.yaml
 - podpool_viewer_role.yaml
 
+# Label the generated manager-role for aggregation so the API server
+# merges its rules into aggregate-manager-role automatically.
+# Users can create additional ClusterRoles with the same label to
+# grant access to non-default workload types (e.g. Argo Rollouts).
+patches:
+- target:
+    kind: ClusterRole
+    name: manager-role
+  patch: |-
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: manager-role
+      labels:
+        podpools.dev/aggregate-to-manager: "true"

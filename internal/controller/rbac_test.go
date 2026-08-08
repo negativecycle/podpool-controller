@@ -238,6 +238,39 @@ func TestManagerRoleGrantsOnlyWhatTheProjectUses(t *testing.T) {
 	}
 }
 
+// TestHumanRolesCanScaleAPodPool covers the half the review missed. RBAC treats
+// a subresource as a distinct resource, so `resources: [podpools]` does not
+// match `podpools/scale` — and kubectl scale issues GET then PUT against the
+// /scale endpoint.
+func TestHumanRolesCanScaleAPodPool(t *testing.T) {
+	for _, file := range []string{"podpool_admin_role.yaml", "podpool_editor_role.yaml"} {
+		t.Run(file, func(t *testing.T) {
+			rules := flattenRules(loadClusterRole(t, file))
+
+			verbs, present := rules[rbacGroupPodpools+"/"+rbacResPodpools+"/"+rbacSubScale]
+			if !present {
+				t.Fatalf("no podpools/scale rule: kubectl scale podpool/x is forbidden for this role")
+			}
+
+			for _, need := range []string{verbGet, verbUpdate} {
+				if !slices.Contains(verbs, need) {
+					t.Errorf("podpools/scale lacks %q; kubectl scale needs get then update", need)
+				}
+			}
+		})
+	}
+}
+
+// TestViewerRoleCannotScale is the counterweight to the test above: /scale
+// carries update, so adding it to the viewer role by symmetry would hand a
+// read-only principal a write verb.
+func TestViewerRoleCannotScale(t *testing.T) {
+	rules := flattenRules(loadClusterRole(t, "podpool_viewer_role.yaml"))
+	if verbs, present := rules[rbacGroupPodpools+"/"+rbacResPodpools+"/"+rbacSubScale]; present {
+		t.Errorf("viewer role grants podpools/scale %v; a read-only role must not", verbs)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // sufficiency and excess, against a real authorizer
 // ---------------------------------------------------------------------------

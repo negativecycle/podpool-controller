@@ -1,7 +1,13 @@
 resources:
 - issuer.yaml
 - certificate-webhook.yaml
-- certificate-metrics.yaml
+# [METRICS-WITH-CERTS] Intentionally not applied. The bundled ServiceMonitor
+# scrapes with insecureSkipVerify: true, so nothing consumes this certificate —
+# applying it only issued a cert for the unsubstituted placeholder hostname
+# SERVICE_NAME.SERVICE_NAMESPACE.svc. To enable metrics TLS, re-add it here and
+# uncomment the [METRICS-WITH-CERTS] blocks in config/default/kustomization.yaml
+# and config/prometheus/kustomization.yaml. See SECURITY.md, "Known limitations".
+#- certificate-metrics.yaml
 
 configurations:
 - kustomizeconfig.yaml
