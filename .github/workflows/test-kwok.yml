@@ -1,0 +1,57 @@
+name: KWOK Integration Tests
+
+on:
+  pull_request:
+
+# A force-push supersedes the run it interrupted; without this the obsolete
+# one keeps a runner busy to no purpose.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  KWOK_VERSION: v0.8.0
+
+jobs:
+  test-kwok:
+    permissions:
+      contents: read
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      # ~443 MB of kube-apiserver, etcd, kube-scheduler and
+      # kube-controller-manager binaries. Warm, cluster creation is ~1.3s.
+      - name: Cache kwok binaries
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.kwok
+          key: kwok-${{ runner.os }}-${{ env.KWOK_VERSION }}-${{ hashFiles('go.mod') }}
+          restore-keys: |
+            kwok-${{ runner.os }}-${{ env.KWOK_VERSION }}-
+
+      - name: Install kwokctl
+        run: |
+          curl -fsSLo kwokctl "https://github.com/kubernetes-sigs/kwok/releases/download/${KWOK_VERSION}/kwokctl-linux-$(go env GOARCH)"
+          chmod +x kwokctl
+          sudo mv kwokctl /usr/local/bin/kwokctl
+          kwokctl --version
+
+      - name: Run KWOK integration tests
+        run: make test-kwok
+
+      # Dead on an ephemeral runner; correct on a self-hosted one.
+      - name: Tear down the KWOK cluster
+        if: always()
+        run: make cleanup-kwok

@@ -115,11 +115,11 @@ setup-kwok: manifests kustomize ## Create a KWOK cluster and install CRDs for in
 			else \
 				echo "KWOK cluster '$(KWOK_CLUSTER)' exists but is not reachable. Recreating..."; \
 				kwokctl delete cluster --name $(KWOK_CLUSTER) 2>/dev/null || true; \
-				kwokctl create cluster --name $(KWOK_CLUSTER) --kube-version=v$(ENVTEST_K8S_VERSION).0; \
+				KWOK_KUBE_VERSION=v$(ENVTEST_K8S_VERSION).0 kwokctl create cluster --name $(KWOK_CLUSTER); \
 			fi ;; \
 		*) \
 			echo "Creating KWOK cluster '$(KWOK_CLUSTER)'..."; \
-			kwokctl create cluster --name $(KWOK_CLUSTER) --kube-version=v$(ENVTEST_K8S_VERSION).0 ;; \
+			KWOK_KUBE_VERSION=v$(ENVTEST_K8S_VERSION).0 kwokctl create cluster --name $(KWOK_CLUSTER) ;; \
 	esac
 	"$(KUSTOMIZE)" build config/crd | $(KUBECTL) --context kwok-$(KWOK_CLUSTER) apply -f -
 
