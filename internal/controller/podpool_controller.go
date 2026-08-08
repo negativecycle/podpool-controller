@@ -238,22 +238,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	pool.Status.Selector = labels.Set{workload.LabelPool: pool.Name}.String()
 
 	if isPaused(&pool) {
-		pool.Status.ObservedGeneration = pool.Generation
-
-		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
-			Type:               ConditionProgressing,
-			Status:             metav1.ConditionFalse,
-			Reason:             ReasonPaused,
-			Message:            "Reconciliation paused",
-			ObservedGeneration: pool.Generation,
-		})
-		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
-			Type:               ConditionReady,
-			Status:             metav1.ConditionFalse,
-			Reason:             ReasonPaused,
-			Message:            "Reconciliation paused",
-			ObservedGeneration: pool.Generation,
-		})
+		setConditions(&pool, conditionInputs{paused: true})
 
 		return ctrl.Result{}, nil
 	}

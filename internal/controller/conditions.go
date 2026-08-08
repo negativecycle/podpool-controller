@@ -89,6 +89,11 @@ type conditionInputs struct {
 	// without inventing a group name.
 	poolInvalid bool
 
+	// paused short-circuits Available/TargetDegraded/GroupsReady entirely,
+	// leaving them at whatever they last reported, and forces Progressing and
+	// Ready to False/Paused.
+	paused bool
+
 	// watchFailed means the pool's spec parsed but no informer could be
 	// established for the workload GVK, so nothing below that point ran. It
 	// exists so the watch-failure exit leaves an honest Ready condition rather
@@ -153,6 +158,20 @@ func setConditions(pool *podpoolsv1alpha1.PodPool, in conditionInputs) {
 	}
 
 	pool.Status.ObservedGeneration = gen
+
+	if in.paused {
+		for _, t := range []string{ConditionProgressing, ConditionReady} {
+			meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+				Type:               t,
+				Status:             metav1.ConditionFalse,
+				Reason:             ReasonPaused,
+				Message:            "Reconciliation paused",
+				ObservedGeneration: gen,
+			})
+		}
+
+		return
+	}
 
 	available := metav1.Condition{
 		Type:               ConditionAvailable,
