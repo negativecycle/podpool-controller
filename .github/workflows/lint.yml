@@ -44,3 +44,7 @@ jobs:
         run: make lint-api
       - name: Verify generated output
         run: make verify-generate
+      - name: Lint workflow YAML (actionlint)
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          actionlint
