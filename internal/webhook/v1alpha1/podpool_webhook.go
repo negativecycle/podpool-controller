@@ -361,6 +361,74 @@ func warnOnUnreadableTarget(pp *podpoolsv1alpha1.PodPool) admission.Warnings {
 	return warnings
 }
 
+type renderedChildResult struct {
+	globalErrs field.ErrorList
+	groupErrs  map[string]field.ErrorList
+}
+
+func (r renderedChildResult) allErrors() field.ErrorList {
+	all := append(field.ErrorList{}, r.globalErrs...)
+	for _, errs := range r.groupErrs {
+		all = append(all, errs...)
+	}
+
+	return all
+}
+
+func validateRenderedChildren(pp *podpoolsv1alpha1.PodPool) renderedChildResult {
+	result := renderedChildResult{groupErrs: make(map[string]field.ErrorList)}
+
+	gvk, err := workload.ExtractGVK(pp.Spec.WorkloadTemplate.Raw)
+	if err != nil {
+		return result
+	}
+
+	if gvk.Group == podpoolsv1alpha1.SchemeGroupVersion.Group && gvk.Kind == workload.KindPodPool {
+		result.globalErrs = append(result.globalErrs, field.Forbidden(
+			field.NewPath("spec", "workloadTemplate"),
+			"a PodPool cannot use another PodPool as its workload template"))
+
+		return result
+	}
+
+	// Unreachable for malformed JSON: ExtractGVK unmarshals the same bytes above.
+	tmpl, parseErr := workload.ParseTemplate(pp.Spec.WorkloadTemplate.Raw)
+	if parseErr != nil {
+		return result
+	}
+
+	dist := workload.ComputeGroupTargets(pp.Spec.Replicas, pp.Spec.Groups, nil)
+	groupsPath := field.NewPath("spec", "groups")
+
+	for i, g := range pp.Spec.Groups {
+		gp := groupsPath.Index(i)
+
+		var groupErrs field.ErrorList
+
+		replicas := int32(0)
+		if i < len(dist.Targets) {
+			replicas = dist.Targets[i]
+		}
+
+		_, renderErr := workload.BuildChildWorkload(tmpl, g, pp, replicas)
+		if renderErr != nil {
+			groupErrs = append(groupErrs, field.Invalid(gp, g.Name,
+				fmt.Sprintf("cannot render child workload: %v", renderErr)))
+			if len(groupErrs) > 0 {
+				result.groupErrs[g.Name] = groupErrs
+			}
+
+			continue
+		}
+
+		if len(groupErrs) > 0 {
+			result.groupErrs[g.Name] = groupErrs
+		}
+	}
+
+	return result
+}
+
 func warnOnGroupRemoval(oldPP, newPP *podpoolsv1alpha1.PodPool) admission.Warnings {
 	newNames := make(map[string]bool)
 	for _, g := range newPP.Spec.Groups {
@@ -416,6 +484,8 @@ func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoo
 	if nameErr := validatePoolNameCreate(obj); nameErr != nil {
 		allErrs = append(allErrs, nameErr)
 	}
+
+	allErrs = append(allErrs, validateRenderedChildren(obj).allErrors()...)
 
 	if len(allErrs) > 0 {
 		return nil, allErrs.ToAggregate()

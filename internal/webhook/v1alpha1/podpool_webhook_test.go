@@ -1013,3 +1013,49 @@ func TestValidateOverflowSinkIntegration(t *testing.T) {
 		t.Error("ValidateUpdate should reject two unbounded groups")
 	}
 }
+
+func templateJSON(obj map[string]any) runtime.RawExtension {
+	raw, _ := json.Marshal(obj)
+
+	return runtime.RawExtension{Raw: raw}
+}
+
+func TestPodPoolAsTemplate(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	v := &PodPoolCustomValidator{}
+
+	tmpl := map[string]any{
+		fieldAPIVersion: "podpools.dev/v1alpha1",
+		fieldKind:       "PodPool",
+		fieldSpec: map[string]any{
+			fieldTemplate: map[string]any{
+				fieldSpec: map[string]any{
+					fieldContainers: []any{
+						map[string]any{fieldName: fieldApp, fieldImage: imageNginx},
+					},
+				},
+			},
+		},
+	}
+
+	pool := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         3,
+			WorkloadTemplate: templateJSON(tmpl),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)}},
+			},
+		},
+	}
+
+	_, err := v.ValidateCreate(ctx, pool)
+	if err == nil {
+		t.Error("expected rejection for PodPool-as-template")
+	}
+
+	if !strings.Contains(err.Error(), "PodPool") {
+		t.Errorf("rejection should mention PodPool: %v", err)
+	}
+}
