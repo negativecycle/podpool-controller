@@ -3,13 +3,10 @@ package controller
 import (
 	"context"
 	errs "errors"
-	"fmt"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
@@ -64,43 +61,6 @@ func scavengerFirstPool() *podpoolsv1alpha1.PodPool {
 	}
 
 	return pool
-}
-
-// ownedChild is a child Deployment this pool controls, with its counts already
-// published.
-//
-// Status is set on the object directly: the fake client registers a status
-// subresource for PodPool only, so a Deployment's status round-trips through
-// WithObjects intact.
-func ownedChild(pool *podpoolsv1alpha1.PodPool, group string, replicas, ready int32) *appsv1.Deployment {
-	labels := map[string]string{workload.LabelPool: pool.Name, workload.LabelGroup: group}
-
-	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-%s", pool.Name, group),
-			Namespace: pool.Namespace,
-			Labels:    labels,
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: podpoolsv1alpha1.GroupVersion.String(),
-				Kind:       workload.KindPodPool,
-				Name:       pool.Name,
-				UID:        pool.UID,
-				Controller: ptr.To(true),
-			}},
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To(replicas),
-			Selector: &metav1.LabelSelector{MatchLabels: labels},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
-				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: testContainer, Image: testImageNginx}}},
-			},
-		},
-		Status: appsv1.DeploymentStatus{
-			Replicas:      replicas,
-			ReadyReplicas: ready,
-		},
-	}
 }
 
 func childReplicas(t *testing.T, c client.Reader, pool *podpoolsv1alpha1.PodPool, group string) int32 {

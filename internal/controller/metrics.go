@@ -1,7 +1,10 @@
 package controller
 
 import (
+	"strings"
+
 	"github.com/prometheus/client_golang/prometheus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
@@ -15,6 +18,8 @@ const (
 	labelNamespace = "namespace"
 	labelName      = "name"
 	labelGroup     = "group"
+	labelType      = "type"
+	labelStatus    = "status"
 )
 
 // Cardinality is the whole design constraint. Every series is keyed by
@@ -26,6 +31,7 @@ const (
 var (
 	poolLabels  = []string{labelNamespace, labelName}
 	groupLabels = []string{labelNamespace, labelName, labelGroup}
+	condLabels  = []string{labelNamespace, labelName, labelType, labelStatus}
 
 	specReplicas = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "podpool_spec_replicas",
@@ -66,6 +72,11 @@ var (
 		Name: "podpool_unplaced_replicas",
 		Help: "Replicas no group could accept without exceeding a max or target ceiling.",
 	}, poolLabels)
+
+	statusCondition = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "podpool_status_condition",
+		Help: "Current status of a PodPool condition. 1 for the active status, 0 for the others. One series per (type, status) pair; all three statuses are written every pass to prevent stale series.",
+	}, condLabels)
 )
 
 // Registering with controller-runtime's registry rather than a new one puts
@@ -81,8 +92,14 @@ func init() {
 		groupSharePercent,
 		groupLastProgress,
 		unplacedReplicas,
+		statusCondition,
 	)
 }
+
+// conditionStatuses is the closed set metav1.ConditionStatus can take, lowered
+// for use as a label value. Every one of them is written on every pass; see
+// recordConditionMetrics.
+var conditionStatuses = []string{"true", "false", "unknown"}
 
 // groupMetric is one group's row, projected out of its GroupStatus. The gauges
 // take primitives rather than the API type so that recording can be tested
@@ -95,7 +112,12 @@ type groupMetric struct {
 	lastProgressTime float64 // unix seconds; 0 means at target
 }
 
-func recordPoolMetrics(namespace, name string, spec, replicas, ready, unplaced int32, groups []groupMetric) {
+func recordPoolMetrics(
+	namespace, name string,
+	spec, replicas, ready, unplaced int32,
+	groups []groupMetric,
+	conditions []metav1.Condition,
+) {
 	specReplicas.WithLabelValues(namespace, name).Set(float64(spec))
 	statusReplicas.WithLabelValues(namespace, name).Set(float64(replicas))
 	statusReadyReplicas.WithLabelValues(namespace, name).Set(float64(ready))
@@ -113,6 +135,37 @@ func recordPoolMetrics(namespace, name string, spec, replicas, ready, unplaced i
 			groupLastProgress.WithLabelValues(namespace, name, g.name).Set(g.lastProgressTime)
 		} else {
 			groupLastProgress.DeleteLabelValues(namespace, name, g.name)
+		}
+	}
+
+	recordConditionMetrics(namespace, name, conditions)
+}
+
+// recordConditionMetrics exports the conditions as a gauge per (type, status)
+// pair, 1 for the status the condition currently holds and 0 for the others.
+//
+// A condition is already a time series; the only question is who turns it into
+// one. Leaving it in status means every consumer that wants "unavailable for
+// ten minutes" writes a kube-state-metrics CustomResourceStateMetrics config
+// against this CRD's status shape, which is a copy of our schema in someone
+// else's repository, kept up to date by nobody.
+//
+// Writing all three statuses rather than only the current one is the part that
+// is easy to get wrong. Write only the active one and a True->False flip leaves
+// the True series reading 1 for the lifetime of the process, so the obvious
+// alerting expression `podpool_status_condition == 1` matches two contradictory
+// series and fires on the stale one.
+func recordConditionMetrics(namespace, name string, conditions []metav1.Condition) {
+	for _, c := range conditions {
+		current := strings.ToLower(string(c.Status))
+
+		for _, s := range conditionStatuses {
+			v := float64(0)
+			if s == current {
+				v = 1
+			}
+
+			statusCondition.WithLabelValues(namespace, name, c.Type, s).Set(v)
 		}
 	}
 }
@@ -136,6 +189,11 @@ func deletePoolMetrics(namespace, name string) {
 	groupReadyReplicas.DeletePartialMatch(poolMatch)
 	groupSharePercent.DeletePartialMatch(poolMatch)
 	groupLastProgress.DeletePartialMatch(poolMatch)
+
+	// Two extra labels, so it needs the partial match too, for the same reason
+	// the group gauges do: nothing here knows which condition types the pool
+	// was carrying when it went away.
+	statusCondition.DeletePartialMatch(poolMatch)
 }
 
 // deleteStaleGroupMetrics retires the series of groups that have left the spec.

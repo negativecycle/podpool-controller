@@ -5,6 +5,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // The gauges under test are package-level and shared with the manager running
@@ -22,6 +23,23 @@ func poolGaugesUnderTest() []*prometheus.GaugeVec {
 
 func groupGaugesUnderTest() []*prometheus.GaugeVec {
 	return []*prometheus.GaugeVec{groupReplicas, groupReadyReplicas, groupSharePercent, groupLastProgress}
+}
+
+// A third hand-maintained list, because the condition gauge is neither a pool
+// gauge nor a group one. Three copies of the same knowledge now: registration,
+// deletePoolMetrics, and here.
+func condGaugesUnderTest() []*prometheus.GaugeVec {
+	return []*prometheus.GaugeVec{statusCondition}
+}
+
+func testConditions() []metav1.Condition {
+	return []metav1.Condition{
+		{Type: ConditionAvailable, Status: metav1.ConditionTrue, Reason: ReasonMinimumReplicasAvailable},
+		{Type: ConditionProgressing, Status: metav1.ConditionFalse, Reason: ReasonAllReplicasReady},
+		{Type: ConditionTargetDegraded, Status: metav1.ConditionFalse, Reason: ReasonTargetsSatisfied},
+		{Type: ConditionGroupsReady, Status: metav1.ConditionTrue, Reason: ReasonAllGroupsReconciled},
+		{Type: ConditionReady, Status: metav1.ConditionTrue, Reason: ReasonPoolReady},
+	}
 }
 
 // seriesFor counts the series in c carrying the given namespace and name
@@ -66,7 +84,7 @@ func TestDeletePoolMetricsRemovesAllPoolSeries(t *testing.T) {
 
 	recordPoolMetrics(ns, name, 5, 5, 4, 0, []groupMetric{
 		{name: testGroupBase, replicas: 3, ready: 3, sharePercent: 60, lastProgressTime: 1000},
-	})
+	}, testConditions())
 
 	for _, g := range poolGaugesUnderTest() {
 		if got := seriesFor(g, ns, name); got == 0 {
@@ -82,9 +100,9 @@ func TestDeletePoolMetricsRemovesAllPoolSeries(t *testing.T) {
 		}
 	}
 
-	for _, g := range groupGaugesUnderTest() {
+	for _, g := range append(groupGaugesUnderTest(), condGaugesUnderTest()...) {
 		if got := seriesFor(g, ns, name); got != 0 {
-			t.Errorf("group gauge: expected 0 series after delete, got %d", got)
+			t.Errorf("group/condition gauge: expected 0 series after delete, got %d", got)
 		}
 	}
 }
@@ -99,7 +117,7 @@ func TestDeleteStaleGroupMetrics(t *testing.T) {
 		{name: testGroupBase, replicas: 3, ready: 3, sharePercent: 50, lastProgressTime: 1000},
 		{name: "removed", replicas: 2, ready: 2, sharePercent: 50, lastProgressTime: 1000},
 	}
-	recordPoolMetrics(ns, name, 5, 5, 5, 0, groups)
+	recordPoolMetrics(ns, name, 5, 5, 5, 0, groups, testConditions())
 
 	for _, g := range groupGaugesUnderTest() {
 		if got := seriesFor(g, ns, name); got != 2 {
@@ -129,7 +147,7 @@ func TestDeletePoolMetricsRemovesAllGroupSeries(t *testing.T) {
 		{name: testGroupScav, replicas: 3, ready: 2, sharePercent: 30, lastProgressTime: 1000},
 		{name: testGroupSpot, replicas: 4, ready: 4, sharePercent: 40, lastProgressTime: 1000},
 	}
-	recordPoolMetrics(ns, name, 10, 10, 9, 0, groups)
+	recordPoolMetrics(ns, name, 10, 10, 9, 0, groups, testConditions())
 
 	for _, g := range groupGaugesUnderTest() {
 		if got := seriesFor(g, ns, name); got != len(groups) {
@@ -177,7 +195,8 @@ func TestReconcilePublishesAndRetiresPoolSeries(t *testing.T) {
 	// later event will ever mention this name again.
 	reconcilePool(t, r, pool)
 
-	for _, g := range append(poolGaugesUnderTest(), groupGaugesUnderTest()...) {
+	all := append(poolGaugesUnderTest(), groupGaugesUnderTest()...)
+	for _, g := range append(all, condGaugesUnderTest()...) {
 		if got := seriesFor(g, pool.Namespace, pool.Name); got != 0 {
 			t.Errorf("after the NotFound pass: got %d series, want 0 — a deleted pool's gauges alert forever", got)
 		}
@@ -226,7 +245,7 @@ func TestLastProgressSeriesIsDeletedAtTarget(t *testing.T) {
 
 	recordPoolMetrics(ns, name, 3, 3, 3, 0, []groupMetric{
 		{name: testGroupBase, replicas: 3, ready: 1, sharePercent: 100, lastProgressTime: 1000},
-	})
+	}, testConditions())
 
 	if got := seriesFor(groupLastProgress, ns, name); got != 1 {
 		t.Fatalf("expected 1 last-progress series while short of target, got %d", got)
@@ -234,7 +253,7 @@ func TestLastProgressSeriesIsDeletedAtTarget(t *testing.T) {
 
 	recordPoolMetrics(ns, name, 3, 3, 3, 0, []groupMetric{
 		{name: testGroupBase, replicas: 3, ready: 3, sharePercent: 100, lastProgressTime: 0},
-	})
+	}, testConditions())
 
 	if got := seriesFor(groupLastProgress, ns, name); got != 0 {
 		t.Errorf("expected the last-progress series to be removed at target, got %d", got)

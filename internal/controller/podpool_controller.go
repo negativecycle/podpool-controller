@@ -395,7 +395,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	recordPoolMetrics(pool.Namespace, pool.Name,
 		pool.Spec.Replicas,
 		pool.Status.Replicas, pool.Status.ReadyReplicas, pool.Status.UnplacedReplicas,
-		metricGroups)
+		metricGroups, pool.Status.Conditions)
 
 	if err := kerrors.NewAggregate(errs); err != nil {
 		return ctrl.Result{}, err
