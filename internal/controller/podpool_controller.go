@@ -408,8 +408,11 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		notOwnedGroups: notOwnedGroups,
 	})
 
-	if conditionTupleChanged(before.Status.Conditions, pool.Status.Conditions, ConditionGroupsReady) {
-		for _, pe := range pendingGroupEvents {
+	// Per group, not per pool. `before` is the deep copy from the top of
+	// Reconcile; pool.Status.Groups already holds this pass's reasons and would
+	// compare every group against itself.
+	for _, pe := range pendingGroupEvents {
+		if groupEventChanged(before.Status.Groups, pe.group, pe.reason) {
 			r.event(&pool, pe.eventType, pe.reason, pe.action, "%s", pe.note)
 		}
 	}
@@ -944,7 +947,43 @@ func staleWorkloadGVKs(prev []podpoolsv1alpha1.GroupStatus, current schema.Group
 }
 
 type pendingEvent struct {
+	// group names the group this event belongs to, so the flush can ask that
+	// group's own history whether the event is news. A plain string rather than
+	// a pointer into pool.Spec.Groups: the struct stays comparable and nothing
+	// retains a reference to a slice element the loop reuses.
+	group                           string
 	eventType, reason, action, note string
+}
+
+// groupEventChanged reports whether a group's failure class differs from what
+// it last published.
+//
+// Group events are gated per group rather than on the pool-level GroupsReady
+// tuple. That tuple summarises every group at once, so a group that changes
+// failure class while the summary stays put is silenced: a group already
+// failing retryably that starts hitting an ownership conflict keeps the same
+// status, the same reason and the same failing-group list, and the refusal to
+// touch another controller's object is never announced. Deriving a per-item
+// signal from an aggregate is the general shape of that bug.
+//
+// The comparison is against the reason already persisted in
+// status.groups[].reason, so nothing new has to be tracked and the gate
+// survives a manager restart. It must be the reason and not the message: the
+// per-group message is cleared on the failure path and the event note carries
+// raw error text, which varies between passes for one underlying condition.
+// Comparing either would reintroduce the spam the gate exists to prevent.
+//
+// The anti-spam property is preserved. An unchanging failure finds prev.Reason
+// equal to this pass's reason on every subsequent pass and emits once.
+//
+// prev must come from `before`, the deep copy taken at the top of Reconcile.
+// Passing this pass's own status compares each reason against itself, silences
+// every group event, and does so in a way no "emits exactly one" test would
+// catch, because zero also satisfies "not more than one".
+func groupEventChanged(before []podpoolsv1alpha1.GroupStatus, groupName, reason string) bool {
+	prev := findGroupStatus(before, groupName)
+
+	return prev == nil || prev.Reason != reason
 }
 
 // conditionTupleChanged reports whether the (status, reason, message) of a
@@ -952,12 +991,16 @@ type pendingEvent struct {
 // previous condition is treated as changed: the first-ever reconcile of a
 // broken pool emits.
 //
-// Gating events on this rather than diffing group names couples granularity to
-// message determinism: if a future change truncates messages to a column
-// budget, gating degrades toward fewer emissions and never toward spam. That
-// bias is deliberate. An event stream that occasionally misses a transition is
-// an inconvenience; one that repeats a warning every ten minutes for a week is
-// how people learn to ignore events entirely.
+// This governs the pool-level events, which for now is the bad-GVK warning:
+// the pool's own template being unreadable really is a property of the pool as
+// a whole. Group events used to be gated on it too and are not any more,
+// because one pool-level signal cannot answer a question about one group.
+//
+// Reading a whole tuple rather than diffing group names couples this to message
+// determinism: if messages are later truncated to a column budget, gating
+// degrades toward fewer emissions and never toward spam. That bias is
+// deliberate, and it is also why the group gate now reads only reasons, which
+// are compile-time constants and cannot be truncated at all.
 func conditionTupleChanged(prev []metav1.Condition, cur []metav1.Condition, condType string) bool {
 	p := meta.FindStatusCondition(prev, condType)
 
@@ -975,12 +1018,14 @@ func classifyGroupError(groupName string, err error) pendingEvent {
 	var notOwned *workloadNotOwnedError
 	if errors.As(err, &notOwned) {
 		return pendingEvent{
+			groupName,
 			corev1.EventTypeWarning, ReasonWorkloadNotOwned, actionReconcileGroup,
 			fmt.Sprintf("Refusing to manage group %s: %v", groupName, err),
 		}
 	}
 
 	return pendingEvent{
+		groupName,
 		corev1.EventTypeWarning, ReasonGroupReconcileFailed, actionReconcileGroup,
 		fmt.Sprintf("Failed to reconcile group %s: %v", groupName, err),
 	}

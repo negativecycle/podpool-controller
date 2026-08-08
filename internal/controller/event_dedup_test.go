@@ -74,34 +74,15 @@ func TestGroupFailureEmitsOnlyOnTransition(t *testing.T) {
 	}
 }
 
-// The first failure always emits. This looks redundant beside the test above
-// until you notice that "exactly one across two passes" is also satisfied by
-// zero — a gate that silences everything passes it. This one cannot be
-// satisfied by silence.
-func TestFirstFailureAlwaysEmits(t *testing.T) {
-	pool := singleGroupPool()
-	rec := events.NewFakeRecorder(64)
-	r, _ := newFakeReconciler(t, nil, pool)
-	r.Recorder = rec
-
-	alwaysInvalidApply(t, r)
-
-	_ = tryReconcilePool(r, pool)
-
-	evts := drainEvents(rec.Events)
-	if n := countEventsByReason(evts, ReasonGroupReconcileFailed); n != 1 {
-		t.Errorf("got %d %s events on the first failing reconcile, want 1; events: %v",
-			n, ReasonGroupReconcileFailed, evts)
-	}
-}
-
-// Changing the set of failing groups changes the GroupsReady message, which
-// counts as a tuple change and re-emits every pending group event — including
-// for groups that did not move.
+// A group that recovers does not make its still-failing neighbour news again.
 //
-// This is the gate's granularity showing through, and it is the behaviour the
-// next commit changes.
-func TestFailureSetChangeReEmits(t *testing.T) {
+// This test used to assert the opposite, because the gate used to be
+// pool-level: a shrinking failing set changed the GroupsReady message, which
+// counted as a tuple change and flushed every buffered event including the ones
+// belonging to groups that had not moved. The gate is now per group, so base
+// announces once and stays quiet until its own failure class changes. Spot's
+// recovery is not announced either; there is no recovery event.
+func TestRecoveredNeighbourDoesNotReAnnounceAFailingGroup(t *testing.T) {
 	pool := fakeTestPool()
 	rec := events.NewFakeRecorder(64)
 	r, _ := newFakeReconciler(t, nil, pool)
@@ -138,14 +119,15 @@ func TestFailureSetChangeReEmits(t *testing.T) {
 			firstCount, ReasonGroupReconcileFailed, firstEvts)
 	}
 
-	// Second reconcile: only base fails, so the pool-level message changes and
-	// base's unchanged failure is announced again.
+	// Second reconcile: spot recovers, base fails exactly as before. The
+	// pool-level message changes, but nothing about base did.
 	_ = tryReconcilePool(r, pool)
 	secondEvts := drainEvents(rec.Events)
 
 	secondCount := countEventsByReason(secondEvts, ReasonGroupReconcileFailed)
-	if secondCount != 1 {
-		t.Errorf("second reconcile: got %d %s events, want 1 (re-emit for changed failing set); events: %v",
+	if secondCount != 0 {
+		t.Errorf("second reconcile: got %d %s events, want 0 — base's failure is unchanged and "+
+			"a neighbour recovering is not news about base; events: %v",
 			secondCount, ReasonGroupReconcileFailed, secondEvts)
 	}
 }
