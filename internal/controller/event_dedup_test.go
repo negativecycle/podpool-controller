@@ -33,7 +33,7 @@ func (f *failingCache) GetInformer(_ context.Context, _ client.Object, _ ...cach
 
 // alwaysInvalidApply makes every child apply fail the same way on every pass,
 // which is the shape a real broken pool has: unchanging, and reconciled again
-// and again.
+// and again. NewInvalid is terminal, so the reason is GroupSpecInvalid.
 func alwaysInvalidApply(t *testing.T, r *PodPoolReconciler) {
 	t.Helper()
 
@@ -67,10 +67,10 @@ func TestGroupFailureEmitsOnlyOnTransition(t *testing.T) {
 
 	evts := drainEvents(rec.Events)
 
-	count := countEventsByReason(evts, ReasonGroupReconcileFailed)
+	count := countEventsByReason(evts, ReasonGroupSpecInvalid)
 	if count != 1 {
 		t.Errorf("got %d %s events across 2 reconciles, want 1 (emit on transition only); events: %v",
-			count, ReasonGroupReconcileFailed, evts)
+			count, ReasonGroupSpecInvalid, evts)
 	}
 }
 
@@ -113,10 +113,10 @@ func TestRecoveredNeighbourDoesNotReAnnounceAFailingGroup(t *testing.T) {
 	_ = tryReconcilePool(r, pool)
 	firstEvts := drainEvents(rec.Events)
 
-	firstCount := countEventsByReason(firstEvts, ReasonGroupReconcileFailed)
+	firstCount := countEventsByReason(firstEvts, ReasonGroupSpecInvalid)
 	if firstCount != 2 {
 		t.Errorf("first reconcile: got %d %s events, want 2 (one per failing group); events: %v",
-			firstCount, ReasonGroupReconcileFailed, firstEvts)
+			firstCount, ReasonGroupSpecInvalid, firstEvts)
 	}
 
 	// Second reconcile: spot recovers, base fails exactly as before. The
@@ -124,11 +124,11 @@ func TestRecoveredNeighbourDoesNotReAnnounceAFailingGroup(t *testing.T) {
 	_ = tryReconcilePool(r, pool)
 	secondEvts := drainEvents(rec.Events)
 
-	secondCount := countEventsByReason(secondEvts, ReasonGroupReconcileFailed)
+	secondCount := countEventsByReason(secondEvts, ReasonGroupSpecInvalid)
 	if secondCount != 0 {
 		t.Errorf("second reconcile: got %d %s events, want 0 — base's failure is unchanged and "+
 			"a neighbour recovering is not news about base; events: %v",
-			secondCount, ReasonGroupReconcileFailed, secondEvts)
+			secondCount, ReasonGroupSpecInvalid, secondEvts)
 	}
 }
 

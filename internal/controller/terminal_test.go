@@ -7,12 +7,164 @@ import (
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
+
+const testDepResPlur = "deployments"
+
+// The wire shape of an SSA schema rejection: code 500 with an EMPTY reason.
+// Constructed literally rather than via NewInternalError, which would set
+// reason=InternalError and dodge the unknown-reason + code==500 fallback
+// branch the real error matches through.
+var errSSATypedPatch = &apierrors.StatusError{ErrStatus: metav1.Status{
+	Code:    500,
+	Message: `failed to create typed patch object (default/x; apps/v1, Kind=Deployment): .spec.replicaz: field not declared in schema`,
+}}
+
+// A child type's own failing webhook is also a 500 -- and it must stay
+// retryable, because it heals without a spec change.
+var errWebhookDown = &apierrors.StatusError{ErrStatus: metav1.Status{
+	Code:    500,
+	Reason:  metav1.StatusReasonInternalError,
+	Message: `Internal error occurred: failed calling webhook "x.kruise.io": connection refused`,
+}}
+
+// failApplyWith makes every child apply return the given error.
+func failApplyWith(t *testing.T, r *PodPoolReconciler, apiErr error) {
+	t.Helper()
+
+	base, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatalf("fake client %T does not implement client.WithWatch", r.Client)
+	}
+
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{
+		Apply: func(_ context.Context, _ client.WithWatch, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+			return apiErr
+		},
+	})
+}
+
+func TestIsTerminalAPIError(t *testing.T) {
+	const name = "my-sts"
+
+	gk := schema.GroupKind{Group: testAppsGroup, Kind: testStsKind}
+	gr := schema.GroupResource{Group: gk.Group, Resource: "statefulsets"}
+
+	invalidErr := apierrors.NewInvalid(gk, name, nil)
+	forbiddenErr := apierrors.NewForbidden(gr, name, errors.New("RBAC denied"))
+	conflictErr := apierrors.NewConflict(gr, name, errors.New("resourceVersion mismatch"))
+	notFoundErr := apierrors.NewNotFound(gr, name)
+	tooLargeErr := apierrors.NewRequestEntityTooLargeError("body too large")
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"Invalid", invalidErr, true},
+		{"Invalid wrapped", fmt.Errorf("applying child: %w", invalidErr), true},
+		{"Forbidden", forbiddenErr, false},
+		{"Forbidden wrapped", fmt.Errorf("applying child: %w", forbiddenErr), false},
+		{"Conflict", conflictErr, false},
+		{"Conflict wrapped", fmt.Errorf("applying child: %w", conflictErr), false},
+		{"NotFound", notFoundErr, false},
+		{"RequestEntityTooLarge", tooLargeErr, true},
+		{"RequestEntityTooLarge wrapped", fmt.Errorf("too big: %w", tooLargeErr), true},
+		{"SSA typed-patch 500", errSSATypedPatch, true},
+		{"SSA typed-patch 500 wrapped", fmt.Errorf("applying child: %w", errSSATypedPatch), true},
+		// The near-miss that documents the design: NOT all 500s are terminal.
+		{"webhook-down 500", errWebhookDown, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTerminalAPIError(tt.err); got != tt.want {
+				t.Errorf("isTerminalAPIError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// The whole point: a mistyped template field comes back as a 500, so the pool
+// must reach the same verdict it reaches for an unrenderable override.
+func TestReconcileStopsRetryingSSASchemaRejection(t *testing.T) {
+	pool := fakeTestPool()
+	r, cl := newFakeReconciler(t, nil, pool)
+	failApplyWith(t, r, errSSATypedPatch)
+
+	if err := tryReconcilePool(r, pool); err != nil {
+		t.Fatalf("Reconcile returned error %v, want nil (an SSA schema rejection is terminal)", err)
+	}
+
+	got := getPool(t, cl, pool)
+
+	cond := conditionByType(got, ConditionGroupsReady)
+	if cond == nil {
+		t.Fatal("GroupsReady not set")
+	}
+
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("GroupsReady = %s, want False", cond.Status)
+	}
+
+	if cond.Reason != ReasonGroupSpecInvalid {
+		t.Errorf("reason = %s, want %s", cond.Reason, ReasonGroupSpecInvalid)
+	}
+}
+
+// The near-miss, and the reason the match is on the message rather than on the
+// status code: a child type's own webhook being down is also a 500, and it
+// heals without anyone touching the spec.
+func TestReconcileKeepsRetryingWebhookDown(t *testing.T) {
+	pool := fakeTestPool()
+	r, _ := newFakeReconciler(t, nil, pool)
+	failApplyWith(t, r, errWebhookDown)
+
+	if err := tryReconcilePool(r, pool); err == nil {
+		t.Fatal("Reconcile returned nil for a webhook-down 500, want non-nil (transient 500s must be retried)")
+	}
+}
+
+// 403 stays retryable on purpose. RBAC is fixed by an admin without touching
+// the spec, and nothing here watches ClusterRoles to notice when they do.
+func TestReconcileKeepsRetryingForbidden(t *testing.T) {
+	pool := fakeTestPool()
+	r, _ := newFakeReconciler(t, nil, pool)
+	failApplyWith(t, r, apierrors.NewForbidden(
+		schema.GroupResource{Group: testAppsGroup, Resource: testDepResPlur},
+		pool.Name+"-"+testGroupBase, errors.New("RBAC denied")))
+
+	if err := tryReconcilePool(r, pool); err == nil {
+		t.Fatal("Reconcile returned nil for Forbidden, want non-nil (Forbidden must be retried)")
+	}
+}
+
+// A 422 is terminal too, and always was the case people expect. It is here so
+// the classifier's two arms are both exercised through Reconcile.
+func TestReconcileStopsRetryingInvalid(t *testing.T) {
+	pool := fakeTestPool()
+	r, cl := newFakeReconciler(t, nil, pool)
+	failApplyWith(t, r, apierrors.NewInvalid(
+		schema.GroupKind{Group: testAppsGroup, Kind: testDepKind},
+		pool.Name+"-"+testGroupBase, nil))
+
+	if err := tryReconcilePool(r, pool); err != nil {
+		t.Fatalf("Reconcile returned error %v, want nil (Invalid is terminal)", err)
+	}
+
+	got := getPool(t, cl, pool)
+	if cond := conditionByType(got, ConditionGroupsReady); cond == nil || cond.Reason != ReasonGroupSpecInvalid {
+		t.Errorf("GroupsReady = %+v, want reason %s", cond, ReasonGroupSpecInvalid)
+	}
+}
 
 func TestTerminalWrapping(t *testing.T) {
 	orig := errors.New("bad spec")

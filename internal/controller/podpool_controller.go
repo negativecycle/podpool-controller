@@ -623,7 +623,12 @@ func (r *PodPoolReconciler) reconcileGroup(
 
 	obs, err := r.reconcileWorkload(ctx, pool, desired)
 	if err != nil {
-		return groupReconcileResult{}, fmt.Errorf("reconciling workload: %w", err)
+		wrapped := fmt.Errorf("reconciling workload: %w", err)
+		if isTerminalAPIError(err) {
+			return groupReconcileResult{}, terminal(wrapped)
+		}
+
+		return groupReconcileResult{}, wrapped
 	}
 
 	if obs.created {
