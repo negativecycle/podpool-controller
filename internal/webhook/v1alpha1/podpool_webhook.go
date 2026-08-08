@@ -42,6 +42,14 @@ type PodPoolCustomDefaulter struct{}
 func (d *PodPoolCustomDefaulter) Default(ctx context.Context, obj *podpoolsv1alpha1.PodPool) error {
 	logf.FromContext(ctx).Info("Defaulting for PodPool", "name", obj.GetName())
 
+	for i := range obj.Spec.Groups {
+		s := &obj.Spec.Groups[i].Scaling
+		if s.Min == nil && s.Max == nil {
+			zero := int32(0)
+			s.Min = &zero
+		}
+	}
+
 	return nil
 }
 
