@@ -218,7 +218,14 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		return res, err
 	}
 
-	observed := r.observeOpportunistic(ctx, &pool, gvk)
+	// A failed read leaves the pool's capacity unknown, and the targets derived
+	// from it are written by SSA in this same pass. Return the error and let the
+	// workqueue retry: writing nothing is always recoverable, writing a guess is
+	// not.
+	observed, err := r.observeOpportunistic(ctx, &pool, gvk)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("observing opportunistic capacity: %w", err)
+	}
 
 	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups, capacityFrom(observed))
 

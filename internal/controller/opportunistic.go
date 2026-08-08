@@ -3,10 +3,12 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,11 +35,22 @@ const probeVerdictRequeue = 15 * time.Second
 // everything we need to know.
 const maxUnschedulableProbe int32 = 256
 
-// opportunisticObservation is one group's child read: what we last asked of it
-// and what it achieved.
+// opportunisticObservation is one group's child read plus, when it is short of
+// target, the scheduler's verdict on the shortfall.
+//
+// found and foreign are both false only for a group with no child at all, which
+// is the cold start. Every other state has to be distinguishable from it,
+// because phase 3 answers "never sized" by offering the whole remainder.
 type opportunisticObservation struct {
-	// found means a child was read and the counts below are real.
+	// found means a child this pool owns was read and the counts below are
+	// real. It does not mean "no error": a read that failed is reported as an
+	// error instead, never as an observation.
 	found bool
+
+	// foreign means an object exists at the child's name under another owner.
+	// Distinct from found=false: there is no capacity here to offer, but there
+	// is also nothing to grow into, so this group must not be read as new.
+	foreign bool
 
 	asked         int32 // what we last wrote
 	ready         int32 // the child's status.readyReplicas
@@ -82,7 +95,7 @@ type probeDecision struct {
 // the group is short of what was asked, the scheduler's verdict on its pods.
 func (r *PodPoolReconciler) observeOpportunistic(
 	ctx context.Context, pool *podpoolsv1alpha1.PodPool, gvk schema.GroupVersionKind,
-) map[string]opportunisticObservation {
+) (map[string]opportunisticObservation, error) {
 	log := logf.FromContext(ctx)
 
 	var out map[string]opportunisticObservation
@@ -92,7 +105,14 @@ func (r *PodPoolReconciler) observeOpportunistic(
 			continue
 		}
 
-		obs := r.childCounts(ctx, pool, gvk, g.Name)
+		// Stop at the first failed read. A partial capacity map is worse than
+		// none: phase 3 subtracts what it gives from what later groups receive,
+		// so one unreadable child produces wrong targets for groups that were
+		// read perfectly well.
+		obs, err := r.childCounts(ctx, pool, gvk, g.Name)
+		if err != nil {
+			return nil, fmt.Errorf("reading group %s: %w", g.Name, err)
+		}
 
 		if obs.found && obs.ready < obs.asked {
 			n, err := r.countUnschedulable(ctx, pool, g.Name,
@@ -111,7 +131,7 @@ func (r *PodPoolReconciler) observeOpportunistic(
 		out[g.Name] = obs
 	}
 
-	return out
+	return out, nil
 }
 
 // countUnschedulable asks how many of a group's pods the scheduler refused.
@@ -167,6 +187,20 @@ func capacityFrom(observed map[string]opportunisticObservation) map[string]int32
 	var out map[string]int32
 
 	for name, obs := range observed {
+		if obs.foreign {
+			// Someone else's object sits at this child's name. The group will
+			// be refused by reconcileWorkload, so it has no capacity, but it
+			// must be present in the map: absence would hand it the remainder
+			// and shrink every group after it for replicas it cannot place.
+			if out == nil {
+				out = make(map[string]int32, len(observed))
+			}
+
+			out[name] = 0
+
+			continue
+		}
+
 		if !obs.found {
 			continue // no child yet → absent from the map → cold start
 		}
@@ -205,7 +239,12 @@ func (r *PodPoolReconciler) decideProbe(
 
 	st := r.probes[key]
 
-	if st.outstanding {
+	// obs.found is the guard, not a formality. An observation that was never
+	// read is the zero value, and the first case below is then 0 >= 0: the
+	// controller would record that the scheduler accepted a replica nobody
+	// looked at, and bias the next heartbeat toward growth on the strength of
+	// it. Read failures no longer reach here, but a foreign-owned child does.
+	if st.outstanding && obs.found {
 		switch {
 		case obs.ready >= obs.asked:
 			st.outstanding = false
@@ -217,6 +256,10 @@ func (r *PodPoolReconciler) decideProbe(
 
 	if st.outstanding {
 		r.probes[key] = st
+
+		if !obs.found {
+			return probeDecision{target: target}
+		}
 
 		return probeDecision{target: target + 1, awaitVerdict: true}
 	}
@@ -281,9 +324,16 @@ func probeKey(pool *podpoolsv1alpha1.PodPool, groupName string) string {
 // The comparison between the two is the gate on everything expensive that
 // follows: a group standing at its target has nothing to explain, and a group
 // short of it does. A converged pool therefore issues no extra reads at all.
+//
+// The four states it can find are materially different and only one of them,
+// genuine absence, is the cold start that phase 3 answers with the whole
+// remainder. A read that failed is returned as an error so the caller can
+// abandon the pass rather than size the pool from data it does not have; an
+// object under another owner is reported as such, because it offers no capacity
+// but is not an invitation to grow either.
 func (r *PodPoolReconciler) childCounts(
 	ctx context.Context, pool *podpoolsv1alpha1.PodPool, gvk schema.GroupVersionKind, groupName string,
-) opportunisticObservation {
+) (opportunisticObservation, error) {
 	child := &unstructured.Unstructured{}
 	child.SetGroupVersionKind(gvk)
 
@@ -291,12 +341,35 @@ func (r *PodPoolReconciler) childCounts(
 		Name:      workload.ChildName(pool.Name, groupName),
 		Namespace: pool.Namespace,
 	}
-	if err := r.Get(ctx, key, child); err != nil {
-		return opportunisticObservation{}
+
+	err := r.Get(ctx, key, child)
+	if apierrors.IsNotFound(err) {
+		// Absence is the one answer that licenses growth, so confirm it
+		// uncached before believing it. This is the read-path counterpart of
+		// reconcileWorkload's confirm on the create path.
+		uncached := &unstructured.Unstructured{}
+		uncached.SetGroupVersionKind(gvk)
+
+		uerr := r.APIReader.Get(ctx, key, uncached)
+
+		switch {
+		case apierrors.IsNotFound(uerr):
+			return opportunisticObservation{}, nil // genuinely absent: the cold start
+		case uerr != nil:
+			return opportunisticObservation{}, uerr
+		}
+
+		child = uncached
+	} else if err != nil {
+		return opportunisticObservation{}, err
+	}
+
+	if !isControlledBy(child, pool) {
+		return opportunisticObservation{foreign: true}, nil
 	}
 
 	replicas, _ := workload.ReadInt32(child, "status", "replicas")
 	ready, _ := workload.ReadInt32(child, "status", "readyReplicas")
 
-	return opportunisticObservation{found: true, asked: replicas, ready: ready}
+	return opportunisticObservation{found: true, asked: replicas, ready: ready}, nil
 }

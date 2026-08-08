@@ -117,6 +117,13 @@ func newSplitView(t *testing.T, hidden []string, objs ...client.Object) *splitVi
 // reconciler returns a reconciler whose cached client lags and whose APIReader
 // tells the truth. liveReader overrides the APIReader when a test needs the
 // live read itself to fail.
+func childKey(pool *podpoolsv1alpha1.PodPool, group string) string {
+	return types.NamespacedName{
+		Namespace: pool.Namespace,
+		Name:      fmt.Sprintf("%s-%s", pool.Name, group),
+	}.String()
+}
+
 func (sv *splitView) reconciler(liveReader client.Reader) *PodPoolReconciler {
 	if liveReader == nil {
 		liveReader = sv.store
