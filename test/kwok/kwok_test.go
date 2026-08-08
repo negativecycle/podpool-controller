@@ -60,7 +60,7 @@ func pctTarget(pct int) *intstr.IntOrString {
 	return &v
 }
 
-func schedulingOverride(nodeSelector map[string]string) *runtime.RawExtension {
+func schedulingOverride(nodeSelector map[string]string, priorityClassName string) *runtime.RawExtension {
 	podSpec := map[string]any{}
 
 	if len(nodeSelector) > 0 {
@@ -70,6 +70,10 @@ func schedulingOverride(nodeSelector map[string]string) *runtime.RawExtension {
 		}
 
 		podSpec["nodeSelector"] = nsAny
+	}
+
+	if priorityClassName != "" {
+		podSpec["priorityClassName"] = priorityClassName
 	}
 
 	if len(podSpec) == 0 {
@@ -349,12 +353,12 @@ func TestPodPoolFullLifecycle(t *testing.T) {
 				{
 					Name:      "on-demand",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}, ""),
 				},
 				{
 					Name:      "spot",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(70)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}, ""),
 				},
 			},
 		},
@@ -462,12 +466,12 @@ func TestPodPoolScaling(t *testing.T) {
 				{
 					Name:      "on-demand",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](2)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}, ""),
 				},
 				{
 					Name:      "spot",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(70)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}, ""),
 				},
 			},
 		},
@@ -566,12 +570,12 @@ func TestPodPoolOrphanCleanup(t *testing.T) {
 				{
 					Name:      "on-demand",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](2)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}, ""),
 				},
 				{
 					Name:      "spot",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](1)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}, ""),
 				},
 			},
 		},
@@ -650,12 +654,12 @@ func TestAsymmetricTopology(t *testing.T) {
 				{
 					Name:      "on-demand",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}, ""),
 				},
 				{
 					Name:      "spot",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(70)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}, ""),
 				},
 			},
 		},
@@ -701,17 +705,17 @@ func TestScavengerPattern(t *testing.T) {
 				{
 					Name:      "base",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}, ""),
 				},
 				{
 					Name:      "scavenger",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(30)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}, ""),
 				},
 				{
 					Name:      "burst",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(50)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}, ""),
 				},
 			},
 		},

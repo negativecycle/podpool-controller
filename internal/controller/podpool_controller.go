@@ -33,7 +33,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -200,7 +199,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 			poolInvalid: true,
 		})
 
-		return ctrl.Result{RequeueAfter: requeueAfter()}, nil
+		return ctrl.Result{RequeueAfter: requeueAfter(&pool)}, nil
 	}
 
 	// Parse once per reconcile; BuildChildWorkload deep-copies per group.
@@ -388,103 +387,6 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	// for a rollout four seconds old and a pool stuck forever, so only a
 	// requeue can turn elapsed time into a verdict.
 	return ctrl.Result{RequeueAfter: deadlineAwareRequeue(&pool, groupStatuses, now)}, nil
-}
-
-// watchSyncRequeue is how soon to look again while an informer is filling its
-// initial cache. Short, because the wait is normally milliseconds and nothing
-// else will wake the pool once the cache is warm.
-const watchSyncRequeue = 2 * time.Second
-
-// reconcileFloor is the base requeue interval for every pool. Without a floor
-// a converged pool is never looked at again until something changes it, and
-// the progress deadline could never fire on a pool that went quiet.
-const reconcileFloor = 10 * time.Minute
-
-// defaultProgressDeadlineSeconds matches the schema default; the in-code copy
-// covers objects stored before the default existed and structs built in tests
-// that never pass through admission.
-const defaultProgressDeadlineSeconds int32 = 600
-
-// requeueAfter returns the base requeue interval, jittered so a manager
-// restart does not herd every pool into lockstep forever.
-func requeueAfter() time.Duration {
-	return wait.Jitter(reconcileFloor, 0.1)
-}
-
-// progressDeadline returns the pool's progress deadline or the default.
-// math.MaxInt32 disables the deadline.
-func progressDeadline(pool *podpoolsv1alpha1.PodPool) time.Duration {
-	s := defaultProgressDeadlineSeconds
-	// The nil check survives the schema default: objects stored before the
-	// default existed are not re-defaulted on read, and structs built in
-	// tests never pass through admission.
-	if pool.Spec.ProgressDeadlineSeconds != nil {
-		s = *pool.Spec.ProgressDeadlineSeconds
-	}
-
-	return time.Duration(s) * time.Second
-}
-
-// hasProgressDeadline reports whether the pool's deadline is enabled.
-func hasProgressDeadline(pool *podpoolsv1alpha1.PodPool) bool {
-	s := defaultProgressDeadlineSeconds
-	if pool.Spec.ProgressDeadlineSeconds != nil {
-		s = *pool.Spec.ProgressDeadlineSeconds
-	}
-
-	return s < 2147483647
-}
-
-// evaluateStalled returns the names of groups whose shortfall has exceeded
-// the progress deadline.
-func evaluateStalled(pool *podpoolsv1alpha1.PodPool, groups []podpoolsv1alpha1.GroupStatus, now time.Time) []string {
-	if !hasProgressDeadline(pool) {
-		return nil
-	}
-
-	deadline := progressDeadline(pool)
-
-	var stalled []string
-
-	for i := range groups {
-		gs := &groups[i]
-
-		shortfall := max(int32(0), gs.TargetReplicas-gs.ReadyReplicas)
-		if shortfall > 0 && gs.LastProgressTime != nil {
-			if now.Sub(gs.LastProgressTime.Time) >= deadline {
-				stalled = append(stalled, gs.Name)
-			}
-		}
-	}
-
-	return stalled
-}
-
-// deadlineAwareRequeue returns the base requeue interval, shortened when a
-// group is short of target but not yet stalled, so the deadline fires
-// precisely rather than up to one floor interval late.
-func deadlineAwareRequeue(pool *podpoolsv1alpha1.PodPool, groups []podpoolsv1alpha1.GroupStatus, now time.Time) time.Duration {
-	base := requeueAfter()
-
-	if hasProgressDeadline(pool) {
-		deadline := progressDeadline(pool)
-
-		for _, gs := range groups {
-			shortfall := max(int32(0), gs.TargetReplicas-gs.ReadyReplicas)
-			if shortfall > 0 && gs.LastProgressTime != nil {
-				remaining := gs.LastProgressTime.Time.Add(deadline).Sub(now)
-				if remaining > 0 && remaining < base {
-					base = remaining
-				}
-			}
-		}
-	}
-
-	if base < time.Second {
-		base = time.Second
-	}
-
-	return base
 }
 
 // stampGroupProgress applies the progress timestamp rules.

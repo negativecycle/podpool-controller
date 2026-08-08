@@ -117,10 +117,6 @@ var _ = Describe("Opportunistic observation", func() {
 	})
 })
 
-// testGroupScavShort keeps the child's name inside the DNS budget in specs that
-// build one by hand.
-const testGroupScavShort = "scav"
-
 // The gate reads the child's spec.replicas — what we last asked for — and never
 // its status.replicas. During a scale-up the ReplicaSet lags, so status.replicas
 // still reports the old count while readyReplicas has caught up to it. Read that

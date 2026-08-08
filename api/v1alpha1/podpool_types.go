@@ -54,6 +54,19 @@ type PodPoolSpec struct {
 	// +listMapKey=name
 	Groups []GroupSpec `json:"groups"`
 
+	// How often, in seconds, an opportunistic group re-tests for capacity
+	// that has freed up since it last settled. Ignored when no group is
+	// opportunistic.
+	//
+	// Shrinking is immediate: a replica the scheduler rejects moves on at
+	// once. Only growth waits for this, because discovering that capacity
+	// exists costs a scheduling attempt, and how eagerly to spend that is a
+	// preference rather than something the controller should decide.
+	// +optional
+	// +kubebuilder:default=300
+	// +kubebuilder:validation:Minimum=1
+	OpportunisticHeartbeatSeconds *int32 `json:"opportunisticHeartbeatSeconds,omitempty"`
+
 	// How long a group may sit short of its target before the pool reports
 	// ProgressDeadlineExceeded. Mirrors a Deployment's
 	// progressDeadlineSeconds. Set to 2147483647 to disable the deadline.

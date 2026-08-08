@@ -27,13 +27,15 @@ type kwokNode struct {
 // topology here and calling withTopology(t, ...) in a test is all it takes;
 // nothing external (YAML files, manual kubectl) is needed.
 //
-// If a test's arithmetic depends on node capacity, pin the topology in that
-// test's header comment so a reader can verify the numbers without
-// cross-referencing.
+// If a test's arithmetic depends on node capacity (like the opportunistic
+// test's bin-packing proof), pin the topology in that test's header comment
+// so a reader can verify the numbers without cross-referencing.
 
 var (
 	// 2 on-demand + 2 spot, 4 CPU / 16Gi each. Used by the lifecycle,
-	// scaling, orphan, scavenger, and HPA tests.
+	// scaling, orphan, scavenger, HPA, and opportunistic tests. The
+	// opportunistic test's arithmetic is pinned to this shape — see its
+	// header comment.
 	defaultTopology = []kwokNode{
 		{Name: "on-demand-1", Labels: map[string]string{"capacity-type": "on-demand"}, CPU: "4", Memory: "16Gi"},
 		{Name: "on-demand-2", Labels: map[string]string{"capacity-type": "on-demand"}, CPU: "4", Memory: "16Gi"},
@@ -190,25 +192,4 @@ func withTopology(t *testing.T, nodes []kwokNode) {
 			t.Errorf("restoring default topology: %v", err)
 		}
 	})
-}
-
-// waitForNoPods blocks until the test namespace has no pods at all, so a
-// test whose arithmetic depends on node headroom cannot inherit terminating
-// pods from an earlier test.
-func waitForNoPods(t *testing.T) {
-	t.Helper()
-
-	remaining := -1
-
-	err := pollFor(30*time.Second, func(ctx context.Context) (bool, error) {
-		pods := &corev1.PodList{}
-		if err := k8sClient.List(ctx, pods); err == nil {
-			remaining = len(pods.Items)
-		}
-
-		return remaining == 0, nil
-	})
-	if err != nil {
-		t.Fatalf("namespace not quiescent: %d pods still present at test start", remaining)
-	}
 }

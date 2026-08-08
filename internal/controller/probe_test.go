@@ -18,10 +18,11 @@ var probeTestBase = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 // of a state machine whose whole job is to be careful about time, so the clock
 // is injected and nothing sleeps.
 
-func probePool() *podpoolsv1alpha1.PodPool {
+func probePool(heartbeatSeconds int32) *podpoolsv1alpha1.PodPool {
 	return &podpoolsv1alpha1.PodPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "probe-pool", Namespace: "default"},
 		Spec: podpoolsv1alpha1.PodPoolSpec{
+			OpportunisticHeartbeatSeconds: &heartbeatSeconds,
 			Groups: []podpoolsv1alpha1.GroupSpec{
 				{Name: testGroupScav, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Opportunistic: opportunistic()}},
 			},
@@ -31,7 +32,7 @@ func probePool() *podpoolsv1alpha1.PodPool {
 
 func TestDecideProbeLifecycle(t *testing.T) {
 	r := &PodPoolReconciler{Clock: clocktesting.NewFakePassiveClock(probeTestBase)}
-	pool := probePool()
+	pool := probePool(60)
 	now := probeTestBase
 
 	settled := opportunisticObservation{found: true, asked: 4, ready: 4}
@@ -70,7 +71,7 @@ func TestDecideProbeLifecycle(t *testing.T) {
 
 	// 5. Heartbeat elapsed → probe again. Measured from the refusal at +2s,
 	//    not from the start: the backoff clock starts when the answer was no.
-	afterHeartbeat := now.Add(2*time.Second + defaultOpportunisticHeartbeat)
+	afterHeartbeat := now.Add(2 * time.Minute)
 
 	d = r.decideProbe(pool, testGroupScav, 4, settled, afterHeartbeat)
 	if d.target != 5 {
@@ -91,7 +92,7 @@ func TestDecideProbeLifecycle(t *testing.T) {
 
 func TestDecideProbeRequiresSettledState(t *testing.T) {
 	r := &PodPoolReconciler{Clock: clocktesting.NewFakePassiveClock(probeTestBase)}
-	pool := probePool()
+	pool := probePool(1) // heartbeat never in the way
 	now := probeTestBase
 
 	cases := []struct {
@@ -120,7 +121,7 @@ func TestDecideProbeRequiresSettledState(t *testing.T) {
 // speculative burst-pod kill the design exists to prevent.
 func TestCapacityFromHoldsUnjudgedProbe(t *testing.T) {
 	r := &PodPoolReconciler{Clock: clocktesting.NewFakePassiveClock(probeTestBase)}
-	pool := probePool()
+	pool := probePool(60)
 
 	// Arrange an outstanding probe.
 	settled := opportunisticObservation{found: true, asked: 4, ready: 4}
@@ -162,7 +163,7 @@ func TestProbeDoesNotFundItselfFromOtherGroups(t *testing.T) {
 	}
 
 	r := &PodPoolReconciler{Clock: clocktesting.NewFakePassiveClock(probeTestBase)}
-	pool := probePool()
+	pool := probePool(60)
 	settled := opportunisticObservation{found: true, asked: 30, ready: 30}
 	scavDecision := r.decideProbe(pool, testGroupScav, base.Targets[1], settled, probeTestBase)
 
@@ -180,8 +181,8 @@ func TestProbeDoesNotFundItselfFromOtherGroups(t *testing.T) {
 
 func TestForgetProbesDropsOnlyThatPool(t *testing.T) {
 	r := &PodPoolReconciler{Clock: clocktesting.NewFakePassiveClock(probeTestBase)}
-	a := probePool()
-	b := probePool()
+	a := probePool(1)
+	b := probePool(1)
 	b.Name = "other-pool"
 
 	settled := opportunisticObservation{found: true, asked: 1, ready: 1}

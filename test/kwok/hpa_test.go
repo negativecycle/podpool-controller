@@ -107,12 +107,12 @@ func TestHPAScalesPodPool(t *testing.T) {
 				{
 					Name:      "on-demand",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](2)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "on-demand"}, ""),
 				},
 				{
 					Name:      "spot",
 					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(70)},
-					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}),
+					Overrides: schedulingOverride(map[string]string{"capacity-type": "spot"}, ""),
 				},
 			},
 		},

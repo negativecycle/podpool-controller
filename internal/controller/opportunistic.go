@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -19,11 +20,11 @@ import (
 	"github.com/negativecycle/podpool-controller/internal/workload"
 )
 
-// defaultOpportunisticHeartbeat is how long a refused probe waits before
-// asking again. Free capacity appears without any event this controller
-// watches, so the only way to notice it is to look, and looking costs a
-// scheduling attempt.
-const defaultOpportunisticHeartbeat = 5 * time.Minute
+// defaultOpportunisticHeartbeatSeconds is the schema default, kept here so the
+// Go fallback and the CRD cannot drift apart.
+const defaultOpportunisticHeartbeatSeconds int32 = 300
+
+const defaultOpportunisticHeartbeat = time.Duration(defaultOpportunisticHeartbeatSeconds) * time.Second
 
 // probeVerdictRequeue is how soon to look again while a probe pod is Pending
 // but the scheduler has not yet said Unschedulable. Long enough for a
@@ -284,7 +285,7 @@ func (r *PodPoolReconciler) decideProbe(
 	// fails to schedule might be the probe, or might be one of the ones already
 	// in flight.
 	settled := obs.found && obs.asked == target && obs.ready >= obs.asked
-	if settled && now.Sub(st.lastFailed) >= defaultOpportunisticHeartbeat {
+	if settled && now.Sub(st.lastFailed) >= opportunisticHeartbeat(pool) {
 		st.outstanding = true
 		r.probes[key] = st
 
@@ -393,4 +394,133 @@ func (r *PodPoolReconciler) childCounts(
 	readyReplicas, _ := workload.ReadInt32(child, "status", "readyReplicas")
 
 	return opportunisticObservation{found: true, asked: specReplicas, ready: readyReplicas}, nil
+}
+
+// watchSyncRequeue is how soon to look again while an informer is filling its
+// initial cache. Short, because the wait is normally milliseconds and nothing
+// else will wake the pool once the cache is warm.
+const watchSyncRequeue = 2 * time.Second
+
+// reconcileFloor is the base requeue interval for every pool. Without a floor
+// a converged pool is never looked at again until something changes it, and
+// the progress deadline could never fire on a pool that went quiet.
+const reconcileFloor = 10 * time.Minute
+
+// defaultProgressDeadlineSeconds matches the schema default; the in-code copy
+// covers objects stored before the default existed and structs built in tests
+// that never pass through admission.
+const defaultProgressDeadlineSeconds int32 = 600
+
+// opportunisticHeartbeat is how long until the next growth probe, or zero when
+// no group is opportunistic and the pool needs no timer at all.
+func opportunisticHeartbeat(pool *podpoolsv1alpha1.PodPool) time.Duration {
+	var hasOpportunistic bool
+
+	for _, g := range pool.Spec.Groups {
+		if workload.IsOpportunistic(g.Scaling) {
+			hasOpportunistic = true
+
+			break
+		}
+	}
+
+	if !hasOpportunistic {
+		return 0
+	}
+	// The nil check survives the schema default: objects stored before the
+	// default existed are not re-defaulted on read, and structs built in
+	// tests never pass through admission.
+	if s := pool.Spec.OpportunisticHeartbeatSeconds; s != nil && *s > 0 {
+		return time.Duration(*s) * time.Second
+	}
+
+	return defaultOpportunisticHeartbeat
+}
+
+// requeueAfter returns the base requeue interval, jittered so a manager
+// restart does not herd every pool into lockstep forever. An explicit
+// heartbeat is not clamped to the floor: it is already a statement about how
+// often this pool wants looking at.
+func requeueAfter(pool *podpoolsv1alpha1.PodPool) time.Duration {
+	if h := opportunisticHeartbeat(pool); h > 0 {
+		return wait.Jitter(h, 0.1)
+	}
+
+	return wait.Jitter(reconcileFloor, 0.1)
+}
+
+// progressDeadline returns the pool's progress deadline or the default.
+// math.MaxInt32 disables the deadline.
+func progressDeadline(pool *podpoolsv1alpha1.PodPool) time.Duration {
+	s := defaultProgressDeadlineSeconds
+	// The nil check survives the schema default: objects stored before the
+	// default existed are not re-defaulted on read, and structs built in
+	// tests never pass through admission.
+	if pool.Spec.ProgressDeadlineSeconds != nil {
+		s = *pool.Spec.ProgressDeadlineSeconds
+	}
+
+	return time.Duration(s) * time.Second
+}
+
+// hasProgressDeadline reports whether the pool's deadline is enabled.
+func hasProgressDeadline(pool *podpoolsv1alpha1.PodPool) bool {
+	s := defaultProgressDeadlineSeconds
+	if pool.Spec.ProgressDeadlineSeconds != nil {
+		s = *pool.Spec.ProgressDeadlineSeconds
+	}
+
+	return s < 2147483647
+}
+
+// evaluateStalled returns the names of groups whose shortfall has exceeded
+// the progress deadline.
+func evaluateStalled(pool *podpoolsv1alpha1.PodPool, groups []podpoolsv1alpha1.GroupStatus, now time.Time) []string {
+	if !hasProgressDeadline(pool) {
+		return nil
+	}
+
+	deadline := progressDeadline(pool)
+
+	var stalled []string
+
+	for i := range groups {
+		gs := &groups[i]
+
+		shortfall := max(int32(0), gs.TargetReplicas-gs.ReadyReplicas)
+		if shortfall > 0 && gs.LastProgressTime != nil {
+			if now.Sub(gs.LastProgressTime.Time) >= deadline {
+				stalled = append(stalled, gs.Name)
+			}
+		}
+	}
+
+	return stalled
+}
+
+// deadlineAwareRequeue returns the base requeue interval, shortened when a
+// group is short of target but not yet stalled, so the deadline fires
+// precisely rather than up to one floor interval late.
+func deadlineAwareRequeue(pool *podpoolsv1alpha1.PodPool, groups []podpoolsv1alpha1.GroupStatus, now time.Time) time.Duration {
+	base := requeueAfter(pool)
+
+	if hasProgressDeadline(pool) {
+		deadline := progressDeadline(pool)
+
+		for _, gs := range groups {
+			shortfall := max(int32(0), gs.TargetReplicas-gs.ReadyReplicas)
+			if shortfall > 0 && gs.LastProgressTime != nil {
+				remaining := gs.LastProgressTime.Time.Add(deadline).Sub(now)
+				if remaining > 0 && remaining < base {
+					base = remaining
+				}
+			}
+		}
+	}
+
+	if base < time.Second {
+		base = time.Second
+	}
+
+	return base
 }

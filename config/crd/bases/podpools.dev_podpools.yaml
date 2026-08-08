@@ -161,6 +161,20 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
+              opportunisticHeartbeatSeconds:
+                default: 300
+                description: |-
+                  How often, in seconds, an opportunistic group re-tests for capacity
+                  that has freed up since it last settled. Ignored when no group is
+                  opportunistic.
+
+                  Shrinking is immediate: a replica the scheduler rejects moves on at
+                  once. Only growth waits for this, because discovering that capacity
+                  exists costs a scheduling attempt, and how eagerly to spend that is a
+                  preference rather than something the controller should decide.
+                format: int32
+                minimum: 1
+                type: integer
               progressDeadlineSeconds:
                 default: 600
                 description: |-

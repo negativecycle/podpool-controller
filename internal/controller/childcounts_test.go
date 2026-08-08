@@ -250,7 +250,7 @@ func TestForeignChildDoesNotShrinkLaterGroups(t *testing.T) {
 // the scheduler accepted a replica it never looked at, and the next heartbeat
 // is biased toward growth on the strength of it.
 func TestUnreadObservationDoesNotResolveAProbe(t *testing.T) {
-	pool := probePool()
+	pool := probePool(60)
 	r := &PodPoolReconciler{
 		Clock:  clocktesting.NewFakePassiveClock(probeTestBase),
 		probes: map[string]probeState{probeKey(pool, testGroupScav): {outstanding: true}},
