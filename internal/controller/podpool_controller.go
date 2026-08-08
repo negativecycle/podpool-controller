@@ -155,6 +155,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		// and this pass, and there is nothing to do. Returning the error
 		// instead would requeue a name that will never resolve again.
 		if apierrors.IsNotFound(err) {
+			deletePoolMetrics(req.Namespace, req.Name)
 			r.forgetProbes(req.Namespace, req.Name)
 
 			return ctrl.Result{}, nil
@@ -370,6 +371,31 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		stalledGroups:  stalledGroups,
 		notOwnedGroups: notOwnedGroups,
 	})
+
+	deleteStaleGroupMetrics(pool.Namespace, pool.Name,
+		groupNames(groupStatuses), groupNames(before.Status.Groups))
+
+	metricGroups := make([]groupMetric, len(groupStatuses))
+
+	for i, gs := range groupStatuses {
+		var lpt float64
+		if gs.LastProgressTime != nil {
+			lpt = float64(gs.LastProgressTime.Unix())
+		}
+
+		metricGroups[i] = groupMetric{
+			name:             gs.Name,
+			replicas:         gs.Replicas,
+			ready:            gs.ReadyReplicas,
+			sharePercent:     gs.SharePercent,
+			lastProgressTime: lpt,
+		}
+	}
+
+	recordPoolMetrics(pool.Namespace, pool.Name,
+		pool.Spec.Replicas,
+		pool.Status.Replicas, pool.Status.ReadyReplicas, pool.Status.UnplacedReplicas,
+		metricGroups)
 
 	if err := kerrors.NewAggregate(errs); err != nil {
 		return ctrl.Result{}, err
