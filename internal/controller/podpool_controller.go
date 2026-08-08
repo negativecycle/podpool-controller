@@ -119,6 +119,10 @@ type PodPoolReconciler struct {
 	// absence is confirmed against the API server itself.
 	APIReader client.Reader
 
+	MaxConcurrentReconciles int
+	RateLimiterBaseDelay    time.Duration
+	RateLimiterMaxDelay     time.Duration
+
 	// Watches are registered lazily, from Reconcile, which runs on several
 	// goroutines at once. The mutex guards the map; the controller handle is
 	// what watches get attached to after Build.

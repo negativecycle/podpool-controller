@@ -106,9 +106,13 @@ var _ = BeforeSuite(func() {
 	// real one, and this suite exercising that default is what keeps it from
 	// silently breaking while every table test swaps in a fake.
 	reconciler = &PodPoolReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		APIReader: mgr.GetAPIReader(),
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Recorder:                mgr.GetEventRecorder("podpool-controller"),
+		APIReader:               mgr.GetAPIReader(),
+		MaxConcurrentReconciles: 5,
+		RateLimiterBaseDelay:    1 * time.Second,
+		RateLimiterMaxDelay:     5 * time.Minute,
 	}
 	err = reconciler.SetupWithManager(mgr)
 	Expect(err).ToNot(HaveOccurred())
