@@ -18,13 +18,20 @@ package v1alpha1
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"regexp"
 
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
+	"github.com/negativecycle/podpool-controller/internal/workload"
 )
+
+var dnsLabelRegexp = regexp.MustCompile(`^[a-z][a-z0-9-]*[a-z0-9]$`)
 
 // SetupPodPoolWebhookWithManager registers the defaulting and validating webhooks for PodPool.
 func SetupPodPoolWebhookWithManager(mgr ctrl.Manager) error {
@@ -58,14 +65,148 @@ func (d *PodPoolCustomDefaulter) Default(ctx context.Context, obj *podpoolsv1alp
 // PodPoolCustomValidator validates PodPool resources during admission.
 type PodPoolCustomValidator struct{}
 
+func validateWorkloadTemplate(fp *field.Path, raw []byte) field.ErrorList {
+	var allErrs field.ErrorList
+
+	if len(raw) == 0 {
+		allErrs = append(allErrs, field.Required(fp, "workloadTemplate is required"))
+
+		return allErrs
+	}
+
+	_, err := workload.ExtractGVK(raw)
+	if err != nil {
+		allErrs = append(allErrs, field.Invalid(fp, string(raw), fmt.Sprintf("must have valid apiVersion and kind: %v", err)))
+
+		return allErrs
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		allErrs = append(allErrs, field.Invalid(fp, string(raw), "must be valid JSON"))
+
+		return allErrs
+	}
+
+	spec, ok := obj["spec"].(map[string]any)
+	if !ok {
+		allErrs = append(allErrs, field.Required(fp.Child("spec"), "workloadTemplate must have a spec"))
+
+		return allErrs
+	}
+
+	if _, ok := spec["template"]; !ok {
+		allErrs = append(allErrs, field.Required(fp.Child("spec", "template"), "workloadTemplate must have .spec.template"))
+	}
+
+	return allErrs
+}
+
+func validatePodPoolSpec(pp *podpoolsv1alpha1.PodPool) field.ErrorList {
+	var allErrs field.ErrorList
+
+	specPath := field.NewPath("spec")
+	groupsPath := specPath.Child("groups")
+
+	allErrs = append(allErrs, validateWorkloadTemplate(specPath.Child("workloadTemplate"), pp.Spec.WorkloadTemplate.Raw)...)
+
+	if len(pp.Spec.Groups) == 0 {
+		allErrs = append(allErrs, field.Required(groupsPath, "at least one group is required"))
+
+		return allErrs
+	}
+
+	names := make(map[string]bool)
+
+	for i, g := range pp.Spec.Groups {
+		gp := groupsPath.Index(i)
+
+		if g.Name == "" {
+			allErrs = append(allErrs, field.Required(gp.Child("name"), "group name is required"))
+		} else if len(g.Name) < 2 || !dnsLabelRegexp.MatchString(g.Name) {
+			allErrs = append(allErrs, field.Invalid(gp.Child("name"), g.Name, "must be a valid DNS label (lowercase alphanumeric and hyphens, at least 2 characters)"))
+		}
+
+		// Unreachable in a real cluster: +listType=map,listMapKey=name rejects
+		// duplicates at the schema layer. Kept for direct-call unit tests and
+		// clusters running a stale CRD.
+		if names[g.Name] {
+			allErrs = append(allErrs, field.Duplicate(gp.Child("name"), g.Name))
+		}
+
+		names[g.Name] = true
+
+		allErrs = append(allErrs, validateScaling(gp.Child("scaling"), &g.Scaling)...)
+	}
+
+	return allErrs
+}
+
+func validateScaling(fp *field.Path, s *podpoolsv1alpha1.ScalingConstraints) field.ErrorList {
+	var allErrs field.ErrorList
+
+	hasOpportunistic := s.Opportunistic != nil && *s.Opportunistic
+
+	// Duplicates the XValidation rule on .opportunistic (podpool_types.go):
+	// "(!has(self.opportunistic) || !self.opportunistic) || (!has(self.max) &&
+	// !has(self.target))". Unreachable through admission in a real cluster: the
+	// schema rejects it first. Kept for direct-call unit tests and clusters
+	// running a stale CRD, like the duplicate-name check in validatePodPoolSpec.
+	if hasOpportunistic && (s.Max != nil || s.Target != nil) {
+		allErrs = append(allErrs, field.Invalid(fp, fmt.Sprintf("min=%v max=%v target=%v opportunistic=%v",
+			s.Min, s.Max, s.Target, s.Opportunistic),
+			"opportunistic is itself the ceiling; it cannot be combined with max or target"))
+	}
+
+	// Duplicates the XValidation rule "!has(self.min) || !has(self.max) ||
+	// self.min <= self.max" (podpool_types.go). Same unreachability and same
+	// reason to keep it as the opportunistic check above.
+	if s.Min != nil && s.Max != nil && *s.Min > *s.Max {
+		allErrs = append(allErrs, field.Invalid(fp, fmt.Sprintf("min=%v max=%v",
+			s.Min, s.Max),
+			"min must not exceed max"))
+	}
+
+	return allErrs
+}
+
 func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoolsv1alpha1.PodPool) (admission.Warnings, error) {
 	logf.FromContext(ctx).Info("Validation for PodPool upon creation", "name", obj.GetName())
+
+	allErrs := validatePodPoolSpec(obj)
+	if len(allErrs) > 0 {
+		return nil, allErrs.ToAggregate()
+	}
 
 	return nil, nil
 }
 
 func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *podpoolsv1alpha1.PodPool, newObj *podpoolsv1alpha1.PodPool) (admission.Warnings, error) {
 	logf.FromContext(ctx).Info("Validation for PodPool upon update", "name", newObj.GetName())
+
+	allErrs := validatePodPoolSpec(newObj)
+
+	// The workload kind is immutable, and this is the only place that can say
+	// so: a single object is never invalid for it, so no per-field rule and no
+	// CEL expression over `self` can see the violation. Changing the kind
+	// orphans every child of the old kind, which the controller's sweep does
+	// handle — but it does so by deleting running workloads, and an operator
+	// who edited one line of a template deserves to be told rather than
+	// obeyed.
+	oldGVK, oldErr := workload.ExtractGVK(oldObj.Spec.WorkloadTemplate.Raw)
+
+	newGVK, newErr := workload.ExtractGVK(newObj.Spec.WorkloadTemplate.Raw)
+	if oldErr == nil && newErr == nil && oldGVK != newGVK {
+		allErrs = append(allErrs, field.Invalid(
+			field.NewPath("spec", "workloadTemplate"),
+			newGVK.String(),
+			fmt.Sprintf("workload GVK is immutable (was %s)", oldGVK.String()),
+		))
+	}
+
+	if len(allErrs) > 0 {
+		return nil, allErrs.ToAggregate()
+	}
 
 	return nil, nil
 }

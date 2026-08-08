@@ -2,9 +2,11 @@ package v1alpha1
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
@@ -24,6 +26,7 @@ const (
 	appsV1          = "apps/v1"
 	kindDeployment  = "Deployment"
 	imageNginx      = "nginx"
+	shapeEmpty      = "empty"
 )
 
 func validWorkloadTemplate() runtime.RawExtension {
@@ -43,6 +46,370 @@ func validWorkloadTemplate() runtime.RawExtension {
 	raw, _ := json.Marshal(tmpl)
 
 	return runtime.RawExtension{Raw: raw}
+}
+
+func opportunisticPtr() *bool {
+	b := true
+
+	return &b
+}
+
+func pctStr(pct int) *intstr.IntOrString {
+	v := intstr.FromString(fmt.Sprintf("%d%%", pct))
+
+	return &v
+}
+
+func TestValidateScaling(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		scaling podpoolsv1alpha1.ScalingConstraints
+		wantErr bool
+	}{
+		{name: "min only", scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)}},
+		{name: "min zero", scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)}},
+		{name: "min + target", scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctStr(70)}},
+		{name: "max + target", scaling: podpoolsv1alpha1.ScalingConstraints{Max: ptr.To[int32](5), Target: pctStr(30)}},
+		{name: "min + max", scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](1), Max: ptr.To[int32](5)}},
+		{name: shapeEmpty, scaling: podpoolsv1alpha1.ScalingConstraints{}},
+		{name: "max only", scaling: podpoolsv1alpha1.ScalingConstraints{Max: ptr.To[int32](5)}},
+		{name: "target only", scaling: podpoolsv1alpha1.ScalingConstraints{Target: pctStr(50)}},
+		{name: "min + max + target", scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Max: ptr.To[int32](10), Target: pctStr(30)}},
+		{
+			name:    "min > max",
+			scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](10), Max: ptr.To[int32](5)},
+			wantErr: true,
+		},
+		{
+			name:    "opportunistic + max",
+			scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Max: ptr.To[int32](5), Opportunistic: opportunisticPtr()},
+			wantErr: true,
+		},
+		{
+			name:    "opportunistic + target",
+			scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctStr(30), Opportunistic: opportunisticPtr()},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			errs := validateScaling(nil, &tt.scaling)
+			if tt.wantErr && len(errs) == 0 {
+				t.Error("expected validation error, got none")
+			}
+
+			if !tt.wantErr && len(errs) > 0 {
+				t.Errorf("unexpected validation errors: %v", errs)
+			}
+		})
+	}
+}
+
+func TestValidatePodPoolSpec(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		pool    podpoolsv1alpha1.PodPool
+		wantErr bool
+	}{
+		{
+			name: "valid single group",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					WorkloadTemplate: validWorkloadTemplate(),
+					Groups: []podpoolsv1alpha1.GroupSpec{
+						{
+							Name:    testGroupBase,
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "valid two groups",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					WorkloadTemplate: validWorkloadTemplate(),
+					Groups: []podpoolsv1alpha1.GroupSpec{
+						{
+							Name:    testGroupBase,
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+						},
+						{
+							Name: testGroupBurst,
+							Scaling: podpoolsv1alpha1.ScalingConstraints{
+								Min:    ptr.To[int32](0),
+								Target: pctStr(70),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "no groups",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					WorkloadTemplate: validWorkloadTemplate(),
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "duplicate group names",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					WorkloadTemplate: validWorkloadTemplate(),
+					Groups: []podpoolsv1alpha1.GroupSpec{
+						{
+							Name:    testGroupBase,
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+						},
+						{
+							Name:    testGroupBase,
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty workload template",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					Groups: []podpoolsv1alpha1.GroupSpec{
+						{
+							Name:    testGroupBase,
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "workload template missing kind",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					WorkloadTemplate: runtime.RawExtension{Raw: []byte(`{"apiVersion":"apps/v1","spec":{}}`)},
+					Groups: []podpoolsv1alpha1.GroupSpec{
+						{
+							Name:    testGroupBase,
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "workload template missing spec.template",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					WorkloadTemplate: runtime.RawExtension{Raw: []byte(`{"apiVersion":"apps/v1","kind":"Deployment","spec":{"replicas":1}}`)},
+					Groups: []podpoolsv1alpha1.GroupSpec{
+						{
+							Name:    testGroupBase,
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty group name",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					WorkloadTemplate: validWorkloadTemplate(),
+					Groups: []podpoolsv1alpha1.GroupSpec{
+						{
+							Name:    "",
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "single char name — too short for DNS label",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					WorkloadTemplate: validWorkloadTemplate(),
+					Groups: []podpoolsv1alpha1.GroupSpec{
+						{
+							Name:    "b",
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "uppercase name — invalid DNS label",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					WorkloadTemplate: validWorkloadTemplate(),
+					Groups: []podpoolsv1alpha1.GroupSpec{
+						{
+							Name:    "Base",
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid scaling in group — min > max",
+			pool: podpoolsv1alpha1.PodPool{
+				Spec: podpoolsv1alpha1.PodPoolSpec{
+					WorkloadTemplate: validWorkloadTemplate(),
+					Groups: []podpoolsv1alpha1.GroupSpec{
+						{
+							Name:    testGroupBase,
+							Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](10), Max: ptr.To[int32](5)},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			errs := validatePodPoolSpec(&tt.pool)
+			if tt.wantErr && len(errs) == 0 {
+				t.Error("expected validation error, got none")
+			}
+
+			if !tt.wantErr && len(errs) > 0 {
+				t.Errorf("unexpected validation errors: %v", errs)
+			}
+		})
+	}
+}
+
+func TestValidateCreateAndUpdate(t *testing.T) {
+	t.Parallel()
+
+	valid := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			WorkloadTemplate: validWorkloadTemplate(),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{
+					Name:    testGroupBase,
+					Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+				},
+			},
+		},
+	}
+
+	invalid := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{},
+	}
+
+	v := &PodPoolCustomValidator{}
+	ctx := t.Context()
+
+	if _, err := v.ValidateCreate(ctx, valid); err != nil {
+		t.Errorf("ValidateCreate rejected valid pool: %v", err)
+	}
+
+	if _, err := v.ValidateCreate(ctx, invalid); err == nil {
+		t.Error("ValidateCreate accepted invalid pool")
+	}
+
+	// Scaled rather than identical: #66 returns early on an unchanged spec, so
+	// passing the same object twice would assert nothing about validation.
+	scaled := valid.DeepCopy()
+	scaled.Spec.Replicas = valid.Spec.Replicas + 1
+
+	if _, err := v.ValidateUpdate(ctx, valid, scaled); err != nil {
+		t.Errorf("ValidateUpdate rejected valid pool: %v", err)
+	}
+
+	if _, err := v.ValidateUpdate(ctx, valid, invalid); err == nil {
+		t.Error("ValidateUpdate accepted invalid pool")
+	}
+
+	if _, err := v.ValidateDelete(ctx, valid); err != nil {
+		t.Errorf("ValidateDelete returned error: %v", err)
+	}
+}
+
+func TestValidateUpdateGVKImmutability(t *testing.T) {
+	t.Parallel()
+
+	deploymentPool := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			WorkloadTemplate: validWorkloadTemplate(),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{
+					Name:    testGroupBase,
+					Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+				},
+			},
+		},
+	}
+
+	rolloutTmpl := map[string]any{
+		fieldAPIVersion: "argoproj.io/v1alpha1",
+		fieldKind:       "Rollout",
+		fieldSpec: map[string]any{
+			fieldTemplate: map[string]any{
+				fieldSpec: map[string]any{
+					fieldContainers: []any{
+						map[string]any{fieldName: fieldApp, fieldImage: imageNginx + ":latest"},
+					},
+				},
+			},
+		},
+	}
+	rolloutBytes, _ := json.Marshal(rolloutTmpl)
+	rolloutPool := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			WorkloadTemplate: runtime.RawExtension{Raw: rolloutBytes},
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{
+					Name:    testGroupBase,
+					Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+				},
+			},
+		},
+	}
+
+	v := &PodPoolCustomValidator{}
+	ctx := t.Context()
+
+	_, err := v.ValidateUpdate(ctx, deploymentPool, rolloutPool)
+	if err == nil {
+		t.Error("ValidateUpdate should reject GVK change from Deployment to Rollout")
+	}
+
+	// The unchanged-GVK case has to reach the immutability check to prove
+	// anything, so the spec must move in some other way: #66 short-circuits an
+	// update whose spec is untouched.
+	scaledDeploymentPool := deploymentPool.DeepCopy()
+	scaledDeploymentPool.Spec.Replicas = deploymentPool.Spec.Replicas + 1
+
+	_, err = v.ValidateUpdate(ctx, deploymentPool, scaledDeploymentPool)
+	if err != nil {
+		t.Errorf("ValidateUpdate should accept same GVK: %v", err)
+	}
 }
 
 func TestDefaulter(t *testing.T) {
