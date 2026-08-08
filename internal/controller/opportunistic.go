@@ -340,6 +340,12 @@ func probeKey(pool *podpoolsv1alpha1.PodPool, groupName string) string {
 // follows: a group standing at its target has nothing to explain, and a group
 // short of it does. A converged pool therefore issues no extra reads at all.
 //
+// The gate is deliberately against the child's .spec.replicas (what we last
+// wrote), never .status.replicas. During a scale-up the ReplicaSet lags, so
+// status.replicas still reports the old count while readyReplicas has caught up
+// to it; read that way, every scale-up looks like a successful probe and the
+// group grows by one replica every reconcile, without end.
+//
 // The four states it can find are materially different and only one of them,
 // genuine absence, is the cold start that phase 3 answers with the whole
 // remainder. A read that failed is returned as an error so the caller can
@@ -383,8 +389,8 @@ func (r *PodPoolReconciler) childCounts(
 		return opportunisticObservation{foreign: true}, nil
 	}
 
-	replicas, _ := workload.ReadInt32(child, "status", "replicas")
-	ready, _ := workload.ReadInt32(child, "status", "readyReplicas")
+	specReplicas, _ := workload.ReadInt32(child, "spec", "replicas")
+	readyReplicas, _ := workload.ReadInt32(child, "status", "readyReplicas")
 
-	return opportunisticObservation{found: true, asked: replicas, ready: ready}, nil
+	return opportunisticObservation{found: true, asked: specReplicas, ready: readyReplicas}, nil
 }
