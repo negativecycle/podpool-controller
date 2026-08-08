@@ -183,7 +183,15 @@ func (r *PodPoolReconciler) countUnschedulable(
 // entered as zero. Absence means "never sized" and phase 3 answers it with the
 // whole remainder; zero means "sized, and nothing fits". Collapsing the two
 // would turn every cold start into a group that never grows.
-func capacityFrom(observed map[string]opportunisticObservation) map[string]int32 {
+//
+// The other subtlety is the outstanding probe: until it is Ready it must not
+// count as capacity, even though it is also not (yet) refused. Counting an
+// unjudged probe would raise this group's target and shrink the next group's
+// before anything was proven: the speculative burst-pod kill this design
+// exists to prevent.
+func (r *PodPoolReconciler) capacityFrom(
+	pool *podpoolsv1alpha1.PodPool, observed map[string]opportunisticObservation,
+) map[string]int32 {
 	var out map[string]int32
 
 	for name, obs := range observed {
@@ -205,7 +213,14 @@ func capacityFrom(observed map[string]opportunisticObservation) map[string]int32
 			continue // no child yet → absent from the map → cold start
 		}
 
-		capacity := max(obs.asked-obs.unschedulable, 0)
+		capacity := obs.asked - obs.unschedulable
+		if r.probeOutstanding(pool, name) && obs.ready < obs.asked && obs.unschedulable == 0 {
+			capacity = obs.asked - 1
+		}
+
+		if capacity < 0 {
+			capacity = 0
+		}
 
 		if out == nil {
 			out = make(map[string]int32, len(observed))

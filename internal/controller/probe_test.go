@@ -115,6 +115,37 @@ func TestDecideProbeRequiresSettledState(t *testing.T) {
 	}
 }
 
+// An unjudged probe must not count as capacity. If it did, the distribution
+// would hand its replica to this group and take one from the next — the
+// speculative burst-pod kill the design exists to prevent.
+func TestCapacityFromHoldsUnjudgedProbe(t *testing.T) {
+	r := &PodPoolReconciler{Clock: clocktesting.NewFakePassiveClock(probeTestBase)}
+	pool := probePool()
+
+	// Arrange an outstanding probe.
+	settled := opportunisticObservation{found: true, asked: 4, ready: 4}
+	if d := r.decideProbe(pool, testGroupScav, 4, settled, probeTestBase); d.target != 5 {
+		t.Fatalf("setup: expected a probe to issue")
+	}
+
+	obs := map[string]opportunisticObservation{
+		testGroupScav: {found: true, asked: 5, ready: 4}, // probe pending, unjudged
+	}
+
+	capacity := r.capacityFrom(pool, obs)
+	if capacity[testGroupScav] != 4 {
+		t.Fatalf("capacity=%d, want 4 — an unjudged probe is not capacity", capacity[testGroupScav])
+	}
+
+	// Once ready, it is.
+	obs[testGroupScav] = opportunisticObservation{found: true, asked: 5, ready: 5}
+
+	capacity = r.capacityFrom(pool, obs)
+	if capacity[testGroupScav] != 5 {
+		t.Fatalf("capacity=%d, want 5 — a running probe is proven capacity", capacity[testGroupScav])
+	}
+}
+
 // The probe rides outside the distribution: while one is outstanding, every
 // other group's target is exactly what it would be with no probe at all.
 func TestProbeDoesNotFundItselfFromOtherGroups(t *testing.T) {

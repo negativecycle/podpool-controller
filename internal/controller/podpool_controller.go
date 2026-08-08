@@ -227,7 +227,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		return ctrl.Result{}, fmt.Errorf("observing opportunistic capacity: %w", err)
 	}
 
-	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups, capacityFrom(observed))
+	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups, r.capacityFrom(&pool, observed))
 
 	now := r.Clock.Now()
 
