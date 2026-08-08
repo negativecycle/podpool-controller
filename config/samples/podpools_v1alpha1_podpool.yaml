@@ -6,4 +6,33 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: podpool-sample
 spec:
-  # TODO(user): Add fields here
+  replicas: 5
+  workloadTemplate:
+    apiVersion: apps/v1
+    kind: Deployment
+    spec:
+      template:
+        spec:
+          containers:
+          - name: app
+            image: nginx:latest
+  groups:
+  - name: base
+    scaling:
+      min: 3
+    overrides:
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              node-type: on-demand
+  - name: burst
+    scaling:
+      min: 0
+      target: "70%"
+    overrides:
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              node-type: spot
