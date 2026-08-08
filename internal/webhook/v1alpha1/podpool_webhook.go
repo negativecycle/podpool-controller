@@ -515,6 +515,51 @@ func validateRenderedChildren(pp *podpoolsv1alpha1.PodPool) renderedChildResult 
 	return result
 }
 
+func downgradePreExisting(oldResult, newResult renderedChildResult) (field.ErrorList, admission.Warnings) {
+	var (
+		errs     field.ErrorList
+		warnings admission.Warnings
+	)
+
+	oldGlobalSet := make(map[string]bool)
+	for _, e := range oldResult.globalErrs {
+		oldGlobalSet[e.Field+"|"+e.Detail] = true
+	}
+
+	for _, e := range newResult.globalErrs {
+		if oldGlobalSet[e.Field+"|"+e.Detail] {
+			warnings = append(warnings, "pre-existing: "+e.Detail)
+		} else {
+			errs = append(errs, e)
+		}
+	}
+
+	for groupName, newGroupErrs := range newResult.groupErrs {
+		oldGroupErrs := oldResult.groupErrs[groupName]
+		if len(oldGroupErrs) == 0 {
+			errs = append(errs, newGroupErrs...)
+
+			continue
+		}
+
+		oldDetailSet := make(map[string]bool)
+		for _, e := range oldGroupErrs {
+			oldDetailSet[e.Type.String()+"|"+e.Detail] = true
+		}
+
+		for _, e := range newGroupErrs {
+			if oldDetailSet[e.Type.String()+"|"+e.Detail] {
+				warnings = append(warnings, fmt.Sprintf(
+					"pre-existing issue in group %q: %s", groupName, e.Detail))
+			} else {
+				errs = append(errs, e)
+			}
+		}
+	}
+
+	return errs, warnings
+}
+
 func warnOnGroupRemoval(oldPP, newPP *podpoolsv1alpha1.PodPool) admission.Warnings {
 	newNames := make(map[string]bool)
 	for _, g := range newPP.Spec.Groups {
@@ -608,11 +653,30 @@ func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *pod
 		))
 	}
 
+	newRCResult := validateRenderedChildren(newObj)
+
+	var renderWarnings admission.Warnings
+
+	// A stricter rule must not brick a stored object. Compare the new pool's
+	// render errors against the same pool's before this edit: a violation it
+	// already had becomes a warning, one this edit introduces stays an error.
+	// Without it, shipping any new render check makes every existing pool that
+	// trips it unpatchable — including by the patch that would fix it.
+	if newRenderErrs := newRCResult.allErrors(); len(newRenderErrs) > 0 {
+		oldRCResult := validateRenderedChildren(oldObj)
+		remaining, downgraded := downgradePreExisting(oldRCResult, newRCResult)
+		allErrs = append(allErrs, remaining...)
+		renderWarnings = append(renderWarnings, downgraded...)
+	}
+
+	renderWarnings = append(renderWarnings, newRCResult.warnings...)
+
 	if len(allErrs) > 0 {
 		return nil, allErrs.ToAggregate()
 	}
 
-	warnings := warnOnGroupRemoval(oldObj, newObj)
+	warnings := renderWarnings
+	warnings = append(warnings, warnOnGroupRemoval(oldObj, newObj)...)
 	warnings = append(warnings, warnOnFullyCappedPool(newObj)...)
 	warnings = append(warnings, warnOnUnreadableTarget(newObj)...)
 	warnings = append(warnings, warnPoolNameUpdate(newObj)...)

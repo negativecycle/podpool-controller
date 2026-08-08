@@ -1249,3 +1249,73 @@ func TestControllerOwnedPathOverrides(t *testing.T) {
 		})
 	}
 }
+
+func TestPreExistingBrokenPoolUpdate(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	v := &PodPoolCustomValidator{}
+
+	brokenOverride, _ := json.Marshal(map[string]any{
+		fieldSpec: map[string]any{fieldSelector: map[string]any{fieldMatchLabels: map[string]any{fieldApp: valueMine}}},
+	})
+
+	oldPool := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         3,
+			WorkloadTemplate: validWorkloadTemplate(),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{
+					Name:      testGroupBase,
+					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+					Overrides: &runtime.RawExtension{Raw: brokenOverride},
+				},
+			},
+		},
+	}
+
+	t.Run("same broken override on update is downgraded to warning", func(t *testing.T) {
+		t.Parallel()
+
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.Replicas = 5
+
+		warnings, err := v.ValidateUpdate(ctx, oldPool, newPool)
+		if err != nil {
+			t.Fatalf("pre-existing broken override must not block updates: %v", err)
+		}
+
+		hasPreExisting := false
+
+		for _, w := range warnings {
+			if strings.Contains(w, "pre-existing") {
+				hasPreExisting = true
+
+				break
+			}
+		}
+
+		if !hasPreExisting {
+			t.Errorf("expected a pre-existing warning, got: %v", warnings)
+		}
+	})
+
+	t.Run("new failure on update is still rejected", func(t *testing.T) {
+		t.Parallel()
+
+		newBrokenOverride, _ := json.Marshal(map[string]any{
+			fieldSpec: map[string]any{
+				fieldSelector: map[string]any{fieldMatchLabels: map[string]any{fieldApp: valueMine}},
+				"replicas":    5,
+			},
+		})
+
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.Groups[0].Overrides = &runtime.RawExtension{Raw: newBrokenOverride}
+
+		_, err := v.ValidateUpdate(ctx, oldPool, newPool)
+		if err == nil {
+			t.Error("a newly introduced failure must still be rejected")
+		}
+	})
+}
