@@ -1,17 +1,14 @@
 package v1alpha1
 
 import (
-	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
 	authzv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-
-	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 // #64: pluralResource consulted a hardcoded Kind-to-plural map before asking
@@ -28,9 +25,6 @@ const (
 	crdVersion    = "v1"
 	crdPlural     = "deploys" // deliberately NOT the kubebuilder default
 	appsPluralDep = "deployments"
-
-	// wantNotAuthorized is the substring every denial-by-SAR case looks for.
-	wantNotAuthorized = "not authorized"
 )
 
 // crdMapper knows example.com/v1 Kind=Deployment as plural "deploys", the
@@ -158,32 +152,6 @@ func TestPluralResource(t *testing.T) {
 // TestSARNamesTheResourceBeingCreated reads what the guard actually asked the
 // authorizer. Resolution can be wrong while the admission outcome looks
 // perfectly reasonable, so the outcome alone cannot catch this.
-func templateForKind(apiVersion, kind string) runtime.RawExtension {
-	tmpl := map[string]any{
-		fieldAPIVersion: apiVersion,
-		fieldKind:       kind,
-		fieldSpec: map[string]any{
-			fieldTemplate: map[string]any{
-				fieldSpec: map[string]any{
-					fieldContainers: []any{
-						map[string]any{fieldName: fieldApp, fieldImage: imageNginx + ":latest"},
-					},
-				},
-			},
-		},
-	}
-	raw, _ := json.Marshal(tmpl)
-
-	return runtime.RawExtension{Raw: raw}
-}
-
-func poolWithTemplate(tmpl runtime.RawExtension) *podpoolsv1alpha1.PodPool {
-	pp := sarPool()
-	pp.Spec.WorkloadTemplate = tmpl
-
-	return pp
-}
-
 func TestSARNamesTheResourceBeingCreated(t *testing.T) {
 	t.Parallel()
 
@@ -238,5 +206,49 @@ func TestSARDoesNotAcceptAnAppsGrantForACRDWorkload(t *testing.T) {
 
 	if !strings.Contains(err.Error(), wantNotAuthorized) {
 		t.Errorf("rejection = %v, want it to name the authorization failure", err)
+	}
+}
+
+// A SubjectAccessReview that cannot be issued is a cluster problem, not
+// something the user put in spec.workloadTemplate. Both still deny; only the
+// diagnosis differs, and nothing else asserts which one we chose.
+//
+// The distinction is only visible before ToAggregate flattens the ErrorList,
+// so this calls the guard directly.
+func TestBrokenAuthorizationCheckIsInternalNotForbidden(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{
+		Client: (&sarProbe{err: errors.New("API server unreachable")}).client(),
+	}
+
+	gvk := schema.GroupVersionKind{Group: groupApps, Version: "v1", Kind: kindDeployment}
+
+	fieldErr := v.checkWorkloadAuthorization(sarAdmissionCtx(), sarPool(), gvk, "")
+	if fieldErr == nil {
+		t.Fatal("a failed authorization check must still deny")
+	}
+
+	if fieldErr.Type != field.ErrorTypeInternal {
+		t.Errorf("error type is %v, want %v: an unreachable authorizer is not the "+
+			"user's field being invalid", fieldErr.Type, field.ErrorTypeInternal)
+	}
+}
+
+// The denial itself stays Forbidden. That one really is about the requester.
+func TestAuthorizationDenialStaysForbidden(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{Client: (&sarProbe{allowed: false}).client()}
+
+	gvk := schema.GroupVersionKind{Group: groupApps, Version: "v1", Kind: kindDeployment}
+
+	fieldErr := v.checkWorkloadAuthorization(sarAdmissionCtx(), sarPool(), gvk, "")
+	if fieldErr == nil {
+		t.Fatal("a denied review must reject")
+	}
+
+	if fieldErr.Type != field.ErrorTypeForbidden {
+		t.Errorf("error type is %v, want %v", fieldErr.Type, field.ErrorTypeForbidden)
 	}
 }

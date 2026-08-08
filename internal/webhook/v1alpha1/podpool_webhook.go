@@ -671,6 +671,24 @@ func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *pod
 		))
 	}
 
+	// The create-time SAR only ever vouched for the GVK admitted then. It
+	// carries forward to an update exactly when the stored GVK is readable and
+	// the new one is identical, which is precisely when the immutability check
+	// above is able to speak. Whenever it cannot, re-authorize.
+	//
+	// Stating the invariant rather than testing for `oldErr != nil` matters:
+	// the authorization must not quietly disappear if the immutability check is
+	// ever relaxed. Costs no round-trip on the overwhelming majority of
+	// updates, where the GVK is unchanged.
+	gvkVouchedFor := oldErr == nil && newErr == nil && oldGVK == newGVK
+	if !gvkVouchedFor && newErr == nil {
+		const reason = "the stored workloadTemplate could not be read, so the " +
+			"workload type must be re-authorized: "
+		if authErr := v.checkWorkloadAuthorization(ctx, newObj, newGVK, reason); authErr != nil {
+			allErrs = append(allErrs, authErr)
+		}
+	}
+
 	newRCResult := validateRenderedChildren(newObj)
 
 	var renderWarnings admission.Warnings
@@ -822,13 +840,20 @@ func (v *PodPoolCustomValidator) checkWorkloadAuthorization(
 		},
 	}
 
-	// A check that cannot be made is a check that failed. Failing open here
-	// would reintroduce the escalation path this guard exists to close, and
-	// would do it silently.
+	// Forbidden would blame spec.workloadTemplate for what is a cluster
+	// misconfiguration: the user wrote nothing wrong, we could not ask the
+	// question. InternalError reads as "Internal error occurred: ...", which is
+	// true, and still denies.
+	//
+	// Only the classification moves. ValidateCreate/ValidateUpdate return an
+	// aggregate, which is not an APIStatus, so controller-runtime denies with
+	// the message either way: same decision, same response shape, better
+	// diagnosis. Failing open here would reintroduce the escalation path the
+	// guard exists to close, and would do it silently.
 	if err := v.Client.Create(ctx, sar); err != nil {
-		return field.Forbidden(
+		return field.InternalError(
 			field.NewPath("spec", "workloadTemplate"),
-			fmt.Sprintf("authorization check failed for %s: %v", gvk.Kind, err))
+			fmt.Errorf("authorization check failed for %s: %w", gvk.Kind, err))
 	}
 
 	if !sar.Status.Allowed {
