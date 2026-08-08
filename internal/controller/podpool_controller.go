@@ -120,6 +120,12 @@ type PodPoolReconciler struct {
 	watchPendingSince map[schema.GroupVersionKind]time.Time
 	watchMu           sync.Mutex
 
+	// Probe bookkeeping for opportunistic groups. In-memory by design (see
+	// probeState) and guarded because Reconcile runs concurrently across
+	// pools.
+	probes  map[string]probeState
+	probeMu sync.Mutex
+
 	// Which groups have already been reported as publishing a count we could
 	// not represent. Keyed per group, not per GVK: a child reporting nonsense
 	// is a property of that object, not of its kind, so gating on the kind
@@ -147,6 +153,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		// and this pass, and there is nothing to do. Returning the error
 		// instead would requeue a name that will never resolve again.
 		if apierrors.IsNotFound(err) {
+			r.forgetProbes(req.Namespace, req.Name)
+
 			return ctrl.Result{}, nil
 		}
 
@@ -207,8 +215,16 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		return res, err
 	}
 
-	// The capacity map stays empty until the controller learns to observe it.
-	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups, nil)
+	observed := r.observeOpportunistic(ctx, &pool, gvk)
+
+	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups, capacityFrom(observed))
+
+	now := r.Clock.Now()
+
+	// The probe rides on top of the distribution rather than inside it, so the
+	// extra replica is funded by nobody: the pool briefly runs one over
+	// spec.replicas and the surplus is the question itself.
+	finalTargets, probePending := r.applyProbes(ctx, &pool, result.Targets, observed, now)
 
 	// Groups are reconciled independently: one that cannot be built or
 	// applied must not stop the others. Failures are collected and returned
@@ -228,7 +244,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	groupStatuses := make([]podpoolsv1alpha1.GroupStatus, 0, len(pool.Spec.Groups))
 
 	for i, group := range pool.Spec.Groups {
-		grResult, err := r.reconcileGroup(ctx, &pool, tmpl, gvk, group, result.Targets[i])
+		grResult, err := r.reconcileGroup(ctx, &pool, tmpl, gvk, group, finalTargets[i])
 		if err != nil {
 			errs = append(errs, fmt.Errorf("group %s: %w", group.Name, err))
 			failedGroups = append(failedGroups, group.Name)
@@ -257,14 +273,14 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 					Name:           group.Name,
 					Ready:          false,
 					Reason:         reason,
-					TargetReplicas: result.Targets[i],
+					TargetReplicas: finalTargets[i],
 				})
 			}
 
 			continue
 		}
 
-		grResult.status.TargetReplicas = result.Targets[i]
+		grResult.status.TargetReplicas = finalTargets[i]
 
 		// The counts have already been clamped into something the API can
 		// store, so the pool is safe. Say so anyway: otherwise the operator
@@ -284,8 +300,6 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	if sweepErrs := r.sweepAllOrphans(ctx, before, &pool, gvk, reconciledGroups); len(sweepErrs) > 0 {
 		errs = append(errs, sweepErrs...)
 	}
-
-	now := r.Clock.Now()
 
 	// Stamp progress timestamps on freshly reconciled groups only. Failed
 	// groups keep their previous status, including timestamps, from the
@@ -348,11 +362,22 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		notOwnedGroups: notOwnedGroups,
 	})
 
+	if err := kerrors.NewAggregate(errs); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// An outstanding probe is the one thing that cannot wait for the ordinary
+	// requeue: the pool is holding a replica the scheduler has not ruled on,
+	// and every other group is sized as though it does not exist.
+	if probePending {
+		return ctrl.Result{RequeueAfter: probeVerdictRequeue}, nil
+	}
+
 	// A deadline needs something to wake the pool, and a wedged pool is
 	// precisely the one that goes silent: ready < desired is byte-identical
 	// for a rollout four seconds old and a pool stuck forever, so only a
 	// requeue can turn elapsed time into a verdict.
-	return ctrl.Result{RequeueAfter: deadlineAwareRequeue(&pool, groupStatuses, now)}, kerrors.NewAggregate(errs)
+	return ctrl.Result{RequeueAfter: deadlineAwareRequeue(&pool, groupStatuses, now)}, nil
 }
 
 // watchSyncRequeue is how soon to look again while an informer is filling its
@@ -924,7 +949,7 @@ func staleWorkloadGVKs(prev []podpoolsv1alpha1.GroupStatus, current schema.Group
 // The stored values are already clamped and safe; this exists so the clamp
 // does not launder the corruption into silence.
 func (r *PodPoolReconciler) reportOutOfRange(ctx context.Context, pool *podpoolsv1alpha1.PodPool, groupName string, outOfRange bool) {
-	key := pool.Namespace + "/" + pool.Name + "/" + groupName
+	key := probeKey(pool, groupName)
 
 	r.outOfRangeMu.Lock()
 	defer r.outOfRangeMu.Unlock()
@@ -1005,6 +1030,38 @@ func (r *PodPoolReconciler) handleWatchFailure(
 		logf.FromContext(ctx).Error(err, "Failed to set up watch for workload kind",
 			"podpool", klog.KObj(pool), "gvk", gvk, "reason", ReasonWatchSetupFailed)
 	}
+}
+
+// applyProbes layers the +1 probe on top of the distribution for any
+// opportunistic groups that are due a heartbeat.
+func (r *PodPoolReconciler) applyProbes(
+	ctx context.Context,
+	pool *podpoolsv1alpha1.PodPool,
+	targets []int32,
+	observed map[string]opportunisticObservation,
+	now time.Time,
+) ([]int32, bool) {
+	finalTargets := make([]int32, len(targets))
+	copy(finalTargets, targets)
+
+	var probePending bool
+
+	for i, group := range pool.Spec.Groups {
+		if !workload.IsOpportunistic(group.Scaling) {
+			continue
+		}
+
+		d := r.decideProbe(pool, group.Name, targets[i], observed[group.Name], now)
+		if d.issued {
+			logf.FromContext(ctx).Info("Probing group for one replica beyond its observed capacity",
+				"group", group.Name)
+		}
+
+		finalTargets[i] = d.target
+		probePending = probePending || d.awaitVerdict
+	}
+
+	return finalTargets, probePending
 }
 
 // applyChild writes the rendered child with server-side apply.

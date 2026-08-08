@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/clock"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -91,6 +92,22 @@ func pctTarget(pct int32) *intstr.IntOrString {
 	v := intstr.FromString(fmt.Sprintf("%d%%", pct))
 
 	return &v
+}
+
+func opportunistic() *bool {
+	b := true
+
+	return &b
+}
+
+// threeTierSpec is the target configuration: a reliable tier with a declared
+// share, an opportunistic tier sized by real capacity, and an unbounded overflow.
+func threeTierSpec() []podpoolsv1alpha1.GroupSpec {
+	return []podpoolsv1alpha1.GroupSpec{
+		{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3), Target: pctTarget(35)}},
+		{Name: testGroupScav, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Opportunistic: opportunistic()}},
+		{Name: testGroupBurst, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)}},
+	}
 }
 
 func getPool(t *testing.T, cl client.Client, pool *podpoolsv1alpha1.PodPool) *podpoolsv1alpha1.PodPool {

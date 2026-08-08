@@ -28,6 +28,8 @@ const (
 	testImageNginx = "nginx:latest"
 	testGroupBase  = "base"
 	testGroupSpot  = "spot"
+	testGroupScav  = "scavenger"
+	testGroupBurst = "burst"
 	testNamespace  = "default"
 	testAppsV1     = "apps/v1"
 	testAppsGroup  = "apps"
