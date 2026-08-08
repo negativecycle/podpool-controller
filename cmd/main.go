@@ -17,9 +17,12 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -36,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -57,6 +61,53 @@ func init() {
 
 	utilruntime.Must(podpoolsv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
+}
+
+// ----------------------------------------------------------------------------
+// cacheSyncLatch
+// ----------------------------------------------------------------------------
+
+type cacheSyncer interface {
+	WaitForCacheSync(ctx context.Context) bool
+}
+
+// cacheSyncLatch closes readyCh once the manager's caches have completed their
+// initial sync, and never re-opens it.
+//
+// One-shot on purpose. Cache.WaitForCacheSync waits on every registered
+// informer, and ensureWatch registers one per workloadTemplate GVK at runtime,
+// so a live check would let a PodPool naming an uninstalled GVK fail readiness
+// on every replica and pull the whole fleet out of the webhook Service.
+type cacheSyncLatch struct {
+	cache   cacheSyncer
+	readyCh chan struct{}
+}
+
+var _ manager.LeaderElectionRunnable = (*cacheSyncLatch)(nil)
+
+func (l *cacheSyncLatch) Start(ctx context.Context) error {
+	if !l.cache.WaitForCacheSync(ctx) {
+		return errors.New("failed to wait for caches to sync")
+	}
+
+	close(l.readyCh)
+
+	return nil
+}
+
+// NeedLeaderElection returns false because the webhook server serves on every
+// replica regardless of leadership (config/webhook/service.yaml selects all
+// pods with control-plane=controller-manager). A standby that never becomes
+// ready is a standby the Service never routes to.
+func (l *cacheSyncLatch) NeedLeaderElection() bool { return false }
+
+func (l *cacheSyncLatch) Checker(_ *http.Request) error {
+	select {
+	case <-l.readyCh:
+		return nil
+	default:
+		return errors.New("informer caches have not completed their initial sync")
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -295,14 +346,30 @@ func main() {
 	}
 	// +kubebuilder:scaffold:builder
 
+	// Liveness: always healthy once the process is running. Must NOT gate on
+	// cache sync or the API server: an apiserver blip would restart every
+	// operator pod simultaneously.
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "Failed to set up health check")
 		os.Exit(1)
 	}
 
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "Failed to set up ready check")
+	latch := &cacheSyncLatch{cache: mgr.GetCache(), readyCh: make(chan struct{})}
+	if err := mgr.Add(latch); err != nil {
+		setupLog.Error(err, "Failed to add cache sync latch")
 		os.Exit(1)
+	}
+
+	if err := mgr.AddReadyzCheck("cache-sync", latch.Checker); err != nil {
+		setupLog.Error(err, "Failed to set up cache sync readiness check")
+		os.Exit(1)
+	}
+
+	if o.enableWebhooks {
+		if err := mgr.AddReadyzCheck("webhook", webhookServer.StartedChecker()); err != nil {
+			setupLog.Error(err, "Failed to set up webhook readiness check")
+			os.Exit(1)
+		}
 	}
 
 	setupLog.Info("Starting manager")
