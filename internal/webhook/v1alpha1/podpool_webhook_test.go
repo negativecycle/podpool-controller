@@ -31,6 +31,10 @@ const (
 	kindDeployment     = "Deployment"
 	imageNginx         = "nginx"
 	shapeEmpty         = "empty"
+	fieldSelector      = "selector"
+	fieldMatchLabels   = "matchLabels"
+	fieldMetadata      = "metadata"
+	valueMine          = "mine"
 )
 
 func validWorkloadTemplate() runtime.RawExtension {
@@ -1159,5 +1163,89 @@ func TestPodPoolAsTemplate(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "PodPool") {
 		t.Errorf("rejection should mention PodPool: %v", err)
+	}
+}
+
+func TestControllerOwnedPathOverrides(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	v := &PodPoolCustomValidator{}
+
+	poolWith := func(overrides map[string]any) *podpoolsv1alpha1.PodPool {
+		raw, _ := json.Marshal(overrides)
+
+		return &podpoolsv1alpha1.PodPool{
+			Spec: podpoolsv1alpha1.PodPoolSpec{
+				Replicas:         3,
+				WorkloadTemplate: validWorkloadTemplate(),
+				Groups: []podpoolsv1alpha1.GroupSpec{
+					{
+						Name:      testGroupBase,
+						Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+						Overrides: &runtime.RawExtension{Raw: raw},
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		overrides map[string]any
+		wantErr   bool
+	}{
+		{
+			name:      "spec.selector.matchLabels is controller-owned",
+			overrides: map[string]any{fieldSpec: map[string]any{fieldSelector: map[string]any{fieldMatchLabels: map[string]any{fieldApp: valueMine}}}},
+			wantErr:   true,
+		},
+		{
+			name:      "spec.selector.matchExpressions passes through",
+			overrides: map[string]any{fieldSpec: map[string]any{fieldSelector: map[string]any{"matchExpressions": []any{map[string]any{"key": "env", "operator": "In", "values": []any{"prod"}}}}}},
+		},
+		{
+			name:      "spec.replicas is controller-owned",
+			overrides: map[string]any{fieldSpec: map[string]any{"replicas": 5}},
+			wantErr:   true,
+		},
+		{
+			name:      "metadata.name is controller-owned",
+			overrides: map[string]any{fieldMetadata: map[string]any{fieldName: "my-name"}},
+			wantErr:   true,
+		},
+		{
+			name:      "metadata.ownerReferences is controller-owned",
+			overrides: map[string]any{fieldMetadata: map[string]any{"ownerReferences": []any{map[string]any{fieldName: "other"}}}},
+			wantErr:   true,
+		},
+		{
+			name:      "podpools.dev/* labels are controller-owned",
+			overrides: map[string]any{fieldMetadata: map[string]any{"labels": map[string]any{"podpools.dev/custom": valueMine}}},
+			wantErr:   true,
+		},
+		{
+			name:      "non-podpools labels are fine",
+			overrides: map[string]any{fieldMetadata: map[string]any{"labels": map[string]any{"app.kubernetes.io/name": valueMine}}},
+		},
+		{
+			name:      "spec.minReadySeconds is fine",
+			overrides: map[string]any{fieldSpec: map[string]any{"minReadySeconds": 30}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := v.ValidateCreate(ctx, poolWith(tt.overrides))
+			if tt.wantErr && err == nil {
+				t.Error("expected rejection for controller-owned path override")
+			}
+
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected rejection: %v", err)
+			}
+		})
 	}
 }

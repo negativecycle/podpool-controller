@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -386,6 +387,57 @@ func (r renderedChildResult) allErrors() field.ErrorList {
 	return all
 }
 
+func checkControllerOwnedPaths(fp *field.Path, overrides []byte) field.ErrorList {
+	var allErrs field.ErrorList
+
+	var obj map[string]any
+	if err := json.Unmarshal(overrides, &obj); err != nil {
+		return nil
+	}
+
+	if spec, ok := obj["spec"].(map[string]any); ok {
+		if sel, ok := spec["selector"].(map[string]any); ok {
+			if _, ok := sel["matchLabels"]; ok {
+				allErrs = append(allErrs, field.Forbidden(
+					fp.Child("spec", "selector", "matchLabels"),
+					"overriding spec.selector.matchLabels has no effect: the controller overwrites it"))
+			}
+		}
+
+		if _, ok := spec["replicas"]; ok {
+			allErrs = append(allErrs, field.Forbidden(
+				fp.Child("spec", "replicas"),
+				"overriding spec.replicas has no effect: the controller sets it from the distribution"))
+		}
+	}
+
+	if md, ok := obj["metadata"].(map[string]any); ok {
+		if _, ok := md["name"]; ok {
+			allErrs = append(allErrs, field.Forbidden(
+				fp.Child("metadata", "name"),
+				"overriding metadata.name has no effect: the controller names children <pool>-<group>"))
+		}
+
+		if _, ok := md["ownerReferences"]; ok {
+			allErrs = append(allErrs, field.Forbidden(
+				fp.Child("metadata", "ownerReferences"),
+				"overriding ownerReferences has no effect: the controller sets the owner reference"))
+		}
+
+		if labels, ok := md["labels"].(map[string]any); ok {
+			for k := range labels {
+				if strings.HasPrefix(k, "podpools.dev/") {
+					allErrs = append(allErrs, field.Forbidden(
+						fp.Child("metadata", "labels").Key(k),
+						"overriding podpools.dev/* labels has no effect: the controller manages them"))
+				}
+			}
+		}
+	}
+
+	return allErrs
+}
+
 func validateRenderedChildren(pp *podpoolsv1alpha1.PodPool) renderedChildResult {
 	result := renderedChildResult{groupErrs: make(map[string]field.ErrorList)}
 
@@ -418,6 +470,10 @@ func validateRenderedChildren(pp *podpoolsv1alpha1.PodPool) renderedChildResult 
 		gp := groupsPath.Index(i)
 
 		var groupErrs field.ErrorList
+
+		if g.Overrides != nil && len(g.Overrides.Raw) > 0 {
+			groupErrs = append(groupErrs, checkControllerOwnedPaths(gp.Child("overrides"), g.Overrides.Raw)...)
+		}
 
 		replicas := int32(0)
 		if i < len(dist.Targets) {
