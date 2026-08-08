@@ -77,23 +77,41 @@ var (
 		Name: "podpool_status_condition",
 		Help: "Current status of a PodPool condition. 1 for the active status, 0 for the others. One series per (type, status) pair; all three statuses are written every pass to prevent stale series.",
 	}, condLabels)
+
+	// The three lists below are the whole point. Every gauge is reachable from
+	// one of them, registration and cleanup both iterate them, and a gauge
+	// added to a list therefore arrives with its own cleanup already written.
+	// A gauge added anywhere else is a series that survives the pool it
+	// describes, which is the failure this arrangement makes structurally
+	// unavailable rather than merely remembered.
+
+	// poolExactGauges carry exactly (namespace, name), so DeleteLabelValues
+	// reaches them.
+	poolExactGauges = []*prometheus.GaugeVec{specReplicas, statusReplicas, statusReadyReplicas, unplacedReplicas}
+
+	// poolPartialGauges carry labels beyond namespace+name. Nothing knows
+	// those label values once the pool is gone, so they need DeletePartialMatch.
+	poolPartialGauges = []*prometheus.GaugeVec{groupReplicas, groupReadyReplicas, groupSharePercent, groupLastProgress, statusCondition}
+
+	// groupGauges are the subset of poolPartialGauges keyed by group, which is
+	// the set a single departing group has to be removed from.
+	groupGauges = []*prometheus.GaugeVec{groupReplicas, groupReadyReplicas, groupSharePercent, groupLastProgress}
 )
 
 // Registering with controller-runtime's registry rather than a new one puts
 // these on the same /metrics endpoint the manager already serves, beside the
 // workqueue and client-go series an operator reads them next to.
 func init() {
-	metrics.Registry.MustRegister(
-		specReplicas,
-		statusReplicas,
-		statusReadyReplicas,
-		groupReplicas,
-		groupReadyReplicas,
-		groupSharePercent,
-		groupLastProgress,
-		unplacedReplicas,
-		statusCondition,
-	)
+	all := make([]prometheus.Collector, 0, len(poolExactGauges)+len(poolPartialGauges))
+	for _, g := range poolExactGauges {
+		all = append(all, g)
+	}
+
+	for _, g := range poolPartialGauges {
+		all = append(all, g)
+	}
+
+	metrics.Registry.MustRegister(all...)
 }
 
 // conditionStatuses is the closed set metav1.ConditionStatus can take, lowered
@@ -209,10 +227,47 @@ func deleteStaleGroupMetrics(namespace, name string, current, previous []string)
 
 	for _, n := range previous {
 		if !active[n] {
-			groupReplicas.DeleteLabelValues(namespace, name, n)
-			groupReadyReplicas.DeleteLabelValues(namespace, name, n)
-			groupSharePercent.DeleteLabelValues(namespace, name, n)
-			groupLastProgress.DeleteLabelValues(namespace, name, n)
+			for _, gauge := range groupGauges {
+				gauge.DeleteLabelValues(namespace, name, n)
+			}
+		}
+	}
+}
+
+// deleteStaleConditionMetrics drops the series for condition types the pool no
+// longer publishes.
+//
+// Symmetric with deleteStaleGroupMetrics, and needed for the same reason: a set
+// that shrinks needs the difference deleting, not merely skipping.
+// recordConditionMetrics writes all three statuses for every type it sees,
+// which keeps a live condition honest across a flip but does nothing when a
+// type disappears -- the loop simply stops visiting it and the last values it
+// wrote stay in the registry until the process restarts. Retiring a condition
+// type would otherwise make its metric stop updating rather than go away, which
+// is strictly worse than never having exported it.
+//
+// Deliberately more general than the retired-type list needs. A type on that
+// list is pruned before the gauges are recorded, so it never gets series at
+// all; this covers any type vanishing for any reason, including conditions
+// written by other actors, and the window between a retirement shipping and
+// anyone updating the list.
+//
+// DeletePartialMatch on (namespace, name, type) clears all three status series
+// in one call, where DeleteLabelValues would need the full four-label tuple
+// three times.
+func deleteStaleConditionMetrics(namespace, name string, current, previous []metav1.Condition) {
+	active := make(map[string]bool, len(current))
+	for _, c := range current {
+		active[c.Type] = true
+	}
+
+	for _, c := range previous {
+		if !active[c.Type] {
+			statusCondition.DeletePartialMatch(prometheus.Labels{
+				labelNamespace: namespace,
+				labelName:      name,
+				labelType:      c.Type,
+			})
 		}
 	}
 }

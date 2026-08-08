@@ -8,6 +8,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -193,4 +194,143 @@ func TestConditionMetricClearsPreviousStatusOnFlip(t *testing.T) {
 			"a stale 1 makes every `== 1` alert match two contradictory series",
 			conditionMetricName, got)
 	}
+}
+
+// Registry-driven on purpose: this test enumerates nothing itself, so it covers
+// gauge number ten the day it is added. Every other test in the package names
+// the gauges it checks, one way or another, and would keep passing while a new
+// one leaked.
+func TestEveryPodpoolSeriesIsRemovedOnPoolDelete(t *testing.T) {
+	const ns, name = "registry-sweep-ns", "registry-sweep-pool"
+
+	reconcileForMetrics(t, ns, name, nil)
+
+	before := podpoolSeriesFor(t, ns, name)
+	if len(before) == 0 {
+		t.Fatal("expected the reconcile to publish at least one podpool_ series")
+	}
+
+	t.Logf("populated %d series across %d families", countSeries(before), len(before))
+
+	deletePoolMetrics(ns, name)
+
+	if after := podpoolSeriesFor(t, ns, name); len(after) != 0 {
+		for family, n := range after {
+			t.Errorf("%s: %d series still carry namespace=%q name=%q after deletePoolMetrics",
+				family, n, ns, name)
+		}
+	}
+}
+
+// A condition type that leaves status must lose its series, not merely stop
+// being updated. recordConditionMetrics writes every type it *sees*, so a type
+// that disappears is simply never visited again and its last values stand.
+func TestRetiredConditionMetricIsRemoved(t *testing.T) {
+	const ns, name = "cond-metric-retire", "pool-retire"
+
+	t.Cleanup(func() { deletePoolMetrics(ns, name) })
+
+	pool := fakeTestPool()
+	pool.Namespace = ns
+	pool.Name = name
+	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+		Type:   "AncientCondition",
+		Status: metav1.ConditionTrue,
+		Reason: "LeftOverFromAnOlderVersion",
+	})
+
+	r, cl := newFakeReconciler(t, nil, pool)
+
+	// Pass one: the type is not retired yet, so it is carried and exported
+	// like any other condition on the object.
+	reconcilePool(t, r, pool)
+
+	if got := conditionSeries(t, ns, name)["AncientCondition/true"]; got != 1 {
+		t.Fatalf("%s{type=AncientCondition,status=true} = %v, want 1 before retirement",
+			conditionMetricName, got)
+	}
+
+	// Pass two: retired. setConditions prunes it from status, and the metric
+	// has to follow it out.
+	withRetiredType(t, "AncientCondition")
+	reconcilePool(t, r, getPool(t, cl, pool))
+
+	for _, status := range conditionStatuses {
+		key := "AncientCondition/" + status
+		if got, ok := conditionSeries(t, ns, name)[key]; ok {
+			t.Errorf("%s{type=AncientCondition,status=%s} = %v still present; a retired condition's "+
+				"metric froze instead of going away", conditionMetricName, status, got)
+		}
+	}
+}
+
+// podpoolSeriesFor counts, per metric family, the series carrying this pool's
+// namespace and name.
+func podpoolSeriesFor(t *testing.T, namespace, name string) map[string]int {
+	t.Helper()
+
+	families, err := crmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+
+	out := map[string]int{}
+
+	for _, fam := range families {
+		if !strings.HasPrefix(fam.GetName(), "podpool_") {
+			continue
+		}
+
+		for _, m := range fam.GetMetric() {
+			labels := labelMap(m)
+			if labels[labelNamespace] == namespace && labels[labelName] == name {
+				out[fam.GetName()]++
+			}
+		}
+	}
+
+	return out
+}
+
+// groupSeriesFor counts, per metric family, the series carrying this pool's
+// namespace, name and the given group.
+//
+// Deliberately gathered from the registry rather than from groupGauges. A test
+// that iterates the same list the code iterates cannot see a gauge dropped from
+// that list: the assertion shrinks with the implementation and stays green.
+// That is the very failure this milestone's slice discipline is meant to
+// prevent, so the check for it has to come from somewhere else.
+func groupSeriesFor(t *testing.T, namespace, name, group string) map[string]int {
+	t.Helper()
+
+	families, err := crmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+
+	out := map[string]int{}
+
+	for _, fam := range families {
+		if !strings.HasPrefix(fam.GetName(), "podpool_group_") {
+			continue
+		}
+
+		for _, m := range fam.GetMetric() {
+			labels := labelMap(m)
+			if labels[labelNamespace] == namespace && labels[labelName] == name && labels[labelGroup] == group {
+				out[fam.GetName()]++
+			}
+		}
+	}
+
+	return out
+}
+
+func countSeries(m map[string]int) int {
+	total := 0
+	for _, n := range m {
+		total += n
+	}
+
+	return total
 }

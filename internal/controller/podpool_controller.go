@@ -374,6 +374,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 
 	deleteStaleGroupMetrics(pool.Namespace, pool.Name,
 		groupNames(groupStatuses), groupNames(before.Status.Groups))
+	deleteStaleConditionMetrics(pool.Namespace, pool.Name,
+		pool.Status.Conditions, before.Status.Conditions)
 
 	metricGroups := make([]groupMetric, len(groupStatuses))
 

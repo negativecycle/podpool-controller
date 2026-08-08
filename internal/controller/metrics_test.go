@@ -14,22 +14,42 @@ import (
 // pass or fail depending on what the envtest manager had reconciled a moment
 // earlier.
 
-// poolGauges and groupGauges enumerate what deletePoolMetrics is responsible
-// for, by hand, because that is what the delete helper does too. Both lists are
-// maintained by remembering, which is the property the next commit removes.
-func poolGaugesUnderTest() []*prometheus.GaugeVec {
-	return []*prometheus.GaugeVec{specReplicas, statusReplicas, statusReadyReplicas, unplacedReplicas}
+type namedCollector struct {
+	name string
+	c    prometheus.Collector
 }
 
-func groupGaugesUnderTest() []*prometheus.GaugeVec {
-	return []*prometheus.GaugeVec{groupReplicas, groupReadyReplicas, groupSharePercent, groupLastProgress}
-}
+// allPoolMetrics enumerates every gauge deletePoolMetrics is responsible for by
+// reading the same lists deletePoolMetrics reads, not a fourth hand-maintained
+// copy. Gauge number ten is covered here the day it joins a list, and a gauge
+// that joins neither list fails the registry sweep instead.
+var allPoolMetrics = func() []namedCollector {
+	seen := map[*prometheus.GaugeVec]bool{}
 
-// A third hand-maintained list, because the condition gauge is neither a pool
-// gauge nor a group one. Three copies of the same knowledge now: registration,
-// deletePoolMetrics, and here.
-func condGaugesUnderTest() []*prometheus.GaugeVec {
-	return []*prometheus.GaugeVec{statusCondition}
+	var out []namedCollector
+
+	for _, g := range poolExactGauges {
+		if !seen[g] {
+			out = append(out, namedCollector{name: gaugeFQName(g), c: g})
+			seen[g] = true
+		}
+	}
+
+	for _, g := range poolPartialGauges {
+		if !seen[g] {
+			out = append(out, namedCollector{name: gaugeFQName(g), c: g})
+			seen[g] = true
+		}
+	}
+
+	return out
+}()
+
+func gaugeFQName(g *prometheus.GaugeVec) string {
+	ch := make(chan *prometheus.Desc, 1)
+	g.Describe(ch)
+
+	return (<-ch).String()
 }
 
 func testConditions() []metav1.Condition {
@@ -86,23 +106,17 @@ func TestDeletePoolMetricsRemovesAllPoolSeries(t *testing.T) {
 		{name: testGroupBase, replicas: 3, ready: 3, sharePercent: 60, lastProgressTime: 1000},
 	}, testConditions())
 
-	for _, g := range poolGaugesUnderTest() {
+	for _, g := range poolExactGauges {
 		if got := seriesFor(g, ns, name); got == 0 {
-			t.Fatalf("pool gauge: expected at least one series before delete, got 0")
+			t.Fatalf("poolExactGauge: expected at least one series before delete, got 0")
 		}
 	}
 
 	deletePoolMetrics(ns, name)
 
-	for _, g := range poolGaugesUnderTest() {
-		if got := seriesFor(g, ns, name); got != 0 {
-			t.Errorf("pool gauge: expected 0 series after delete, got %d", got)
-		}
-	}
-
-	for _, g := range append(groupGaugesUnderTest(), condGaugesUnderTest()...) {
-		if got := seriesFor(g, ns, name); got != 0 {
-			t.Errorf("group/condition gauge: expected 0 series after delete, got %d", got)
+	for _, g := range allPoolMetrics {
+		if got := seriesFor(g.c, ns, name); got != 0 {
+			t.Errorf("%s: expected 0 series after delete, got %d", g.name, got)
 		}
 	}
 }
@@ -119,17 +133,17 @@ func TestDeleteStaleGroupMetrics(t *testing.T) {
 	}
 	recordPoolMetrics(ns, name, 5, 5, 5, 0, groups, testConditions())
 
-	for _, g := range groupGaugesUnderTest() {
+	for _, g := range groupGauges {
 		if got := seriesFor(g, ns, name); got != 2 {
-			t.Fatalf("group gauge: expected 2 series before removal, got %d", got)
+			t.Fatalf("groupGauge: expected 2 series before removal, got %d", got)
 		}
 	}
 
 	deleteStaleGroupMetrics(ns, name, []string{testGroupBase}, []string{testGroupBase, "removed"})
 
-	for _, g := range groupGaugesUnderTest() {
+	for _, g := range groupGauges {
 		if got := seriesFor(g, ns, name); got != 1 {
-			t.Errorf("group gauge: expected 1 series after removal, got %d", got)
+			t.Errorf("groupGauge: expected 1 series after removal, got %d", got)
 		}
 	}
 
@@ -149,17 +163,17 @@ func TestDeletePoolMetricsRemovesAllGroupSeries(t *testing.T) {
 	}
 	recordPoolMetrics(ns, name, 10, 10, 9, 0, groups, testConditions())
 
-	for _, g := range groupGaugesUnderTest() {
+	for _, g := range groupGauges {
 		if got := seriesFor(g, ns, name); got != len(groups) {
-			t.Fatalf("group gauge: expected %d series before delete, got %d", len(groups), got)
+			t.Fatalf("groupGauge: expected %d series before delete, got %d", len(groups), got)
 		}
 	}
 
 	deletePoolMetrics(ns, name)
 
-	for _, g := range groupGaugesUnderTest() {
+	for _, g := range groupGauges {
 		if got := seriesFor(g, ns, name); got != 0 {
-			t.Errorf("group gauge: expected 0 series after delete, got %d", got)
+			t.Errorf("groupGauge: expected 0 series after delete, got %d", got)
 		}
 	}
 }
@@ -181,7 +195,7 @@ func TestReconcilePublishesAndRetiresPoolSeries(t *testing.T) {
 		t.Fatalf("after reconcile: got %d spec_replicas series, want 1", got)
 	}
 
-	for _, g := range groupGaugesUnderTest() {
+	for _, g := range groupGauges {
 		if got := seriesFor(g, pool.Namespace, pool.Name); got == 0 {
 			t.Errorf("after reconcile: group gauge has no series for a pool with %d groups", len(pool.Spec.Groups))
 		}
@@ -195,10 +209,10 @@ func TestReconcilePublishesAndRetiresPoolSeries(t *testing.T) {
 	// later event will ever mention this name again.
 	reconcilePool(t, r, pool)
 
-	all := append(poolGaugesUnderTest(), groupGaugesUnderTest()...)
-	for _, g := range append(all, condGaugesUnderTest()...) {
-		if got := seriesFor(g, pool.Namespace, pool.Name); got != 0 {
-			t.Errorf("after the NotFound pass: got %d series, want 0 — a deleted pool's gauges alert forever", got)
+	for _, g := range allPoolMetrics {
+		if got := seriesFor(g.c, pool.Namespace, pool.Name); got != 0 {
+			t.Errorf("after the NotFound pass: %s kept %d series, want 0 — a deleted pool's gauges alert forever",
+				g.name, got)
 		}
 	}
 }
@@ -222,6 +236,7 @@ func TestReconcileRetiresADroppedGroupsSeries(t *testing.T) {
 	}
 
 	live := getPool(t, cl, pool)
+	dropped := live.Spec.Groups[1].Name
 	live.Spec.Groups = live.Spec.Groups[:1]
 
 	if err := cl.Update(t.Context(), live); err != nil {
@@ -230,10 +245,17 @@ func TestReconcileRetiresADroppedGroupsSeries(t *testing.T) {
 
 	reconcilePool(t, r, live)
 
-	for _, g := range groupGaugesUnderTest() {
-		if got := seriesFor(g, pool.Namespace, pool.Name); got != 1 {
-			t.Errorf("after dropping a group: got %d series, want 1 — the removed group's gauges are frozen at its last values", got)
+	// Counted from the registry, not from groupGauges: a test that iterates the
+	// implementation's own list cannot notice a gauge dropped from it.
+	if left := groupSeriesFor(t, pool.Namespace, pool.Name, dropped); len(left) != 0 {
+		for family, n := range left {
+			t.Errorf("%s: %d series still carry group=%q after it left the spec — "+
+				"the removed group's gauges are frozen at its last values", family, n, dropped)
 		}
+	}
+
+	if kept := groupSeriesFor(t, pool.Namespace, pool.Name, testGroupBase); len(kept) == 0 {
+		t.Error("the surviving group lost its series too; the stale sweep deleted more than the difference")
 	}
 }
 
