@@ -2,12 +2,16 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 	"github.com/negativecycle/podpool-controller/internal/workload"
@@ -23,6 +27,11 @@ const defaultOpportunisticHeartbeat = 5 * time.Minute
 // but the scheduler has not yet said Unschedulable. Long enough for a
 // scheduling cycle, short enough that a refusal is acted on promptly.
 const probeVerdictRequeue = 15 * time.Second
+
+// maxUnschedulableProbe caps how many Pending pods a single capacity probe
+// will page in. A group short by more than this is already telling us
+// everything we need to know.
+const maxUnschedulableProbe int32 = 256
 
 // opportunisticObservation is one group's child read: what we last asked of it
 // and what it achieved.
@@ -69,10 +78,13 @@ type probeDecision struct {
 	awaitVerdict bool // a probe is outstanding; look again soon
 }
 
-// observeOpportunistic reads each opportunistic group's child.
+// observeOpportunistic reads each opportunistic group's child and, only when
+// the group is short of what was asked, the scheduler's verdict on its pods.
 func (r *PodPoolReconciler) observeOpportunistic(
 	ctx context.Context, pool *podpoolsv1alpha1.PodPool, gvk schema.GroupVersionKind,
 ) map[string]opportunisticObservation {
+	log := logf.FromContext(ctx)
+
 	var out map[string]opportunisticObservation
 
 	for _, g := range pool.Spec.Groups {
@@ -80,14 +92,69 @@ func (r *PodPoolReconciler) observeOpportunistic(
 			continue
 		}
 
+		obs := r.childCounts(ctx, pool, gvk, g.Name)
+
+		if obs.found && obs.ready < obs.asked {
+			n, err := r.countUnschedulable(ctx, pool, g.Name,
+				min(obs.asked-obs.ready, maxUnschedulableProbe))
+			if err != nil {
+				log.Error(err, "Counting unschedulable pods", "group", g.Name)
+			} else {
+				obs.unschedulable = n
+			}
+		}
+
 		if out == nil {
 			out = make(map[string]opportunisticObservation, len(pool.Spec.Groups))
 		}
 
-		out[g.Name] = r.childCounts(ctx, pool, gvk, g.Name)
+		out[g.Name] = obs
 	}
 
 	return out
+}
+
+// countUnschedulable asks how many of a group's pods the scheduler refused.
+//
+// Namespace, labels and phase are all applied server-side, so the API server
+// only sends back pods that already match. The condition check has to be done
+// here rather than in the query (status.conditions[].reason is not an indexable
+// field and the API server rejects it outright), which is exactly why the three
+// filters above matter: they decide how much arrives to loop over.
+func (r *PodPoolReconciler) countUnschedulable(
+	ctx context.Context, pool *podpoolsv1alpha1.PodPool, groupName string, limit int32,
+) (int32, error) {
+	if r.APIReader == nil {
+		return 0, errors.New("no APIReader configured")
+	}
+
+	var pods corev1.PodList
+
+	err := r.APIReader.List(ctx, &pods,
+		client.InNamespace(pool.Namespace),
+		client.MatchingLabels{workload.LabelPool: pool.Name, workload.LabelGroup: groupName},
+		client.MatchingFields{"status.phase": string(corev1.PodPending)},
+		client.Limit(int64(limit)),
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	var n int32
+
+	for i := range pods.Items {
+		for _, c := range pods.Items[i].Status.Conditions {
+			if c.Type == corev1.PodScheduled &&
+				c.Status == corev1.ConditionFalse &&
+				c.Reason == corev1.PodReasonUnschedulable {
+				n++
+
+				break
+			}
+		}
+	}
+
+	return n, nil
 }
 
 // capacityFrom turns observations into the capacity map the distribution uses.

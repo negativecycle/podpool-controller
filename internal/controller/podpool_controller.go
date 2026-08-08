@@ -142,6 +142,9 @@ type PodPoolReconciler struct {
 // required or the first reconcile of every child fails.
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;delete;get;list;patch;watch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=create;delete;get;list;patch;watch
+// Pods are listed (never watched) for opportunistic sizing: the scheduler's
+// verdict on a handful of pods, not a permanent cache.
+// +kubebuilder:rbac:groups="",resources=pods,verbs=list
 
 // Reconcile moves the cluster toward the pool's desired state. Everything
 // starts from a fresh read of the pool: the request carries only a name, and
