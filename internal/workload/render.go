@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -14,6 +15,27 @@ import (
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
+
+const (
+	fieldGeneration   = "generation"
+	condStatusFalse   = "False"
+	condStatusUnknown = "Unknown"
+)
+
+// GenerationCurrent reports whether a child's controller has observed its
+// current spec. Both fields absent (a fresh object, or a type that does not
+// publish observedGeneration) is treated as current: absence is not evidence
+// of staleness.
+func GenerationCurrent(child *unstructured.Unstructured) bool {
+	gen, genFound, _ := unstructured.NestedInt64(child.Object, "metadata", fieldGeneration)
+
+	obsGen, obsGenFound, _ := unstructured.NestedInt64(child.Object, "status", "observedGeneration")
+	if !genFound || !obsGenFound {
+		return true
+	}
+
+	return obsGen >= gen
+}
 
 // ChildName is the one definition of a child workload's name. The rule is
 // derived again by anyone who needs to find a child from its pool and group,
@@ -155,7 +177,7 @@ func stripPastedMetadata(obj map[string]any) {
 	}
 
 	for _, key := range []string{
-		"uid", "resourceVersion", "generation", "generateName",
+		"uid", "resourceVersion", fieldGeneration, "generateName",
 		"creationTimestamp", "deletionTimestamp",
 		"finalizers", "managedFields", "selfLink",
 		"ownerReferences",
@@ -173,21 +195,59 @@ func stripPastedMetadata(obj map[string]any) {
 	}
 }
 
-// ReadInt32 reads an integer status field from a child workload, returning
-// ok=false when the field is absent or unreadable.
+// ReadInt32 reads an integer status field from a child workload, clamped to
+// the range the PodPool API can actually store.
 //
-// Absent is also the ordinary state of a healthy child: these fields are
-// omitempty on the built-in types, so a count of zero and a field the kind
-// never publishes are the same wire state. Treat ok=false as "zero for now",
-// never as "this kind does not publish the field"; only elapsed time can
-// separate those readings.
+// The clamp is not defensive programming for its own sake. A child may be a
+// CRD this controller does not own, and a CRD's schema is written by its
+// author: a field declared `type: integer` with no `format: int32` accepts the
+// whole int64 range and the API server stores it. An unchecked int32
+// conversion reads 4294967295 back as -1, and 2^40 back as 0, which looks
+// like a healthy empty group.
+//
+// A negative then reaches status.groups[].replicas, whose Minimum=0 our own
+// CRD enforces, and the status patch 422s identically on every retry: the pool
+// wedges in permanent backoff. Clamping here is what keeps a lying child from
+// taking the pool down.
+//
+// ok=false still means "absent or unreadable" and is unchanged. A clamped
+// value is ok=true, because the field was genuinely present. Absent is also
+// the ordinary state of a healthy child: these fields are omitempty on the
+// built-in types, so a count of zero and a field the kind never publishes
+// are the same wire state. Treat ok=false as "zero for now", never as "this
+// kind does not publish the field"; only elapsed time can separate those
+// readings.
 func ReadInt32(obj *unstructured.Unstructured, fields ...string) (int32, bool) {
-	v, found, err := unstructured.NestedInt64(obj.Object, fields...)
+	v, ok, _ := ReadInt32Checked(obj, fields...)
+
+	return v, ok
+}
+
+// ReadInt32Checked is ReadInt32 plus whether the stored value was outside the
+// representable range.
+//
+// Clamping alone launders the corruption: an operator sees readyReplicas 0 and
+// a group that never becomes ready, with nothing anywhere saying the child
+// claimed 4294967296. Callers that can reach the operator use the third return
+// to say so. Callers that cannot use ReadInt32 and ignore it.
+func ReadInt32Checked(obj *unstructured.Unstructured, fields ...string) (v int32, ok, clamped bool) {
+	val, found, err := unstructured.NestedInt64(obj.Object, fields...)
 	if err != nil || !found {
-		return 0, false
+		return 0, false, false
 	}
 
-	return int32(v), true //nolint:gosec // counts are small in practice; revisited when a hostile child is considered
+	// Counts, so a negative has no meaning downstream. Clamping high to
+	// MaxInt32 rather than 0 fails in the safe direction: the group reads as
+	// full and nothing scales up on the strength of it.
+	if val < 0 {
+		return 0, true, true
+	}
+
+	if val > math.MaxInt32 {
+		return math.MaxInt32, true, true
+	}
+
+	return int32(val), true, false
 }
 
 // MergeMaps deep-merges patch into base following RFC 7386 semantics: maps
@@ -219,4 +279,87 @@ func MergeMaps(base, patch map[string]any) map[string]any {
 	}
 
 	return result
+}
+
+// ChildDetail extracts a best-effort explanation from a child workload's
+// conditions. Returns ok=false when the child publishes nothing usable,
+// which is the common case, not an error.
+//
+// Rules mirror sigs.k8s.io/cli-utils/pkg/kstatus without the dependency.
+// Generation is checked first: if the child has not observed its own current
+// spec, its conditions describe the previous one and are suppressed.
+func ChildDetail(child *unstructured.Unstructured) (reason, message string, ok bool) {
+	if !GenerationCurrent(child) {
+		return "", "", false
+	}
+
+	raw, found, _ := unstructured.NestedFieldNoCopy(child.Object, "status", "conditions")
+	if !found {
+		return "", "", false
+	}
+
+	conds, isList := raw.([]any)
+	if !isList || len(conds) == 0 {
+		return "", "", false
+	}
+
+	type probe struct {
+		condType  string
+		badStatus string // the status value that indicates a problem
+	}
+	// Ordered most specific first. ReplicaFailure (negative polarity: True
+	// is the problem) carries the API error verbatim. Ready and Available
+	// are positive polarity: False or Unknown is the problem.
+	probes := []probe{
+		{"ReplicaFailure", "True"},
+		{"Ready", condStatusFalse},
+		{"Ready", condStatusUnknown},
+		{"Available", condStatusFalse},
+		{"Available", condStatusUnknown},
+	}
+
+	for _, p := range probes {
+		for _, item := range conds {
+			c, isMap := item.(map[string]any)
+			if !isMap {
+				continue
+			}
+
+			cType, _ := c["type"].(string)
+
+			cStatus, _ := c["status"].(string)
+			if cType != p.condType || cStatus != p.badStatus {
+				continue
+			}
+
+			r, _ := c["reason"].(string)
+
+			m, _ := c["message"].(string)
+			if r == "" && m == "" {
+				continue
+			}
+
+			return r, m, true
+		}
+	}
+
+	return "", "", false
+}
+
+// TruncateRunes truncates s to at most maxLen runes, on a rune boundary.
+func TruncateRunes(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+
+	n := 0
+	for i := range s {
+		if n >= maxLen {
+			return s[:i]
+		}
+
+		n++
+	}
+
+	return s
 }

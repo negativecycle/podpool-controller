@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -125,6 +126,7 @@ func (sv *splitView) reconciler(liveReader client.Reader) *PodPoolReconciler {
 		Client:    sv.cached,
 		Scheme:    sv.store.Scheme(),
 		APIReader: liveReader,
+		Clock:     clock.RealClock{},
 	}
 }
 
@@ -167,6 +169,7 @@ func unownedDeployment(pool *podpoolsv1alpha1.PodPool, group string) *appsv1.Dep
 // "the cache is merely behind" apart from "this is a stranger".
 func poolOwnedDeployment(pool *podpoolsv1alpha1.PodPool, group string) *appsv1.Deployment {
 	dep := unownedDeployment(pool, group)
+	dep.Status = appsv1.DeploymentStatus{Replicas: 3, ReadyReplicas: 3}
 	dep.UID = types.UID("owned-" + group)
 	dep.Labels = map[string]string{workload.LabelPool: pool.Name, workload.LabelGroup: group, workload.LabelManagedBy: workload.ManagerName}
 	dep.OwnerReferences = []metav1.OwnerReference{{
@@ -289,6 +292,16 @@ func TestStaleCacheFallsThroughForOwnChild(t *testing.T) {
 
 	if !applied {
 		t.Error("the owned child was not applied; falling through must keep converging it")
+	}
+
+	// The fall-through also reports real counts one pass sooner: the live
+	// object the confirm read is the same one the observation reads.
+	got := getPool(t, sv.store, pool)
+
+	base := findGroupStatus(got.Status.Groups, testGroupBase)
+	if base == nil || base.Replicas != 3 {
+		t.Errorf("group status = %+v, want replicas 3 from the live object; "+
+			"the create branch discards counts the API server already has", base)
 	}
 }
 
