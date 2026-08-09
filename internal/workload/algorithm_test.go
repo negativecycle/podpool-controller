@@ -265,7 +265,7 @@ func TestComputeGroupTargets(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			result := ComputeGroupTargets(tt.total, tt.groups)
+			result := ComputeGroupTargets(tt.total, tt.groups, nil)
 
 			if tt.wantTargets == nil && result.Targets == nil {
 				return
@@ -338,6 +338,217 @@ func threeGroupSpec() []podpoolsv1alpha1.GroupSpec {
 	}
 }
 
+func TestComputeGroupTargetsScalingTrace(t *testing.T) {
+	t.Parallel()
+
+	groups := threeGroupSpec()
+
+	expected := []struct {
+		total int32
+		base  int32
+		scav  int32
+		burst int32
+	}{
+		{1, 1, 0, 0},
+		{3, 3, 0, 0},
+		{4, 3, 1, 0},
+		{5, 3, 1, 1},
+		{7, 3, 2, 2},
+		{10, 3, 3, 4},
+		{12, 3, 3, 6},
+		{15, 4, 4, 7},
+		{20, 4, 6, 10},
+		{25, 6, 7, 12},
+		{30, 6, 9, 15},
+	}
+
+	for _, e := range expected {
+		t.Run(fmt.Sprintf("total=%d", e.total), func(t *testing.T) {
+			t.Parallel()
+
+			result := ComputeGroupTargets(e.total, groups, nil)
+
+			got := result.Targets
+			if got[0] != e.base || got[1] != e.scav || got[2] != e.burst {
+				t.Errorf("total=%d: got base=%d scav=%d burst=%d, want base=%d scav=%d burst=%d",
+					e.total, got[0], got[1], got[2], e.base, e.scav, e.burst)
+			}
+		})
+	}
+}
+
+// cappedGroupSpec has no (min)-only group, so nothing can absorb overflow:
+// ceilings of 20% + 50% leave 30% of any total unplaced.
+func cappedGroupSpec() []podpoolsv1alpha1.GroupSpec {
+	return []podpoolsv1alpha1.GroupSpec{
+		{Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(20)}},
+		{Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(50)}},
+	}
+}
+
+// TestComputeGroupTargetsCappedTrace pins the shortfall across a range rather
+// than at a single total, which is where rounding interactions show up.
+//
+// Each group takes floor(total x target%); the rest is unplaced. Nothing is ever
+// forced past a ceiling, and nothing is ever lost — targets plus unplaced must
+// always account for the whole total.
+func TestComputeGroupTargetsCappedTrace(t *testing.T) {
+	t.Parallel()
+
+	groups := cappedGroupSpec()
+
+	for total := range int32(61) {
+		t.Run(fmt.Sprintf("total=%d", total), func(t *testing.T) {
+			t.Parallel()
+
+			r := ComputeGroupTargets(total, groups, nil)
+
+			wantA := int32(float64(total) * 0.20)
+
+			wantB := int32(float64(total) * 0.50)
+			if r.Targets[0] != wantA || r.Targets[1] != wantB {
+				t.Errorf("targets = %v, want [%d %d]", r.Targets, wantA, wantB)
+			}
+
+			wantUnplaced := total - wantA - wantB
+			if r.Unplaced != wantUnplaced {
+				t.Errorf("unplaced = %d, want %d", r.Unplaced, wantUnplaced)
+			}
+
+			if r.Targets[0]+r.Targets[1]+r.Unplaced != total {
+				t.Errorf("%v + %d unplaced does not account for %d", r.Targets, r.Unplaced, total)
+			}
+
+			// A pool this shape is always short — except at zero, where there
+			// is nothing to place.
+			if total > 0 && r.Unplaced == 0 {
+				t.Errorf("expected a shortfall at total=%d", total)
+			}
+		})
+	}
+}
+
+func opportunistic() *bool {
+	b := true
+
+	return &b
+}
+
+// threeTierSpec is the target configuration: a reliable tier with a declared
+// share, an opportunistic tier sized by real capacity, and an unbounded overflow.
+func threeTierSpec() []podpoolsv1alpha1.GroupSpec {
+	return []podpoolsv1alpha1.GroupSpec{
+		{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3), Target: pctTarget(35)}},
+		{Name: testGroupScav, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Opportunistic: opportunistic()}},
+		{Name: testGroupBurst, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0)}},
+	}
+}
+
+// TestComputeGroupTargetsOpportunistic pins the phase ordering, which is the
+// whole design: after targets so a declared share is never undercut by free
+// capacity, before overflow so free capacity is used before an unbounded group
+// buys more.
+func TestComputeGroupTargetsOpportunistic(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		total    int32
+		observed map[string]int32
+		want     []int32
+	}{
+		{
+			// No entry for the group means never sized. It is offered the whole
+			// remainder so the cold start converges in one round trip rather
+			// than one replica per heartbeat.
+			name:  "cold start offers the remainder",
+			total: 100,
+			want:  []int32{35, 65, 0},
+		},
+		{
+			// The point of the feature: 30 free slots displace 30 spot pods.
+			name:     "settled capacity is respected",
+			total:    100,
+			observed: map[string]int32{testGroupScav: 30},
+			want:     []int32{35, 30, 35},
+		},
+		{
+			// base reaches its 35% before scavenger takes anything. If the
+			// opportunistic phase ran first it would strand base at its min.
+			name:     "a declared share is honoured before free capacity",
+			total:    100,
+			observed: map[string]int32{testGroupScav: 90},
+			want:     []int32{35, 65, 0},
+		},
+		{
+			// And burst gets nothing until scavenger is full — free before paid.
+			name:     "free capacity is consumed before the overflow grows",
+			total:    20,
+			observed: map[string]int32{testGroupScav: 4},
+			want:     []int32{7, 4, 9},
+		},
+		{
+			// Capacity lost to preemption moves to burst; the pool stays whole.
+			name:     "lost capacity moves to the overflow",
+			total:    100,
+			observed: map[string]int32{testGroupScav: 10},
+			want:     []int32{35, 10, 55},
+		},
+		{
+			name:     "zero capacity gives the overflow everything",
+			total:    100,
+			observed: map[string]int32{testGroupScav: 0},
+			want:     []int32{35, 0, 65},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := ComputeGroupTargets(tt.total, threeTierSpec(), tt.observed)
+
+			if fmt.Sprint(got.Targets) != fmt.Sprint(tt.want) {
+				t.Errorf("targets = %v, want %v", got.Targets, tt.want)
+			}
+
+			var sum int32
+			for _, v := range got.Targets {
+				sum += v
+			}
+
+			if sum+got.Unplaced != tt.total {
+				t.Errorf("targets sum to %d with %d unplaced, want %d accounted for",
+					sum, got.Unplaced, tt.total)
+			}
+		})
+	}
+}
+
+// An opportunistic group must never absorb the overflow. Phase 4 treats a
+// (min)-only group as unbounded, and an opportunistic group is also (min)-only
+// on paper — so without an explicit skip it would swallow the remainder, which
+// is the same shape of bug #21 fixed for target ceilings.
+func TestOpportunisticGroupNeverAbsorbsOverflow(t *testing.T) {
+	t.Parallel()
+
+	groups := []podpoolsv1alpha1.GroupSpec{
+		{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)}},
+		{Name: testGroupScav, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Opportunistic: opportunistic()}},
+	}
+	// base is the only unbounded group, so it must take everything scavenger
+	// cannot — even though scavenger comes later and looks (min)-only.
+	got := ComputeGroupTargets(20, groups, map[string]int32{testGroupScav: 5})
+
+	if got.Targets[1] != 5 {
+		t.Errorf("scavenger = %d, want 5 — it absorbed overflow past its observed capacity", got.Targets[1])
+	}
+
+	if got.Targets[0] != 15 {
+		t.Errorf("base = %d, want 15", got.Targets[0])
+	}
+}
+
 // TestRoundingMatchesLegacyPolarity sweeps a matrix of totals and targets for
 // both shapes, asserting that the GroupTarget helper returns the value the
 // inline arithmetic would. This settles the rounding question empirically
@@ -388,92 +599,3 @@ func TestRoundingMatchesLegacyPolarity(t *testing.T) {
 //	scavTarget  = floor(total * 0.30)
 //	burstTarget = floor(total * 0.50)
 //	baseTarget  = total - scavTarget - burstTarget
-func TestComputeGroupTargetsScalingTrace(t *testing.T) {
-	t.Parallel()
-
-	groups := threeGroupSpec()
-
-	expected := []struct {
-		total int32
-		base  int32
-		scav  int32
-		burst int32
-	}{
-		{1, 1, 0, 0},
-		{3, 3, 0, 0},
-		{4, 3, 1, 0},
-		{5, 3, 1, 1},
-		{7, 3, 2, 2},
-		{10, 3, 3, 4},
-		{12, 3, 3, 6},
-		{15, 4, 4, 7},
-		{20, 4, 6, 10},
-		{25, 6, 7, 12},
-		{30, 6, 9, 15},
-	}
-
-	for _, e := range expected {
-		t.Run(fmt.Sprintf("total=%d", e.total), func(t *testing.T) {
-			t.Parallel()
-
-			result := ComputeGroupTargets(e.total, groups)
-
-			got := result.Targets
-			if got[0] != e.base || got[1] != e.scav || got[2] != e.burst {
-				t.Errorf("total=%d: got base=%d scav=%d burst=%d, want base=%d scav=%d burst=%d",
-					e.total, got[0], got[1], got[2], e.base, e.scav, e.burst)
-			}
-		})
-	}
-}
-
-// cappedGroupSpec has no (min)-only group, so nothing can absorb overflow:
-// ceilings of 20% + 50% leave 30% of any total unplaced.
-func cappedGroupSpec() []podpoolsv1alpha1.GroupSpec {
-	return []podpoolsv1alpha1.GroupSpec{
-		{Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(20)}},
-		{Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](0), Target: pctTarget(50)}},
-	}
-}
-
-// TestComputeGroupTargetsCappedTrace pins the shortfall across a range rather
-// than at a single total, which is where rounding interactions show up.
-//
-// Each group takes floor(total x target%); the rest is unplaced. Nothing is ever
-// forced past a ceiling, and nothing is ever lost — targets plus unplaced must
-// always account for the whole total.
-func TestComputeGroupTargetsCappedTrace(t *testing.T) {
-	t.Parallel()
-
-	groups := cappedGroupSpec()
-
-	for total := range int32(61) {
-		t.Run(fmt.Sprintf("total=%d", total), func(t *testing.T) {
-			t.Parallel()
-
-			r := ComputeGroupTargets(total, groups)
-
-			wantA := int32(float64(total) * 0.20)
-
-			wantB := int32(float64(total) * 0.50)
-			if r.Targets[0] != wantA || r.Targets[1] != wantB {
-				t.Errorf("targets = %v, want [%d %d]", r.Targets, wantA, wantB)
-			}
-
-			wantUnplaced := total - wantA - wantB
-			if r.Unplaced != wantUnplaced {
-				t.Errorf("unplaced = %d, want %d", r.Unplaced, wantUnplaced)
-			}
-
-			if r.Targets[0]+r.Targets[1]+r.Unplaced != total {
-				t.Errorf("%v + %d unplaced does not account for %d", r.Targets, r.Unplaced, total)
-			}
-
-			// A pool this shape is always short — except at zero, where there
-			// is nothing to place.
-			if total > 0 && r.Unplaced == 0 {
-				t.Errorf("expected a shortfall at total=%d", total)
-			}
-		})
-	}
-}

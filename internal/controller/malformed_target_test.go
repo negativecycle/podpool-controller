@@ -54,6 +54,9 @@ func TestTargetBoundedness(t *testing.T) {
 		wantParsed  bool
 		wantLimit   int32
 		wantBounded bool
+		// wantIsBounded is wantBounded except for opportunistic groups, which
+		// have no static ceiling but can still never absorb an overflow.
+		wantIsBounded bool
 	}{
 		{
 			// The case the fix must not break. A genuinely absent target is
@@ -63,82 +66,105 @@ func TestTargetBoundedness(t *testing.T) {
 			wantBounded: false,
 		},
 		{
-			name:        "int-typed target",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: intTarget(30)},
-			wantBounded: true,
+			name:          "int-typed target",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Target: intTarget(30)},
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 		{
-			name:        "well-formed percentage",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("30%")},
-			wantPct:     30,
-			wantParsed:  true,
-			wantLimit:   30,
-			wantBounded: true,
+			name:          "well-formed percentage",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Target: strTarget("30%")},
+			wantPct:       30,
+			wantParsed:    true,
+			wantLimit:     30,
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 		{
-			name:        "leading plus is honoured",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("+30%")},
-			wantPct:     30,
-			wantParsed:  true,
-			wantLimit:   30,
-			wantBounded: true,
+			name:          "leading plus is honoured",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Target: strTarget("+30%")},
+			wantPct:       30,
+			wantParsed:    true,
+			wantLimit:     30,
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 		{
-			name:        "leading zero is honoured",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("030%")},
-			wantPct:     30,
-			wantParsed:  true,
-			wantLimit:   30,
-			wantBounded: true,
+			name:          "leading zero is honoured",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Target: strTarget("030%")},
+			wantPct:       30,
+			wantParsed:    true,
+			wantLimit:     30,
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 		{
-			name:        "bare number without a percent sign is honoured",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("30")},
-			wantPct:     30,
-			wantParsed:  true,
-			wantLimit:   30,
-			wantBounded: true,
+			name:          "bare number without a percent sign is honoured",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Target: strTarget("30")},
+			wantPct:       30,
+			wantParsed:    true,
+			wantLimit:     30,
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 		{
-			name:        "zero percent is out of range",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("0%")},
-			wantBounded: true,
+			name:          "zero percent is out of range",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Target: strTarget("0%")},
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 		{
-			name:        "over one hundred percent is out of range",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("101%")},
-			wantBounded: true,
+			name:          "over one hundred percent is out of range",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Target: strTarget("101%")},
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 		{
-			name:        "empty string",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("")},
-			wantBounded: true,
+			name:          "empty string",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Target: strTarget("")},
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 		{
-			name:        "non-numeric",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("abc%")},
-			wantBounded: true,
+			name:          "non-numeric",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Target: strTarget("abc%")},
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 		{
-			name:        "embedded space",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Target: strTarget("30 %")},
-			wantBounded: true,
+			name:          "embedded space",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Target: strTarget("30 %")},
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 		{
 			// max wins outright, so an unreadable target beside it is moot.
-			name:        "max outranks an unreadable target",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Max: ptr.To[int32](7), Target: strTarget("abc%")},
-			wantLimit:   7,
-			wantBounded: true,
+			name:          "max outranks an unreadable target",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Max: ptr.To[int32](7), Target: strTarget("abc%")},
+			wantLimit:     7,
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 		{
-			// Opportunistic has no static ceiling: its bound will be whatever
-			// the scheduler accepts, which GroupCeiling cannot express. The
-			// distribution phase that sizes such groups arrives with the
-			// capacity feature.
-			name:        "opportunistic has no static ceiling",
-			scaling:     podpoolsv1alpha1.ScalingConstraints{Opportunistic: ptr.To(true)},
-			wantBounded: false,
+			// Opportunistic has no static ceiling: its bound is whatever the
+			// scheduler accepted, which GroupCeiling cannot express. Phase 4
+			// skips such groups rather than asking.
+			name:          "opportunistic has no static ceiling",
+			scaling:       podpoolsv1alpha1.ScalingConstraints{Opportunistic: ptr.To(true)},
+			wantBounded:   false,
+			wantIsBounded: true,
+		},
+		{
+			// Only reachable on a stored object: the CEL rule rejects the pair
+			// on write. Opportunistic wins, which matches phase 3 sizing the
+			// group from observed capacity.
+			name: "opportunistic beside a stored target",
+			scaling: podpoolsv1alpha1.ScalingConstraints{
+				Opportunistic: ptr.To(true), Target: intTarget(30),
+			},
+			wantLimit:     0,
+			wantBounded:   true,
+			wantIsBounded: true,
 		},
 	}
 
@@ -155,12 +181,11 @@ func TestTargetBoundedness(t *testing.T) {
 					total, limit, bounded, tt.wantLimit, tt.wantBounded)
 			}
 
-			// The predicate every layer shares. It agrees with GroupCeiling on
-			// every static shape; the capacity feature will part them on
-			// opportunistic groups, whose ceiling is real but discovered
-			// rather than declared.
-			if got := workload.IsBounded(tt.scaling); got != tt.wantBounded {
-				t.Errorf("IsBounded = %v, want %v", got, tt.wantBounded)
+			// The predicate every layer shares. It parts company with
+			// GroupCeiling only on opportunistic groups, whose ceiling is real
+			// but discovered rather than declared.
+			if got := workload.IsBounded(tt.scaling); got != tt.wantIsBounded {
+				t.Errorf("IsBounded = %v, want %v", got, tt.wantIsBounded)
 			}
 		})
 	}
@@ -243,7 +268,7 @@ func TestMalformedTargetDoesNotAbsorbTheOverflow(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := workload.ComputeGroupTargets(total, malformedTargetSpec(tt.baseMin, tt.baseTarget))
+			got := workload.ComputeGroupTargets(total, malformedTargetSpec(tt.baseMin, tt.baseTarget), nil)
 
 			if fmt.Sprint(got.Targets) != fmt.Sprint(tt.wantTargets) {
 				t.Errorf("targets = %v, want %v", got.Targets, tt.wantTargets)

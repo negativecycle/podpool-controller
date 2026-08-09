@@ -229,14 +229,58 @@ func TestFormatGroupNames(t *testing.T) {
 }
 
 func TestRequeueAfter(t *testing.T) {
-	t.Run("floor with jitter", func(t *testing.T) {
-		d := requeueAfter()
+	t.Run("non-opportunistic pool gets floor", func(t *testing.T) {
+		pool := &podpoolsv1alpha1.PodPool{
+			Spec: podpoolsv1alpha1.PodPoolSpec{
+				Groups: []podpoolsv1alpha1.GroupSpec{
+					{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To(int32(3))}},
+				},
+			},
+		}
+
+		d := requeueAfter(pool)
 		if d == 0 {
-			t.Fatal("a pool must not get zero requeue")
+			t.Fatal("non-opportunistic pool must not get zero requeue")
 		}
 		// Jittered around reconcileFloor ± 10%.
 		if d < reconcileFloor*90/100 || d > reconcileFloor*110/100+time.Second {
 			t.Errorf("requeue = %v, want within 10%% of %v", d, reconcileFloor)
+		}
+	})
+
+	t.Run("opportunistic pool uses heartbeat", func(t *testing.T) {
+		pool := &podpoolsv1alpha1.PodPool{
+			Spec: podpoolsv1alpha1.PodPoolSpec{
+				Groups: []podpoolsv1alpha1.GroupSpec{
+					{Name: testGroupScavShort, Scaling: podpoolsv1alpha1.ScalingConstraints{
+						Min: ptr.To(int32(0)), Opportunistic: ptr.To(true),
+					}},
+				},
+			},
+		}
+
+		d := requeueAfter(pool)
+		if d < defaultOpportunisticHeartbeat*90/100 || d > defaultOpportunisticHeartbeat*110/100+time.Second {
+			t.Errorf("requeue = %v, want within 10%% of %v", d, defaultOpportunisticHeartbeat)
+		}
+	})
+
+	t.Run("explicit heartbeat not clamped to floor", func(t *testing.T) {
+		thirtyMinSec := int32(1800)
+		pool := &podpoolsv1alpha1.PodPool{
+			Spec: podpoolsv1alpha1.PodPoolSpec{
+				OpportunisticHeartbeatSeconds: &thirtyMinSec,
+				Groups: []podpoolsv1alpha1.GroupSpec{
+					{Name: testGroupScavShort, Scaling: podpoolsv1alpha1.ScalingConstraints{
+						Min: ptr.To(int32(0)), Opportunistic: ptr.To(true),
+					}},
+				},
+			},
+		}
+
+		d := requeueAfter(pool)
+		if d < 27*time.Minute {
+			t.Errorf("requeue = %v, explicit 30min heartbeat should not be clamped to floor", d)
 		}
 	})
 }

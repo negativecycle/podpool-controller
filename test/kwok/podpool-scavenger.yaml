@@ -1,0 +1,58 @@
+apiVersion: podpools.dev/v1alpha1
+kind: PodPool
+metadata:
+  name: api-server
+spec:
+  replicas: 10
+  workloadTemplate:
+    apiVersion: apps/v1
+    kind: Deployment
+    spec:
+      template:
+        metadata:
+          labels:
+            app: api-server
+        spec:
+          containers:
+            - name: api
+              image: api-server:v2.1.0
+              ports:
+                - containerPort: 8080
+              resources:
+                requests:
+                  cpu: 500m
+                  memory: 256Mi
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
+  groups:
+    - name: base
+      scaling:
+        min: 3
+      overrides:
+        spec:
+          template:
+            spec:
+              nodeSelector:
+                capacity-type: on-demand
+    - name: scavenger
+      scaling:
+        min: 0
+        target: "30%"
+      overrides:
+        spec:
+          template:
+            spec:
+              nodeSelector:
+                capacity-type: on-demand
+              priorityClassName: low-priority
+    - name: burst
+      scaling:
+        min: 0
+        target: "50%"
+      overrides:
+        spec:
+          template:
+            spec:
+              nodeSelector:
+                capacity-type: spot

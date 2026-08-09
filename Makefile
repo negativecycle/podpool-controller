@@ -94,6 +94,37 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
+KWOK_CLUSTER ?= podpool-sim
+
+.PHONY: setup-kwok
+setup-kwok: manifests kustomize ## Create a KWOK cluster and install CRDs for integration tests.
+	@command -v kwokctl >/dev/null 2>&1 || { \
+		echo "kwokctl is not installed. See https://kwok.sigs.k8s.io/docs/user/installation/"; \
+		exit 1; \
+	}
+	@case "$$(kwokctl get clusters 2>/dev/null)" in \
+		*"$(KWOK_CLUSTER)"*) \
+			if $(KUBECTL) --context kwok-$(KWOK_CLUSTER) cluster-info >/dev/null 2>&1; then \
+				echo "KWOK cluster '$(KWOK_CLUSTER)' is running."; \
+			else \
+				echo "KWOK cluster '$(KWOK_CLUSTER)' exists but is not reachable. Recreating..."; \
+				kwokctl delete cluster --name $(KWOK_CLUSTER) 2>/dev/null || true; \
+				kwokctl create cluster --name $(KWOK_CLUSTER) --kube-version=v$(ENVTEST_K8S_VERSION).0; \
+			fi ;; \
+		*) \
+			echo "Creating KWOK cluster '$(KWOK_CLUSTER)'..."; \
+			kwokctl create cluster --name $(KWOK_CLUSTER) --kube-version=v$(ENVTEST_K8S_VERSION).0 ;; \
+	esac
+	"$(KUSTOMIZE)" build config/crd | $(KUBECTL) --context kwok-$(KWOK_CLUSTER) apply -f -
+
+.PHONY: cleanup-kwok
+cleanup-kwok: ## Delete the KWOK cluster used for integration tests.
+	@kwokctl delete cluster --name $(KWOK_CLUSTER) 2>/dev/null || true
+
+.PHONY: test-kwok
+test-kwok: manifests generate fmt vet setup-kwok ## Run integration tests against a KWOK cluster.
+	go test -race -tags=kwok ./test/kwok/ -v -count=1 -timeout=15m
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run

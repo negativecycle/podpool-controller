@@ -141,6 +141,11 @@ func (in *PodPoolSpec) DeepCopyInto(out *PodPoolSpec) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.OpportunisticHeartbeatSeconds != nil {
+		in, out := &in.OpportunisticHeartbeatSeconds, &out.OpportunisticHeartbeatSeconds
+		*out = new(int32)
+		**out = **in
+	}
 	if in.ProgressDeadlineSeconds != nil {
 		in, out := &in.ProgressDeadlineSeconds, &out.ProgressDeadlineSeconds
 		*out = new(int32)

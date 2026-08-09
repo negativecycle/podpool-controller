@@ -8,8 +8,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 	"github.com/negativecycle/podpool-controller/internal/workload"
@@ -178,5 +180,28 @@ func TestReconcileRefusesForeignChild(t *testing.T) {
 
 	if !found {
 		t.Fatalf("expected workloadNotOwnedError in aggregate, got: %v", err)
+	}
+}
+
+func TestChildCountsIgnoresForeignObject(t *testing.T) {
+	pool := fakeTestPool()
+	dep := foreignDeployment(pool.Name+"-"+testGroupBase, testNamespace)
+
+	r, _ := newFakeReconciler(t, nil, []client.Object{pool, dep}...)
+
+	gvk := schema.GroupVersionKind{Group: testAppsGroup, Version: "v1", Kind: testDepKind}
+
+	obs, err := r.childCounts(t.Context(), pool, gvk, testGroupBase)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if obs.found {
+		t.Error("childCounts should return found=false for a foreign object")
+	}
+
+	if !obs.foreign {
+		t.Error("childCounts should mark a foreign object as such; reported as merely " +
+			"absent it reads as a cold start and is offered the whole remainder")
 	}
 }

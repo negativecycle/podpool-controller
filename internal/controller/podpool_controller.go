@@ -33,7 +33,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -120,6 +119,12 @@ type PodPoolReconciler struct {
 	watchPendingSince map[schema.GroupVersionKind]time.Time
 	watchMu           sync.Mutex
 
+	// Probe bookkeeping for opportunistic groups. In-memory by design (see
+	// probeState) and guarded because Reconcile runs concurrently across
+	// pools.
+	probes  map[string]probeState
+	probeMu sync.Mutex
+
 	// Which groups have already been reported as publishing a count we could
 	// not represent. Keyed per group, not per GVK: a child reporting nonsense
 	// is a property of that object, not of its kind, so gating on the kind
@@ -136,6 +141,9 @@ type PodPoolReconciler struct {
 // required or the first reconcile of every child fails.
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;delete;get;list;patch;watch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=create;delete;get;list;patch;watch
+// Pods are listed (never watched) for opportunistic sizing: the scheduler's
+// verdict on a handful of pods, not a permanent cache.
+// +kubebuilder:rbac:groups="",resources=pods,verbs=list
 
 // Reconcile moves the cluster toward the pool's desired state. Everything
 // starts from a fresh read of the pool: the request carries only a name, and
@@ -147,6 +155,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		// and this pass, and there is nothing to do. Returning the error
 		// instead would requeue a name that will never resolve again.
 		if apierrors.IsNotFound(err) {
+			r.forgetProbes(req.Namespace, req.Name)
+
 			return ctrl.Result{}, nil
 		}
 
@@ -189,7 +199,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 			poolInvalid: true,
 		})
 
-		return ctrl.Result{RequeueAfter: requeueAfter()}, nil
+		return ctrl.Result{RequeueAfter: requeueAfter(&pool)}, nil
 	}
 
 	// Parse once per reconcile; BuildChildWorkload deep-copies per group.
@@ -207,7 +217,23 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		return res, err
 	}
 
-	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups)
+	// A failed read leaves the pool's capacity unknown, and the targets derived
+	// from it are written by SSA in this same pass. Return the error and let the
+	// workqueue retry: writing nothing is always recoverable, writing a guess is
+	// not.
+	observed, err := r.observeOpportunistic(ctx, &pool, gvk)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("observing opportunistic capacity: %w", err)
+	}
+
+	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups, r.capacityFrom(&pool, observed))
+
+	now := r.Clock.Now()
+
+	// The probe rides on top of the distribution rather than inside it, so the
+	// extra replica is funded by nobody: the pool briefly runs one over
+	// spec.replicas and the surplus is the question itself.
+	finalTargets, probePending := r.applyProbes(ctx, &pool, result.Targets, observed, now)
 
 	// Groups are reconciled independently: one that cannot be built or
 	// applied must not stop the others. Failures are collected and returned
@@ -227,7 +253,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	groupStatuses := make([]podpoolsv1alpha1.GroupStatus, 0, len(pool.Spec.Groups))
 
 	for i, group := range pool.Spec.Groups {
-		grResult, err := r.reconcileGroup(ctx, &pool, tmpl, gvk, group, result.Targets[i])
+		grResult, err := r.reconcileGroup(ctx, &pool, tmpl, gvk, group, finalTargets[i])
 		if err != nil {
 			errs = append(errs, fmt.Errorf("group %s: %w", group.Name, err))
 			failedGroups = append(failedGroups, group.Name)
@@ -256,14 +282,14 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 					Name:           group.Name,
 					Ready:          false,
 					Reason:         reason,
-					TargetReplicas: result.Targets[i],
+					TargetReplicas: finalTargets[i],
 				})
 			}
 
 			continue
 		}
 
-		grResult.status.TargetReplicas = result.Targets[i]
+		grResult.status.TargetReplicas = finalTargets[i]
 
 		// The counts have already been clamped into something the API can
 		// store, so the pool is safe. Say so anyway: otherwise the operator
@@ -283,8 +309,6 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	if sweepErrs := r.sweepAllOrphans(ctx, before, &pool, gvk, reconciledGroups); len(sweepErrs) > 0 {
 		errs = append(errs, sweepErrs...)
 	}
-
-	now := r.Clock.Now()
 
 	// Stamp progress timestamps on freshly reconciled groups only. Failed
 	// groups keep their previous status, including timestamps, from the
@@ -347,108 +371,22 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		notOwnedGroups: notOwnedGroups,
 	})
 
+	if err := kerrors.NewAggregate(errs); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// An outstanding probe is the one thing that cannot wait for the ordinary
+	// requeue: the pool is holding a replica the scheduler has not ruled on,
+	// and every other group is sized as though it does not exist.
+	if probePending {
+		return ctrl.Result{RequeueAfter: probeVerdictRequeue}, nil
+	}
+
 	// A deadline needs something to wake the pool, and a wedged pool is
 	// precisely the one that goes silent: ready < desired is byte-identical
 	// for a rollout four seconds old and a pool stuck forever, so only a
 	// requeue can turn elapsed time into a verdict.
-	return ctrl.Result{RequeueAfter: deadlineAwareRequeue(&pool, groupStatuses, now)}, kerrors.NewAggregate(errs)
-}
-
-// watchSyncRequeue is how soon to look again while an informer is filling its
-// initial cache. Short, because the wait is normally milliseconds and nothing
-// else will wake the pool once the cache is warm.
-const watchSyncRequeue = 2 * time.Second
-
-// reconcileFloor is the base requeue interval for every pool. Without a floor
-// a converged pool is never looked at again until something changes it, and
-// the progress deadline could never fire on a pool that went quiet.
-const reconcileFloor = 10 * time.Minute
-
-// defaultProgressDeadlineSeconds matches the schema default; the in-code copy
-// covers objects stored before the default existed and structs built in tests
-// that never pass through admission.
-const defaultProgressDeadlineSeconds int32 = 600
-
-// requeueAfter returns the base requeue interval, jittered so a manager
-// restart does not herd every pool into lockstep forever.
-func requeueAfter() time.Duration {
-	return wait.Jitter(reconcileFloor, 0.1)
-}
-
-// progressDeadline returns the pool's progress deadline or the default.
-// math.MaxInt32 disables the deadline.
-func progressDeadline(pool *podpoolsv1alpha1.PodPool) time.Duration {
-	s := defaultProgressDeadlineSeconds
-	// The nil check survives the schema default: objects stored before the
-	// default existed are not re-defaulted on read, and structs built in
-	// tests never pass through admission.
-	if pool.Spec.ProgressDeadlineSeconds != nil {
-		s = *pool.Spec.ProgressDeadlineSeconds
-	}
-
-	return time.Duration(s) * time.Second
-}
-
-// hasProgressDeadline reports whether the pool's deadline is enabled.
-func hasProgressDeadline(pool *podpoolsv1alpha1.PodPool) bool {
-	s := defaultProgressDeadlineSeconds
-	if pool.Spec.ProgressDeadlineSeconds != nil {
-		s = *pool.Spec.ProgressDeadlineSeconds
-	}
-
-	return s < 2147483647
-}
-
-// evaluateStalled returns the names of groups whose shortfall has exceeded
-// the progress deadline.
-func evaluateStalled(pool *podpoolsv1alpha1.PodPool, groups []podpoolsv1alpha1.GroupStatus, now time.Time) []string {
-	if !hasProgressDeadline(pool) {
-		return nil
-	}
-
-	deadline := progressDeadline(pool)
-
-	var stalled []string
-
-	for i := range groups {
-		gs := &groups[i]
-
-		shortfall := max(int32(0), gs.TargetReplicas-gs.ReadyReplicas)
-		if shortfall > 0 && gs.LastProgressTime != nil {
-			if now.Sub(gs.LastProgressTime.Time) >= deadline {
-				stalled = append(stalled, gs.Name)
-			}
-		}
-	}
-
-	return stalled
-}
-
-// deadlineAwareRequeue returns the base requeue interval, shortened when a
-// group is short of target but not yet stalled, so the deadline fires
-// precisely rather than up to one floor interval late.
-func deadlineAwareRequeue(pool *podpoolsv1alpha1.PodPool, groups []podpoolsv1alpha1.GroupStatus, now time.Time) time.Duration {
-	base := requeueAfter()
-
-	if hasProgressDeadline(pool) {
-		deadline := progressDeadline(pool)
-
-		for _, gs := range groups {
-			shortfall := max(int32(0), gs.TargetReplicas-gs.ReadyReplicas)
-			if shortfall > 0 && gs.LastProgressTime != nil {
-				remaining := gs.LastProgressTime.Time.Add(deadline).Sub(now)
-				if remaining > 0 && remaining < base {
-					base = remaining
-				}
-			}
-		}
-	}
-
-	if base < time.Second {
-		base = time.Second
-	}
-
-	return base
+	return ctrl.Result{RequeueAfter: deadlineAwareRequeue(&pool, groupStatuses, now)}, nil
 }
 
 // stampGroupProgress applies the progress timestamp rules.
@@ -923,7 +861,7 @@ func staleWorkloadGVKs(prev []podpoolsv1alpha1.GroupStatus, current schema.Group
 // The stored values are already clamped and safe; this exists so the clamp
 // does not launder the corruption into silence.
 func (r *PodPoolReconciler) reportOutOfRange(ctx context.Context, pool *podpoolsv1alpha1.PodPool, groupName string, outOfRange bool) {
-	key := pool.Namespace + "/" + pool.Name + "/" + groupName
+	key := probeKey(pool, groupName)
 
 	r.outOfRangeMu.Lock()
 	defer r.outOfRangeMu.Unlock()
@@ -1004,6 +942,43 @@ func (r *PodPoolReconciler) handleWatchFailure(
 		logf.FromContext(ctx).Error(err, "Failed to set up watch for workload kind",
 			"podpool", klog.KObj(pool), "gvk", gvk, "reason", ReasonWatchSetupFailed)
 	}
+}
+
+// applyProbes layers the +1 probe on top of the distribution for any
+// opportunistic groups that are due a heartbeat.
+func (r *PodPoolReconciler) applyProbes(
+	ctx context.Context,
+	pool *podpoolsv1alpha1.PodPool,
+	targets []int32,
+	observed map[string]opportunisticObservation,
+	now time.Time,
+) ([]int32, bool) {
+	finalTargets := make([]int32, len(targets))
+	copy(finalTargets, targets)
+
+	var probePending bool
+
+	for i, group := range pool.Spec.Groups {
+		if !workload.IsOpportunistic(group.Scaling) {
+			continue
+		}
+
+		d := r.decideProbe(pool, group.Name, targets[i], observed[group.Name], now)
+		if d.issued {
+			logf.FromContext(ctx).Info("Probing group for one replica beyond its observed capacity",
+				"group", group.Name)
+		}
+
+		if d.abandoned {
+			logf.FromContext(ctx).Info("Probe got no scheduler verdict in time; treating it as refused",
+				"group", group.Name, "timeout", probeVerdictTimeout)
+		}
+
+		finalTargets[i] = d.target
+		probePending = probePending || d.awaitVerdict
+	}
+
+	return finalTargets, probePending
 }
 
 // applyChild writes the rendered child with server-side apply.
