@@ -209,15 +209,15 @@ func TestFullyCappedWarningSeesAnUnreadableTarget(t *testing.T) {
 func TestUnreadableTargetWarnsRatherThanRejects(t *testing.T) {
 	t.Parallel()
 
-	stored := poolWith("test-pool", 3)
+	stored := sarPool()
 	stored.Spec.Groups = []podpoolsv1alpha1.GroupSpec{
 		{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{
 			Min: ptr.To[int32](1), Target: intTarget(),
 		}},
 	}
 
-	// The ordinary scale: `scaling` is untouched, so CEL would have ratcheted
-	// past it and the object reaches this validator intact.
+	// The ordinary scale: spec changes, so the short-circuit does not engage,
+	// and `scaling` is untouched, so CEL would have ratcheted past it.
 	scaled := stored.DeepCopy()
 	scaled.Spec.Replicas = stored.Spec.Replicas + 5
 
@@ -270,7 +270,7 @@ func TestUnreadableTargetWarnsRatherThanRejects(t *testing.T) {
 func TestReadableTargetIsNotWarnedAbout(t *testing.T) {
 	t.Parallel()
 
-	pp := poolWith("test-pool", 3)
+	pp := sarPool()
 	pp.Spec.Groups = []podpoolsv1alpha1.GroupSpec{
 		{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{
 			Min: ptr.To[int32](1), Target: pctStr(30),
@@ -287,7 +287,7 @@ func TestReadableTargetIsNotWarnedAbout(t *testing.T) {
 func TestEveryUnreadableTargetIsNamed(t *testing.T) {
 	t.Parallel()
 
-	pp := poolWith("test-pool", 3)
+	pp := sarPool()
 	pp.Spec.Groups = []podpoolsv1alpha1.GroupSpec{
 		{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Target: intTarget()}},
 		{Name: testGroupScavenger, Scaling: podpoolsv1alpha1.ScalingConstraints{Target: pctStr(20)}},

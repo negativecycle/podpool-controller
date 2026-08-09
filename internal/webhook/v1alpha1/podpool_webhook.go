@@ -22,12 +22,21 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
+	authzv1 "k8s.io/api/authorization/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+	kjson "sigs.k8s.io/json"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 	"github.com/negativecycle/podpool-controller/internal/workload"
@@ -35,10 +44,20 @@ import (
 
 var dnsLabelRegexp = regexp.MustCompile(`^[a-z][a-z0-9-]*[a-z0-9]$`)
 
+var childScheme = func() *runtime.Scheme {
+	s := runtime.NewScheme()
+	_ = appsv1.AddToScheme(s)
+
+	return s
+}()
+
 // SetupPodPoolWebhookWithManager registers the defaulting and validating webhooks for PodPool.
 func SetupPodPoolWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, &podpoolsv1alpha1.PodPool{}).
-		WithValidator(&PodPoolCustomValidator{}).
+		WithValidator(&PodPoolCustomValidator{
+			Client:     mgr.GetClient(),
+			RESTMapper: mgr.GetRESTMapper(),
+		}).
 		WithDefaulter(&PodPoolCustomDefaulter{}).
 		Complete()
 }
@@ -65,7 +84,10 @@ func (d *PodPoolCustomDefaulter) Default(ctx context.Context, obj *podpoolsv1alp
 // +kubebuilder:webhook:path=/validate-podpools-dev-v1alpha1-podpool,mutating=false,failurePolicy=fail,sideEffects=None,groups=podpools.dev,resources=podpools,verbs=create;update,versions=v1alpha1,name=vpodpool-v1alpha1.kb.io,admissionReviewVersions=v1
 
 // PodPoolCustomValidator validates PodPool resources during admission.
-type PodPoolCustomValidator struct{}
+type PodPoolCustomValidator struct {
+	Client     client.Client
+	RESTMapper meta.RESTMapper
+}
 
 func validateWorkloadTemplate(fp *field.Path, raw []byte) field.ErrorList {
 	var allErrs field.ErrorList
@@ -361,6 +383,194 @@ func warnOnUnreadableTarget(pp *podpoolsv1alpha1.PodPool) admission.Warnings {
 	return warnings
 }
 
+type renderedChildResult struct {
+	globalErrs field.ErrorList
+	groupErrs  map[string]field.ErrorList
+	warnings   admission.Warnings
+}
+
+func (r renderedChildResult) allErrors() field.ErrorList {
+	all := append(field.ErrorList{}, r.globalErrs...)
+	for _, errs := range r.groupErrs {
+		all = append(all, errs...)
+	}
+
+	return all
+}
+
+func checkControllerOwnedPaths(fp *field.Path, overrides []byte) field.ErrorList {
+	var allErrs field.ErrorList
+
+	var obj map[string]any
+	if err := json.Unmarshal(overrides, &obj); err != nil {
+		return nil
+	}
+
+	if spec, ok := obj["spec"].(map[string]any); ok {
+		if sel, ok := spec["selector"].(map[string]any); ok {
+			if _, ok := sel["matchLabels"]; ok {
+				allErrs = append(allErrs, field.Forbidden(
+					fp.Child("spec", "selector", "matchLabels"),
+					"overriding spec.selector.matchLabels has no effect: the controller overwrites it"))
+			}
+		}
+
+		if _, ok := spec["replicas"]; ok {
+			allErrs = append(allErrs, field.Forbidden(
+				fp.Child("spec", "replicas"),
+				"overriding spec.replicas has no effect: the controller sets it from the distribution"))
+		}
+	}
+
+	if md, ok := obj["metadata"].(map[string]any); ok {
+		if _, ok := md["name"]; ok {
+			allErrs = append(allErrs, field.Forbidden(
+				fp.Child("metadata", "name"),
+				"overriding metadata.name has no effect: the controller names children <pool>-<group>"))
+		}
+
+		if _, ok := md["ownerReferences"]; ok {
+			allErrs = append(allErrs, field.Forbidden(
+				fp.Child("metadata", "ownerReferences"),
+				"overriding ownerReferences has no effect: the controller sets the owner reference"))
+		}
+
+		if labels, ok := md["labels"].(map[string]any); ok {
+			for k := range labels {
+				if strings.HasPrefix(k, "podpools.dev/") {
+					allErrs = append(allErrs, field.Forbidden(
+						fp.Child("metadata", "labels").Key(k),
+						"overriding podpools.dev/* labels has no effect: the controller manages them"))
+				}
+			}
+		}
+	}
+
+	return allErrs
+}
+
+func validateRenderedChildren(pp *podpoolsv1alpha1.PodPool) renderedChildResult {
+	result := renderedChildResult{groupErrs: make(map[string]field.ErrorList)}
+
+	gvk, err := workload.ExtractGVK(pp.Spec.WorkloadTemplate.Raw)
+	if err != nil {
+		return result
+	}
+
+	if gvk.Group == podpoolsv1alpha1.SchemeGroupVersion.Group && gvk.Kind == workload.KindPodPool {
+		result.globalErrs = append(result.globalErrs, field.Forbidden(
+			field.NewPath("spec", "workloadTemplate"),
+			"a PodPool cannot use another PodPool as its workload template"))
+
+		return result
+	}
+
+	// Unreachable for malformed JSON: ExtractGVK unmarshals the same bytes above.
+	tmpl, parseErr := workload.ParseTemplate(pp.Spec.WorkloadTemplate.Raw)
+	if parseErr != nil {
+		return result
+	}
+
+	_, schemeCheckErr := childScheme.New(gvk)
+	knownGVK := schemeCheckErr == nil
+
+	dist := workload.ComputeGroupTargets(pp.Spec.Replicas, pp.Spec.Groups, nil)
+	groupsPath := field.NewPath("spec", "groups")
+
+	for i, g := range pp.Spec.Groups {
+		gp := groupsPath.Index(i)
+
+		var groupErrs field.ErrorList
+
+		if g.Overrides != nil && len(g.Overrides.Raw) > 0 {
+			groupErrs = append(groupErrs, checkControllerOwnedPaths(gp.Child("overrides"), g.Overrides.Raw)...)
+		}
+
+		replicas := int32(0)
+		if i < len(dist.Targets) {
+			replicas = dist.Targets[i]
+		}
+
+		child, renderErr := workload.BuildChildWorkload(tmpl, g, pp, replicas)
+		if renderErr != nil {
+			groupErrs = append(groupErrs, field.Invalid(gp, g.Name,
+				fmt.Sprintf("cannot render child workload: %v", renderErr)))
+			if len(groupErrs) > 0 {
+				result.groupErrs[g.Name] = groupErrs
+			}
+
+			continue
+		}
+
+		if knownGVK {
+			typed, _ := childScheme.New(gvk)
+			childJSON, _ := json.Marshal(child.Object) //nolint:errchkjson // unstructured objects always marshal cleanly
+
+			strictErrs, decodeErr := kjson.UnmarshalStrict(childJSON, typed)
+			if decodeErr != nil {
+				groupErrs = append(groupErrs, field.Invalid(gp, g.Name,
+					fmt.Sprintf("rendered child has type errors: %v", decodeErr)))
+			}
+
+			for _, se := range strictErrs {
+				result.warnings = append(result.warnings,
+					fmt.Sprintf("group %q: %v", g.Name, se))
+			}
+		}
+
+		if len(groupErrs) > 0 {
+			result.groupErrs[g.Name] = groupErrs
+		}
+	}
+
+	return result
+}
+
+func downgradePreExisting(oldResult, newResult renderedChildResult) (field.ErrorList, admission.Warnings) {
+	var (
+		errs     field.ErrorList
+		warnings admission.Warnings
+	)
+
+	oldGlobalSet := make(map[string]bool)
+	for _, e := range oldResult.globalErrs {
+		oldGlobalSet[e.Field+"|"+e.Detail] = true
+	}
+
+	for _, e := range newResult.globalErrs {
+		if oldGlobalSet[e.Field+"|"+e.Detail] {
+			warnings = append(warnings, "pre-existing: "+e.Detail)
+		} else {
+			errs = append(errs, e)
+		}
+	}
+
+	for groupName, newGroupErrs := range newResult.groupErrs {
+		oldGroupErrs := oldResult.groupErrs[groupName]
+		if len(oldGroupErrs) == 0 {
+			errs = append(errs, newGroupErrs...)
+
+			continue
+		}
+
+		oldDetailSet := make(map[string]bool)
+		for _, e := range oldGroupErrs {
+			oldDetailSet[e.Type.String()+"|"+e.Detail] = true
+		}
+
+		for _, e := range newGroupErrs {
+			if oldDetailSet[e.Type.String()+"|"+e.Detail] {
+				warnings = append(warnings, fmt.Sprintf(
+					"pre-existing issue in group %q: %s", groupName, e.Detail))
+			} else {
+				errs = append(errs, e)
+			}
+		}
+	}
+
+	return errs, warnings
+}
+
 func warnOnGroupRemoval(oldPP, newPP *podpoolsv1alpha1.PodPool) admission.Warnings {
 	newNames := make(map[string]bool)
 	for _, g := range newPP.Spec.Groups {
@@ -408,6 +618,30 @@ func warnPoolNameUpdate(pp *podpoolsv1alpha1.PodPool) admission.Warnings {
 	}
 }
 
+func warnStatefulSetOrdinalBudget(pp *podpoolsv1alpha1.PodPool) admission.Warnings {
+	gvk, err := workload.ExtractGVK(pp.Spec.WorkloadTemplate.Raw)
+	if err != nil || gvk.Kind != "StatefulSet" {
+		return nil
+	}
+
+	maxOrdinalLen := len(strconv.FormatInt(int64(pp.Spec.Replicas), 10))
+
+	var warnings admission.Warnings
+
+	for _, g := range pp.Spec.Groups {
+		child := workload.ChildName(pp.Name, g.Name)
+
+		hostnameLen := len(child) + 1 + maxOrdinalLen
+		if hostnameLen > maxPoolNameLen {
+			warnings = append(warnings, fmt.Sprintf(
+				"group %q: StatefulSet pods will be named %s-<ordinal>, up to %d characters, exceeding the 63-byte hostname limit; pods with high ordinals will fail to schedule",
+				g.Name, child, hostnameLen))
+		}
+	}
+
+	return warnings
+}
+
 func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoolsv1alpha1.PodPool) (admission.Warnings, error) {
 	logf.FromContext(ctx).Info("Validation for PodPool upon creation", "name", obj.GetName())
 
@@ -417,18 +651,63 @@ func (v *PodPoolCustomValidator) ValidateCreate(ctx context.Context, obj *podpoo
 		allErrs = append(allErrs, nameErr)
 	}
 
+	rcResult := validateRenderedChildren(obj)
+	allErrs = append(allErrs, rcResult.allErrors()...)
+
+	// An unparseable template has already been rejected by validatePodPoolSpec,
+	// so a parse failure here means there is nothing left to authorize.
+	if gvk, err := workload.ExtractGVK(obj.Spec.WorkloadTemplate.Raw); err == nil {
+		if authErr := v.checkWorkloadAuthorization(ctx, obj, gvk, ""); authErr != nil {
+			allErrs = append(allErrs, authErr)
+		}
+	}
+
 	if len(allErrs) > 0 {
 		return nil, allErrs.ToAggregate()
 	}
 
-	warnings := warnOnFullyCappedPool(obj)
+	warnings := rcResult.warnings
+	warnings = append(warnings, warnOnFullyCappedPool(obj)...)
 	warnings = append(warnings, warnOnUnreadableTarget(obj)...)
+	warnings = append(warnings, warnStatefulSetOrdinalBudget(obj)...)
 
 	return warnings, nil
 }
 
 func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *podpoolsv1alpha1.PodPool, newObj *podpoolsv1alpha1.PodPool) (admission.Warnings, error) {
 	logf.FromContext(ctx).Info("Validation for PodPool upon update", "name", newObj.GetName())
+
+	// An unchanged spec cannot change any verdict below, so return before
+	// reaching any of them.
+	//
+	// This is load-bearing, not an optimisation: pause is a metadata annotation
+	// (workload.AnnotationPaused), so setting it is a metadata-only update and
+	// was therefore gated on full spec validation. A pool was unpausable in
+	// exactly the states that make an operator want to pause it. The general
+	// shape is worse: any rule tightened after a pool was admitted turned every
+	// future metadata write to that pool into a rejection, which makes
+	// tightening validation retroactively destructive in a way that is
+	// invisible at review time. The API server solved the same problem for CRD
+	// schemas with validation ratcheting; a webhook has to do it itself.
+	//
+	// What licenses it: everything below is a function of spec plus
+	// metadata.name, metadata.namespace and metadata.uid, all three immutable
+	// for an object's lifetime. BuildChildWorkload reads those three and
+	// nothing else; in particular it does not inherit pool labels or
+	// annotations into the child. Recheck this argument if that ever changes.
+	//
+	// Semantic rather than reflect.DeepEqual: the two agree on PodPoolSpec as
+	// it stands, but Semantic is the convention and is the one that stays
+	// correct if a resource.Quantity or a metav1.Time is ever added. Do not
+	// simplify it.
+	//
+	// Best-effort by construction: a semantically-equal but byte-different spec
+	// (re-serialised whitespace, a populated RawExtension.Object) compares
+	// unequal and pays full validation. That is the safe direction, and the
+	// reason this is a DeepEqual rather than a canonicalising comparison.
+	if apiequality.Semantic.DeepEqual(oldObj.Spec, newObj.Spec) {
+		return nil, nil
+	}
 
 	allErrs := validatePodPoolSpec(newObj)
 
@@ -450,14 +729,52 @@ func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *pod
 		))
 	}
 
+	// The create-time SAR only ever vouched for the GVK admitted then. It
+	// carries forward to an update exactly when the stored GVK is readable and
+	// the new one is identical, which is precisely when the immutability check
+	// above is able to speak. Whenever it cannot, re-authorize.
+	//
+	// Stating the invariant rather than testing for `oldErr != nil` matters:
+	// the authorization must not quietly disappear if the immutability check is
+	// ever relaxed. Costs no round-trip on the overwhelming majority of
+	// updates, where the GVK is unchanged.
+	gvkVouchedFor := oldErr == nil && newErr == nil && oldGVK == newGVK
+	if !gvkVouchedFor && newErr == nil {
+		const reason = "the stored workloadTemplate could not be read, so the " +
+			"workload type must be re-authorized: "
+		if authErr := v.checkWorkloadAuthorization(ctx, newObj, newGVK, reason); authErr != nil {
+			allErrs = append(allErrs, authErr)
+		}
+	}
+
+	newRCResult := validateRenderedChildren(newObj)
+
+	var renderWarnings admission.Warnings
+
+	// A stricter rule must not brick a stored object. Compare the new pool's
+	// render errors against the same pool's before this edit: a violation it
+	// already had becomes a warning, one this edit introduces stays an error.
+	// Without it, shipping any new render check makes every existing pool that
+	// trips it unpatchable — including by the patch that would fix it.
+	if newRenderErrs := newRCResult.allErrors(); len(newRenderErrs) > 0 {
+		oldRCResult := validateRenderedChildren(oldObj)
+		remaining, downgraded := downgradePreExisting(oldRCResult, newRCResult)
+		allErrs = append(allErrs, remaining...)
+		renderWarnings = append(renderWarnings, downgraded...)
+	}
+
+	renderWarnings = append(renderWarnings, newRCResult.warnings...)
+
 	if len(allErrs) > 0 {
 		return nil, allErrs.ToAggregate()
 	}
 
-	warnings := warnOnGroupRemoval(oldObj, newObj)
+	warnings := renderWarnings
+	warnings = append(warnings, warnOnGroupRemoval(oldObj, newObj)...)
 	warnings = append(warnings, warnOnFullyCappedPool(newObj)...)
 	warnings = append(warnings, warnOnUnreadableTarget(newObj)...)
 	warnings = append(warnings, warnPoolNameUpdate(newObj)...)
+	warnings = append(warnings, warnStatefulSetOrdinalBudget(newObj)...)
 
 	return warnings, nil
 }
@@ -468,4 +785,149 @@ func (v *PodPoolCustomValidator) ValidateUpdate(ctx context.Context, oldObj *pod
 // operator no way to remove a broken pool.
 func (v *PodPoolCustomValidator) ValidateDelete(_ context.Context, _ *podpoolsv1alpha1.PodPool) (admission.Warnings, error) {
 	return nil, nil
+}
+
+const groupApps = "apps"
+
+var builtinPluralResources = map[schema.GroupKind]string{
+	{Group: groupApps, Kind: "Deployment"}:  "deployments",
+	{Group: groupApps, Kind: "StatefulSet"}: "statefulsets",
+	{Group: groupApps, Kind: "DaemonSet"}:   "daemonsets",
+}
+
+// pluralResource resolves a Kind to the resource name the SubjectAccessReview
+// must name.
+//
+// Discovery is asked first because it is authoritative: a plural comes from the
+// CRD's own spec.names.plural and is not computable from the Kind. The builtin
+// table is the discovery-outage fallback, which is the only role a hardcoded
+// plural should ever play in an authorization decision.
+//
+// Every resolution failure ends in the same place, and the caller turns it into
+// a denial. Branching on the error class here would let an attacker-influencable
+// condition select a different code path in an authz check.
+func (v *PodPoolCustomValidator) pluralResource(gvk schema.GroupVersionKind) (string, error) {
+	gk := gvk.GroupKind()
+
+	if v.RESTMapper == nil {
+		if plural, ok := builtinPluralResources[gk]; ok {
+			return plural, nil
+		}
+
+		return "", fmt.Errorf("cannot resolve %s: no RESTMapper available", gvk.Kind)
+	}
+
+	mapping, err := v.RESTMapper.RESTMapping(gk, gvk.Version)
+	if err == nil {
+		return mapping.Resource.Resource, nil
+	}
+
+	// The table covers only apps/v1, whose plurals cannot change, so a
+	// discovery outage does not take the built-in workload kinds down with it.
+	if plural, ok := builtinPluralResources[gk]; ok {
+		return plural, nil
+	}
+
+	return "", fmt.Errorf("cannot resolve %s to a resource name: %w", gvk.Kind, err)
+}
+
+// The admission guard below creates a SubjectAccessReview to confirm the
+// requesting user may create the workload kind the pool renders. This grant
+// must be declared here, not only inherited from metrics_auth_role.yaml:
+// config/rbac/kustomization.yaml documents that role as safe to comment out
+// when metrics protection is unwanted, and following that instruction would
+// otherwise leave the webhook unable to authorize anything. With
+// failurePolicy=fail that makes every PodPool write fail admission,
+// cluster-wide, for a reason the instruction never mentions.
+//
+// The duplicate grant is deliberate and costs nothing. RBAC is additive, both
+// roles bind the same ServiceAccount, and metrics_auth_role needs its own copy
+// because the metrics authz filter issues SubjectAccessReviews too.
+// +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
+
+// checkWorkloadAuthorization asks whether the requesting user could create the
+// workload kind this pool renders, and denies if not.
+//
+// The GVK is a parameter rather than re-extracted here: every caller has
+// already parsed it, and taking it in removes a third failure mode from a
+// security-critical function. Callers must not invoke this with a GVK they
+// could not parse; the spec validation rejects those first.
+//
+// reason names why the check is running. It is empty on create, where being
+// asked to authorize a new object needs no explanation, and set on update,
+// where the user did not think they were creating anything.
+func (v *PodPoolCustomValidator) checkWorkloadAuthorization(
+	ctx context.Context,
+	pp *podpoolsv1alpha1.PodPool,
+	gvk schema.GroupVersionKind,
+	reason string,
+) *field.Error {
+	if v.Client == nil {
+		return nil
+	}
+
+	req, err := admission.RequestFromContext(ctx)
+	if err != nil {
+		return nil //nolint:nilerr // skip auth check when admission request unavailable
+	}
+
+	plural, err := v.pluralResource(gvk)
+	if err != nil {
+		return field.Forbidden(
+			field.NewPath("spec", "workloadTemplate"),
+			fmt.Sprintf("cannot verify authorization: %v", err))
+	}
+
+	extra := make(map[string]authzv1.ExtraValue, len(req.UserInfo.Extra))
+	for k, vals := range req.UserInfo.Extra {
+		extra[k] = authzv1.ExtraValue(vals)
+	}
+
+	sar := &authzv1.SubjectAccessReview{
+		Spec: authzv1.SubjectAccessReviewSpec{
+			User:   req.UserInfo.Username,
+			Groups: req.UserInfo.Groups,
+			UID:    req.UserInfo.UID,
+			Extra:  extra,
+			ResourceAttributes: &authzv1.ResourceAttributes{
+				Namespace: pp.Namespace,
+				Verb:      "create",
+				Group:     gvk.Group,
+				Resource:  plural,
+				Version:   gvk.Version,
+			},
+		},
+	}
+
+	// Forbidden would blame spec.workloadTemplate for what is a cluster
+	// misconfiguration: the user wrote nothing wrong, we could not ask the
+	// question. InternalError reads as "Internal error occurred: ...", which is
+	// true, and still denies.
+	//
+	// Only the classification moves. ValidateCreate/ValidateUpdate return an
+	// aggregate, which is not an APIStatus, so controller-runtime denies with
+	// the message either way: same decision, same response shape, better
+	// diagnosis. Failing open here would reintroduce the escalation path the
+	// guard exists to close, and would do it silently.
+	if err := v.Client.Create(ctx, sar); err != nil {
+		return field.InternalError(
+			field.NewPath("spec", "workloadTemplate"),
+			fmt.Errorf("authorization check failed for %s: %w", gvk.Kind, err))
+	}
+
+	if !sar.Status.Allowed {
+		// A security control that denies silently is half a control. The
+		// admission response reaches the API audit log either way, but a line
+		// here is greppable without audit policy configured.
+		logf.FromContext(ctx).Info("Denied PodPool write: user not authorized for workload type",
+			"user", req.UserInfo.Username, "resource", plural, "group", gvk.Group,
+			"namespace", pp.Namespace, "reason", reason)
+
+		return field.Forbidden(
+			field.NewPath("spec", "workloadTemplate"),
+			reason+fmt.Sprintf("user %q is not authorized to create %s.%s in namespace %q",
+				req.UserInfo.Username, plural, gvk.Group, pp.Namespace))
+	}
+
+	return nil
 }

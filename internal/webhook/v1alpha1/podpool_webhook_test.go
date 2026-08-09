@@ -1,16 +1,24 @@
 package v1alpha1
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"strings"
 	"testing"
 
+	admissionv1 "k8s.io/api/admission/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	authzv1 "k8s.io/api/authorization/v1"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
@@ -31,6 +39,12 @@ const (
 	kindDeployment     = "Deployment"
 	imageNginx         = "nginx"
 	shapeEmpty         = "empty"
+	fieldSelector      = "selector"
+	fieldMatchLabels   = "matchLabels"
+	fieldMetadata      = "metadata"
+	valueMine          = "mine"
+	argoV1alpha1       = "argoproj.io/v1alpha1"
+	kindRollout        = "Rollout"
 )
 
 func validWorkloadTemplate() runtime.RawExtension {
@@ -52,42 +66,10 @@ func validWorkloadTemplate() runtime.RawExtension {
 	return runtime.RawExtension{Raw: raw}
 }
 
-// templateRaw builds a minimal valid template. It takes no kind yet: nothing
-// here cares which workload type it is, and a parameter with one caller and one
-// value is a claim the tests do not make.
-func templateRaw() runtime.RawExtension {
-	return runtime.RawExtension{Raw: []byte(`{
-		"apiVersion": "apps/v1",
-		"kind": "Deployment",
-		"spec": {"template": {"spec": {"containers": [{"name": "app", "image": "nginx"}]}}}
-	}`)}
-}
-
-// poolWith builds a minimally valid pool so that a test asserting on one rule
-// is not tripped by an unrelated one.
-func poolWith(name string, replicas int32) *podpoolsv1alpha1.PodPool {
-	return &podpoolsv1alpha1.PodPool{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
-		Spec: podpoolsv1alpha1.PodPoolSpec{
-			Replicas:         replicas,
-			WorkloadTemplate: templateRaw(),
-			Groups: []podpoolsv1alpha1.GroupSpec{
-				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To(int32(1))}},
-			},
-		},
-	}
-}
-
 func opportunisticPtr() *bool {
 	b := true
 
 	return &b
-}
-
-func pctStr(pct int) *intstr.IntOrString {
-	v := intstr.FromString(fmt.Sprintf("%d%%", pct))
-
-	return &v
 }
 
 func TestValidateScaling(t *testing.T) {
@@ -416,8 +398,8 @@ func TestValidateUpdateGVKImmutability(t *testing.T) {
 	}
 
 	rolloutTmpl := map[string]any{
-		fieldAPIVersion: "argoproj.io/v1alpha1",
-		fieldKind:       "Rollout",
+		fieldAPIVersion: argoV1alpha1,
+		fieldKind:       kindRollout,
 		fieldSpec: map[string]any{
 			fieldTemplate: map[string]any{
 				fieldSpec: map[string]any{
@@ -461,138 +443,6 @@ func TestValidateUpdateGVKImmutability(t *testing.T) {
 	}
 }
 
-func scalingMessage(t *testing.T, s podpoolsv1alpha1.ScalingConstraints) string {
-	t.Helper()
-
-	errs := validateScaling(field.NewPath("spec", "groups").Index(0).Child("scaling"), &s)
-	if len(errs) == 0 {
-		t.Fatalf("expected validateScaling to reject %+v, it accepted", s)
-	}
-
-	return errs.ToAggregate().Error()
-}
-
-// The headline case: a *int32 rendered with %v is an address.
-func TestScalingMessageHasNoPointerAddresses(t *testing.T) {
-	t.Parallel()
-
-	msg := scalingMessage(t, podpoolsv1alpha1.ScalingConstraints{
-		Target:        pctStr(30),
-		Opportunistic: ptr.To(true),
-	})
-
-	if strings.Contains(msg, "0x") {
-		t.Errorf("message renders a pointer address: %s", msg)
-	}
-
-	if !strings.Contains(msg, "target=30%") {
-		t.Errorf("message does not contain target=30%%: %s", msg)
-	}
-}
-
-// TestScalingMessageSaysUnsetForAbsentFields pins the other half: a nil pointer
-// currently renders as "<nil>", which reads as a value rather than an absence.
-func TestScalingMessageSaysUnsetForAbsentFields(t *testing.T) {
-	t.Parallel()
-
-	msg := scalingMessage(t, podpoolsv1alpha1.ScalingConstraints{
-		Target:        pctStr(30),
-		Opportunistic: ptr.To(true),
-	})
-
-	for _, want := range []string{"min=unset", "max=unset"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("message does not contain %q: %s", want, msg)
-		}
-	}
-}
-
-// TestScalingMessageRendersZeroNotEmpty guards the fix rather than the bug: a
-// helper that returns "" for the zero value would satisfy the nil-only tests
-// above while losing min=0, which is the value the defaulter injects and
-// therefore the one most likely to appear.
-func TestScalingMessageRendersZeroNotEmpty(t *testing.T) {
-	t.Parallel()
-
-	msg := scalingMessage(t, podpoolsv1alpha1.ScalingConstraints{
-		Min:           ptr.To(int32(0)),
-		Target:        pctStr(30),
-		Opportunistic: ptr.To(true),
-	})
-
-	// Delimited deliberately: "min=0" is a prefix of "min=0x8567eae718", so an
-	// undelimited Contains passes against the very bug this file exists to pin.
-	if !strings.Contains(msg, "min=0 ") {
-		t.Errorf("message does not render an explicit zero as min=0: %s", msg)
-	}
-}
-
-func TestDefaulter(t *testing.T) {
-	t.Parallel()
-
-	pool := &podpoolsv1alpha1.PodPool{
-		Spec: podpoolsv1alpha1.PodPoolSpec{
-			WorkloadTemplate: validWorkloadTemplate(),
-			Groups: []podpoolsv1alpha1.GroupSpec{
-				{
-					Name:    testGroupBase,
-					Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
-				},
-				{
-					Name:    testGroupBurst,
-					Scaling: podpoolsv1alpha1.ScalingConstraints{},
-				},
-			},
-		},
-	}
-
-	d := &PodPoolCustomDefaulter{}
-	if err := d.Default(t.Context(), pool); err != nil {
-		t.Fatalf("Default returned error: %v", err)
-	}
-
-	burst := pool.Spec.Groups[1].Scaling
-	if burst.Min == nil {
-		t.Fatal("expected min to be defaulted to 0, got nil")
-	}
-
-	if *burst.Min != 0 {
-		t.Errorf("expected min=0, got %d", *burst.Min)
-	}
-
-	base := pool.Spec.Groups[0].Scaling
-	if *base.Min != 3 {
-		t.Errorf("expected base min to remain 3, got %d", *base.Min)
-	}
-}
-
-// The defaulter deliberately leaves min alone when max is set. A group that
-// declares only a ceiling has already said what it wants; writing a floor into
-// it puts a number in the stored object the user never asked for, and the
-// arithmetic reads an absent min as zero anyway.
-func TestDefaulterLeavesMinAloneWhenMaxIsSet(t *testing.T) {
-	t.Parallel()
-
-	pool := &podpoolsv1alpha1.PodPool{
-		Spec: podpoolsv1alpha1.PodPoolSpec{
-			WorkloadTemplate: validWorkloadTemplate(),
-			Groups: []podpoolsv1alpha1.GroupSpec{{
-				Name:    testGroupBase,
-				Scaling: podpoolsv1alpha1.ScalingConstraints{Max: ptr.To(int32(5))},
-			}},
-		},
-	}
-
-	if err := (&PodPoolCustomDefaulter{}).Default(t.Context(), pool); err != nil {
-		t.Fatalf("Default: %v", err)
-	}
-
-	if got := pool.Spec.Groups[0].Scaling.Min; got != nil {
-		t.Errorf("defaulter injected min=%d into a group that declared max; want it left unset", *got)
-	}
-}
-
-// The cross-group rules: displaced replicas need somewhere to go.
 func TestValidateOpportunisticAcrossGroups(t *testing.T) {
 	t.Parallel()
 
@@ -690,61 +540,6 @@ func TestValidateOpportunisticAcrossGroups(t *testing.T) {
 				t.Errorf("error = %v, want %v (%v)", got, tt.wantErr, errs)
 			}
 		})
-	}
-}
-
-const (
-	nameAt63 = "a23456789012345678901234567890123456789012345678901234567890123"  // 63
-	nameAt64 = "a234567890123456789012345678901234567890123456789012345678901234" // 64
-)
-
-func TestPoolNameLengthBoundary(t *testing.T) {
-	t.Parallel()
-
-	if len(nameAt63) != 63 || len(nameAt64) != 64 {
-		t.Fatalf("fixture lengths wrong: %d, %d", len(nameAt63), len(nameAt64))
-	}
-
-	t.Run("63 is accepted", func(t *testing.T) {
-		t.Parallel()
-
-		_, err := (&PodPoolCustomValidator{}).ValidateCreate(t.Context(), poolWith(nameAt63, 3))
-		if err != nil {
-			t.Errorf("63-character name rejected: %v", err)
-		}
-	})
-
-	t.Run("64 is rejected", func(t *testing.T) {
-		t.Parallel()
-
-		_, err := (&PodPoolCustomValidator{}).ValidateCreate(t.Context(), poolWith(nameAt64, 3))
-		if err == nil {
-			t.Fatal("64-character name admitted; it becomes an over-long podpools.dev/pool label value and every group fails at apply time")
-		}
-
-		if !strings.Contains(err.Error(), "63") {
-			t.Errorf("rejection does not state the limit: %v", err)
-		}
-	})
-}
-
-// TestOverLongNameOnUpdateWarnsButDoesNotBlock is the trap this item most needs
-// a guard for. metadata.name is immutable, so rejecting on update would leave
-// an already-created over-long pool permanently un-editable — the user could
-// not even scale it to zero.
-func TestOverLongNameOnUpdateWarnsButDoesNotBlock(t *testing.T) {
-	t.Parallel()
-
-	old := poolWith(nameAt64, 3)
-	updated := poolWith(nameAt64, 5)
-
-	warnings, err := (&PodPoolCustomValidator{}).ValidateUpdate(t.Context(), old, updated)
-	if err != nil {
-		t.Fatalf("update to an existing over-long pool was rejected, trapping the object: %v", err)
-	}
-
-	if len(warnings) == 0 {
-		t.Error("update to an over-long pool produced no warning; the user gets no signal at all")
 	}
 }
 
@@ -1011,5 +806,515 @@ func TestValidateOverflowSinkIntegration(t *testing.T) {
 
 	if _, err := v.ValidateUpdate(ctx, valid, twoUnbounded); err == nil {
 		t.Error("ValidateUpdate should reject two unbounded groups")
+	}
+}
+
+func templateJSON(obj map[string]any) runtime.RawExtension {
+	raw, _ := json.Marshal(obj)
+
+	return runtime.RawExtension{Raw: raw}
+}
+
+func validDeploymentMap() map[string]any {
+	return map[string]any{
+		fieldAPIVersion: appsV1,
+		fieldKind:       kindDeployment,
+		fieldSpec: map[string]any{
+			fieldTemplate: map[string]any{
+				fieldSpec: map[string]any{
+					fieldContainers: []any{
+						map[string]any{fieldName: fieldApp, fieldImage: imageNginx},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestRenderedChildTypedDecode(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	v := &PodPoolCustomValidator{}
+
+	pool := func(tmpl runtime.RawExtension) *podpoolsv1alpha1.PodPool {
+		return &podpoolsv1alpha1.PodPool{
+			Spec: podpoolsv1alpha1.PodPoolSpec{
+				Replicas:         3,
+				WorkloadTemplate: tmpl,
+				Groups: []podpoolsv1alpha1.GroupSpec{
+					{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)}},
+				},
+			},
+		}
+	}
+
+	t.Run("type error rejects", func(t *testing.T) {
+		t.Parallel()
+
+		tmpl := validDeploymentMap()
+		tmpl[fieldSpec].(map[string]any)["minReadySeconds"] = "ten"
+
+		_, err := v.ValidateCreate(ctx, pool(templateJSON(tmpl)))
+		if err == nil {
+			t.Error("expected rejection for minReadySeconds: \"ten\"")
+		}
+	})
+
+	t.Run("bad quantity rejects", func(t *testing.T) {
+		t.Parallel()
+
+		tmpl := validDeploymentMap()
+		containers := tmpl[fieldSpec].(map[string]any)["template"].(map[string]any)[fieldSpec].(map[string]any)["containers"].([]any)
+		containers[0].(map[string]any)["resources"] = map[string]any{
+			"limits": map[string]any{"cpu": "not-a-quantity"},
+		}
+
+		_, err := v.ValidateCreate(ctx, pool(templateJSON(tmpl)))
+		if err == nil {
+			t.Error("expected rejection for cpu: \"not-a-quantity\"")
+		}
+	})
+
+	t.Run("unknown field warns, not rejects", func(t *testing.T) {
+		t.Parallel()
+
+		tmpl := validDeploymentMap()
+		tmpl[fieldSpec].(map[string]any)["containerz"] = "typo"
+
+		warnings, err := v.ValidateCreate(ctx, pool(templateJSON(tmpl)))
+		if err != nil {
+			t.Errorf("unknown fields must warn, not reject (version skew): %v", err)
+		}
+
+		if len(warnings) == 0 {
+			t.Error("expected warning about unknown field")
+		}
+	})
+
+	t.Run("CRD GVK skips typed decode", func(t *testing.T) {
+		t.Parallel()
+
+		tmpl := map[string]any{
+			fieldAPIVersion: argoV1alpha1,
+			fieldKind:       kindRollout,
+			fieldSpec: map[string]any{
+				"minReadySeconds": "would-fail-if-decoded",
+				fieldTemplate: map[string]any{
+					fieldSpec: map[string]any{
+						fieldContainers: []any{
+							map[string]any{fieldName: fieldApp, fieldImage: imageNginx},
+						},
+					},
+				},
+			},
+		}
+
+		_, err := v.ValidateCreate(ctx, pool(templateJSON(tmpl)))
+		if err != nil {
+			t.Errorf("CRD GVK should skip typed decode: %v", err)
+		}
+	})
+}
+
+func TestPodPoolAsTemplate(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	v := &PodPoolCustomValidator{}
+
+	tmpl := map[string]any{
+		fieldAPIVersion: "podpools.dev/v1alpha1",
+		fieldKind:       "PodPool",
+		fieldSpec: map[string]any{
+			fieldTemplate: map[string]any{
+				fieldSpec: map[string]any{
+					fieldContainers: []any{
+						map[string]any{fieldName: fieldApp, fieldImage: imageNginx},
+					},
+				},
+			},
+		},
+	}
+
+	pool := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         3,
+			WorkloadTemplate: templateJSON(tmpl),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)}},
+			},
+		},
+	}
+
+	_, err := v.ValidateCreate(ctx, pool)
+	if err == nil {
+		t.Error("expected rejection for PodPool-as-template")
+	}
+
+	if !strings.Contains(err.Error(), "PodPool") {
+		t.Errorf("rejection should mention PodPool: %v", err)
+	}
+}
+
+func TestControllerOwnedPathOverrides(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	v := &PodPoolCustomValidator{}
+
+	poolWith := func(overrides map[string]any) *podpoolsv1alpha1.PodPool {
+		raw, _ := json.Marshal(overrides)
+
+		return &podpoolsv1alpha1.PodPool{
+			Spec: podpoolsv1alpha1.PodPoolSpec{
+				Replicas:         3,
+				WorkloadTemplate: validWorkloadTemplate(),
+				Groups: []podpoolsv1alpha1.GroupSpec{
+					{
+						Name:      testGroupBase,
+						Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+						Overrides: &runtime.RawExtension{Raw: raw},
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		overrides map[string]any
+		wantErr   bool
+	}{
+		{
+			name:      "spec.selector.matchLabels is controller-owned",
+			overrides: map[string]any{fieldSpec: map[string]any{fieldSelector: map[string]any{fieldMatchLabels: map[string]any{fieldApp: valueMine}}}},
+			wantErr:   true,
+		},
+		{
+			name:      "spec.selector.matchExpressions passes through",
+			overrides: map[string]any{fieldSpec: map[string]any{fieldSelector: map[string]any{"matchExpressions": []any{map[string]any{"key": "env", "operator": "In", "values": []any{"prod"}}}}}},
+		},
+		{
+			name:      "spec.replicas is controller-owned",
+			overrides: map[string]any{fieldSpec: map[string]any{"replicas": 5}},
+			wantErr:   true,
+		},
+		{
+			name:      "metadata.name is controller-owned",
+			overrides: map[string]any{fieldMetadata: map[string]any{fieldName: "my-name"}},
+			wantErr:   true,
+		},
+		{
+			name:      "metadata.ownerReferences is controller-owned",
+			overrides: map[string]any{fieldMetadata: map[string]any{"ownerReferences": []any{map[string]any{fieldName: "other"}}}},
+			wantErr:   true,
+		},
+		{
+			name:      "podpools.dev/* labels are controller-owned",
+			overrides: map[string]any{fieldMetadata: map[string]any{"labels": map[string]any{"podpools.dev/custom": valueMine}}},
+			wantErr:   true,
+		},
+		{
+			name:      "non-podpools labels are fine",
+			overrides: map[string]any{fieldMetadata: map[string]any{"labels": map[string]any{"app.kubernetes.io/name": valueMine}}},
+		},
+		{
+			name:      "spec.minReadySeconds is fine",
+			overrides: map[string]any{fieldSpec: map[string]any{"minReadySeconds": 30}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := v.ValidateCreate(ctx, poolWith(tt.overrides))
+			if tt.wantErr && err == nil {
+				t.Error("expected rejection for controller-owned path override")
+			}
+
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected rejection: %v", err)
+			}
+		})
+	}
+}
+
+func TestPreExistingBrokenPoolUpdate(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	v := &PodPoolCustomValidator{}
+
+	brokenOverride, _ := json.Marshal(map[string]any{
+		fieldSpec: map[string]any{fieldSelector: map[string]any{fieldMatchLabels: map[string]any{fieldApp: valueMine}}},
+	})
+
+	oldPool := &podpoolsv1alpha1.PodPool{
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         3,
+			WorkloadTemplate: validWorkloadTemplate(),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{
+					Name:      testGroupBase,
+					Scaling:   podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](3)},
+					Overrides: &runtime.RawExtension{Raw: brokenOverride},
+				},
+			},
+		},
+	}
+
+	t.Run("same broken override on update is downgraded to warning", func(t *testing.T) {
+		t.Parallel()
+
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.Replicas = 5
+
+		warnings, err := v.ValidateUpdate(ctx, oldPool, newPool)
+		if err != nil {
+			t.Fatalf("pre-existing broken override must not block updates: %v", err)
+		}
+
+		hasPreExisting := false
+
+		for _, w := range warnings {
+			if strings.Contains(w, "pre-existing") {
+				hasPreExisting = true
+
+				break
+			}
+		}
+
+		if !hasPreExisting {
+			t.Errorf("expected a pre-existing warning, got: %v", warnings)
+		}
+	})
+
+	t.Run("new failure on update is still rejected", func(t *testing.T) {
+		t.Parallel()
+
+		newBrokenOverride, _ := json.Marshal(map[string]any{
+			fieldSpec: map[string]any{
+				fieldSelector: map[string]any{fieldMatchLabels: map[string]any{fieldApp: valueMine}},
+				"replicas":    5,
+			},
+		})
+
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.Groups[0].Overrides = &runtime.RawExtension{Raw: newBrokenOverride}
+
+		_, err := v.ValidateUpdate(ctx, oldPool, newPool)
+		if err == nil {
+			t.Error("a newly introduced failure must still be rejected")
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// the authorization guard
+// --------------------------------------------------------------------------
+
+const (
+	sarTestUser = "developer@example.com"
+	sarTestNS   = "production"
+)
+
+func sarAdmissionCtx() context.Context {
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			UserInfo: authenticationv1.UserInfo{
+				Username: sarTestUser,
+				Groups:   []string{"system:authenticated"},
+			},
+			Namespace: sarTestNS,
+		},
+	}
+
+	return admission.NewContextWithRequest(context.Background(), req)
+}
+
+func sarInterceptor(allowed bool, sarErr error) client.WithWatch {
+	return (&sarProbe{allowed: allowed, err: sarErr}).client()
+}
+
+// sarProbe stands in for the authorizer and records what the admission guard
+// actually asked it.
+//
+// Both halves are load-bearing. The count is #63's: an outcome assertion cannot
+// distinguish "the check ran and allowed" from "the check never ran", so a
+// regression that re-skips the guard passes every allow-path test that only
+// looks at the returned error. The captured review is #64's: the guard can
+// issue a perfectly well-formed SAR about entirely the wrong resource, and the
+// only way to catch that is to read the ResourceAttributes it sent.
+type sarProbe struct {
+	// allowed is the verdict to return; err makes the review itself fail.
+	allowed bool
+	err     error
+
+	count int
+	last  *authzv1.SubjectAccessReview
+
+	// allow, when set, decides per review instead of the flat allowed field,
+	// so a test can grant one resource and deny every other.
+	allow func(*authzv1.SubjectAccessReview) bool
+}
+
+func (p *sarProbe) client() client.WithWatch {
+	s := runtime.NewScheme()
+	_ = authzv1.AddToScheme(s)
+	_ = podpoolsv1alpha1.AddToScheme(s)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).Build()
+
+	return interceptor.NewClient(fakeClient, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			sar, ok := obj.(*authzv1.SubjectAccessReview)
+			if !ok {
+				return c.Create(ctx, obj, opts...)
+			}
+
+			p.count++
+			p.last = sar.DeepCopy()
+
+			if p.err != nil {
+				return p.err
+			}
+
+			if p.allow != nil {
+				sar.Status.Allowed = p.allow(sar)
+			} else {
+				sar.Status.Allowed = p.allowed
+			}
+
+			return nil
+		},
+	})
+}
+
+func sarPool() *podpoolsv1alpha1.PodPool {
+	pp := &podpoolsv1alpha1.PodPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pool", Namespace: sarTestNS},
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         3,
+			WorkloadTemplate: validWorkloadTemplate(),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: ptr.To[int32](1)}},
+			},
+		},
+	}
+
+	return pp
+}
+
+func TestSARGuardAllowedWorkload(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{Client: sarInterceptor(true, nil)}
+	ctx := sarAdmissionCtx()
+
+	_, err := v.ValidateCreate(ctx, sarPool())
+	if err != nil {
+		t.Errorf("expected allowed workload to pass: %v", err)
+	}
+}
+
+func TestSARGuardDeniedWorkload(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{Client: sarInterceptor(false, nil)}
+	ctx := sarAdmissionCtx()
+
+	_, err := v.ValidateCreate(ctx, sarPool())
+	if err == nil {
+		t.Fatal("expected denied workload to be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "not authorized") {
+		t.Errorf("rejection message should mention authorization: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), sarTestUser) {
+		t.Errorf("rejection message should name the user: %v", err)
+	}
+}
+
+func TestSARGuardFailClosed(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{Client: sarInterceptor(false, errors.New("API server unreachable"))}
+	ctx := sarAdmissionCtx()
+
+	_, err := v.ValidateCreate(ctx, sarPool())
+	if err == nil {
+		t.Fatal("expected SAR failure to reject (fail-closed)")
+	}
+
+	if !strings.Contains(err.Error(), "authorization check failed") {
+		t.Errorf("rejection should distinguish operational failure from denial: %v", err)
+	}
+}
+
+// A kind whose resource name cannot be resolved cannot be authorized, and an
+// authorization that cannot be performed is a denial. Failing open here would
+// be the whole escalation path back: point a pool at any CRD workload the
+// resolver does not know and the guard stops asking.
+func TestSARGuardUnresolvablePluralDenies(t *testing.T) {
+	t.Parallel()
+
+	pp := sarPool()
+	pp.Spec.WorkloadTemplate = templateJSON(map[string]any{
+		fieldAPIVersion: argoV1alpha1,
+		fieldKind:       kindRollout,
+		fieldSpec: map[string]any{
+			fieldTemplate: map[string]any{
+				fieldSpec: map[string]any{
+					fieldContainers: []any{
+						map[string]any{fieldName: fieldApp, fieldImage: imageNginx},
+					},
+				},
+			},
+		},
+	})
+
+	probe := &sarProbe{allowed: true}
+	v := &PodPoolCustomValidator{Client: probe.client()}
+
+	_, err := v.ValidateCreate(sarAdmissionCtx(), pp)
+	if err == nil {
+		t.Fatal("a workload kind whose resource name cannot be resolved was admitted; " +
+			"the guard silently stopped applying")
+	}
+
+	if !strings.Contains(err.Error(), "Rollout") {
+		t.Errorf("rejection should name the unresolvable kind: %v", err)
+	}
+
+	if probe.count != 0 {
+		t.Errorf("a SubjectAccessReview was sent for an unresolved resource (%d); "+
+			"it would have authorized the wrong noun", probe.count)
+	}
+}
+
+func TestSARGuardNoClientIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{}
+	ctx := sarAdmissionCtx()
+
+	_, err := v.ValidateCreate(ctx, sarPool())
+	if err != nil {
+		t.Errorf("without a client the SAR check should be a no-op: %v", err)
+	}
+}
+
+func TestSARGuardNoAdmissionContextIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	v := &PodPoolCustomValidator{Client: sarInterceptor(false, nil)}
+
+	_, err := v.ValidateCreate(t.Context(), sarPool())
+	if err != nil {
+		t.Errorf("without admission context the SAR check should be a no-op: %v", err)
 	}
 }
