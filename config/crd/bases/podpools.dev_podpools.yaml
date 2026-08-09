@@ -14,7 +14,34 @@ spec:
     singular: podpool
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - description: Replicas requested by spec
+      jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - description: Replicas reported ready by child workloads
+      jsonPath: .status.readyReplicas
+      name: Ready
+      type: integer
+    - description: Summary of the Ready condition
+      jsonPath: .status.conditions[?(@.type=="Ready")].message
+      name: Status
+      type: string
+    - description: Number of groups in the pool
+      jsonPath: .status.groupCount
+      name: Groups
+      priority: 1
+      type: integer
+    - description: Machine-readable reason for the Ready condition
+      jsonPath: .status.conditions[?(@.type=="Ready")].reason
+      name: Reason
+      priority: 1
+      type: string
+    - description: Time since the pool was created
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: PodPool is the Schema for the podpools API.
@@ -37,27 +64,134 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of PodPool
+            description: PodPoolSpec defines the desired state of PodPool.
             properties:
-              foo:
-                description: foo is an example field of PodPool. Edit podpool_types.go
-                  to remove/update
-                type: string
+              groups:
+                description: |-
+                  Ordered list of groups that divide the pool's replicas. Groups are
+                  filled in list order: earlier groups are satisfied first, and the
+                  first group constrained only by min (no ceiling, not opportunistic)
+                  absorbs whatever remains.
+                items:
+                  description: GroupSpec defines a single group within a PodPool.
+                  properties:
+                    name:
+                      description: |-
+                        DNS-label name that identifies this group within the pool. Becomes
+                        part of the child workload's name (<pool>-<name>) and its label
+                        selector, so renaming a group replaces its child entirely.
+                      maxLength: 53
+                      minLength: 1
+                      pattern: ^[a-z][a-z0-9-]*[a-z0-9]$
+                      type: string
+                    overrides:
+                      description: |-
+                        Partial workload object deep-merged on top of the pool's template
+                        before the child is created. Use this to differentiate groups:
+                        node selectors, tolerations, resource requests, or any field the
+                        workload kind supports. Null values delete the corresponding key
+                        from the template.
+                      x-kubernetes-preserve-unknown-fields: true
+                    scaling:
+                      description: How many of the pool's total replicas this group
+                        should receive.
+                      properties:
+                        max:
+                          description: Absolute ceiling. Never more than this many
+                            pods.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        min:
+                          description: Cascade threshold. Satisfy before filling later
+                            groups.
+                          format: int32
+                          minimum: 0
+                          type: integer
+                        opportunistic:
+                          description: |-
+                            Size this group by whatever the scheduler will actually accept, rather
+                            than by a declared number or percentage.
+
+                            For a group running in another tier's spare capacity (expendable
+                            priority, pinned to nodes it does not own) the right size is "however
+                            much happens to be free right now", which no static value can express.
+                            The controller finds it by offering the group more replicas than it
+                            expects to place and handing the ones the scheduler rejects to the next
+                            group.
+
+                            Pairs with min only: this *is* the ceiling, so max and target would
+                            contradict it. Requires a later group able to absorb what does not fit.
+                          type: boolean
+                        target:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          description: |-
+                            Best-effort target. The group's desired share of the pool total, as
+                            a percentage (1%–100%). Expressed as a string with a trailing percent
+                            sign, following the same convention as maxSurge. When no max is set,
+                            the target doubles as the ceiling; when max is set, the group may
+                            grow past the target up to max via overflow.
+                          maxLength: 4
+                          x-kubernetes-int-or-string: true
+                      type: object
+                      x-kubernetes-validations:
+                      - message: min must not exceed max
+                        reason: FieldValueInvalid
+                        rule: '!has(self.min) || !has(self.max) || self.min <= self.max'
+                      - fieldPath: .opportunistic
+                        message: opportunistic is itself the ceiling; it pairs only
+                          with min
+                        reason: FieldValueInvalid
+                        rule: (!has(self.opportunistic) || !self.opportunistic) ||
+                          (!has(self.max) && !has(self.target))
+                      - fieldPath: .target
+                        message: target must be a percentage string like "30%" (1%–100%)
+                        reason: FieldValueInvalid
+                        rule: '!has(self.target) || (type(self.target) == string &&
+                          self.target.matches(''^([1-9]|[1-9][0-9]|100)%$''))'
+                  required:
+                  - name
+                  - scaling
+                  type: object
+                maxItems: 32
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              replicas:
+                description: |-
+                  Total number of pod replicas to distribute across all groups. Each
+                  group receives a share of this total according to its scaling
+                  constraints. An HPA targeting the pool's /scale subresource writes
+                  this field directly.
+                format: int32
+                maximum: 1000000
+                minimum: 0
+                type: integer
+              workloadTemplate:
+                description: |-
+                  Template for the child workload each group creates. Accepts any
+                  workload kind with a pod template at .spec.template: Deployment,
+                  StatefulSet, or a CRD such as Argo Rollout or Kruise CloneSet.
+                  The controller copies this template per group, injects
+                  group-specific overrides, and applies it with server-side apply.
+                x-kubernetes-preserve-unknown-fields: true
+            required:
+            - groups
+            - replicas
+            - workloadTemplate
             type: object
           status:
-            description: status defines the observed state of PodPool
+            description: PodPoolStatus defines the observed state of PodPool.
             properties:
               conditions:
                 description: |-
-                  conditions represent the current state of the PodPool resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                  Standard conditions summarising pool health. Ready is the single
+                  top-level signal; Progressing, TargetDegraded, and GroupsReady
+                  provide detail.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -112,10 +246,142 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 32
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              groupCount:
+                description: |-
+                  Number of groups defined in the spec. Projected into a print
+                  column so kubectl get shows the pool's fan-out at a glance.
+                format: int32
+                type: integer
+              groups:
+                description: Per-group observed state, one entry per spec.groups entry.
+                items:
+                  description: GroupStatus reflects the observed state of a single
+                    group.
+                  properties:
+                    message:
+                      description: |-
+                        Human-readable detail from the child workload's conditions.
+                        Best-effort: present when the child publishes a standard condition
+                        explaining the problem, absent for workload types that publish no
+                        conditions (e.g. StatefulSet, DaemonSet).
+                      maxLength: 512
+                      type: string
+                    name:
+                      description: Name of the group, matching the corresponding spec
+                        entry.
+                      minLength: 1
+                      type: string
+                    ready:
+                      description: |-
+                        Whether this group has at least its target replicas ready. False
+                        also covers "not yet known"; see Reason for which case applies.
+                      type: boolean
+                    readyReplicas:
+                      description: Ready replicas reported by this group's child workload.
+                      format: int32
+                      type: integer
+                    reason:
+                      description: |-
+                        Machine-readable reason for Ready. A closed set owned by this
+                        API; values are the same vocabulary the pool-level conditions use.
+                      minLength: 1
+                      type: string
+                    replicas:
+                      description: Replicas reported by this group's child workload.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    sharePercent:
+                      description: |-
+                        This group's share of the pool's total observed replicas, as a percentage.
+                        Calculated from observed replicas, not from the distribution target.
+                      format: int32
+                      type: integer
+                    targetReplicas:
+                      description: |-
+                        What the distribution asked this group to run. Differs from
+                        Replicas while a rollout is in progress or the child has not
+                        yet converged.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    updatedReplicas:
+                      description: |-
+                        Updated replicas reported by this group's child workload.
+                        Tracked per group so that a group which fails to reconcile can keep its
+                        last observed counts without dragging the pool total down.
+                      format: int32
+                      type: integer
+                    workloadRef:
+                      description: Reference to the child workload this group owns.
+                      properties:
+                        apiVersion:
+                          description: API group and version of the child workload,
+                            e.g. "apps/v1".
+                          minLength: 1
+                          type: string
+                        kind:
+                          description: Kind of the child workload, e.g. "Deployment".
+                          minLength: 1
+                          type: string
+                        name:
+                          description: Name of the child workload, always <pool>-<group>.
+                          minLength: 1
+                          type: string
+                      required:
+                      - apiVersion
+                      - kind
+                      - name
+                      type: object
+                  required:
+                  - name
+                  - ready
+                  - reason
+                  - replicas
+                  - targetReplicas
+                  type: object
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: |-
+                  The generation of the spec this status reflects. Lags
+                  metadata.generation when the controller has not yet reconciled
+                  the latest edit.
+                format: int64
+                type: integer
+              readyReplicas:
+                description: Total ready replicas reported by all child workloads.
+                format: int32
+                type: integer
+              replicas:
+                description: Total replicas reported by all child workloads.
+                format: int32
+                type: integer
+              selector:
+                description: |-
+                  Label selector serialized as a string, used by the /scale
+                  subresource to identify pods belonging to this pool.
+                type: string
+              unplacedReplicas:
+                description: |-
+                  Replicas that no group could accept without exceeding a ceiling the user
+                  set. Non-zero only when every group is capped, in which case the pool
+                  deliberately runs below spec.replicas rather than overspending on a tier
+                  that was limited on purpose.
+                format: int32
+                type: integer
+              updatedReplicas:
+                description: Total updated replicas reported by all child workloads.
+                format: int32
+                type: integer
             type: object
         required:
         - spec
@@ -123,4 +389,8 @@ spec:
     served: true
     storage: true
     subresources:
+      scale:
+        labelSelectorPath: .status.selector
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.replicas
       status: {}
