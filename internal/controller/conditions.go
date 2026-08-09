@@ -33,6 +33,7 @@ const (
 	ReasonProgressDeadlineExceeded   = "ProgressDeadlineExceeded"
 	ReasonPoolReady                  = "PoolReady"
 	ReasonWorkloadUpdating           = "WorkloadUpdating"
+	ReasonWatchSetupFailed           = "WatchSetupFailed"
 )
 
 // retiredConditionTypes are condition types this controller used to publish
@@ -76,6 +77,34 @@ type conditionInputs struct {
 	// workloadTemplate), not any group's. It makes GroupsReady report the pool
 	// without inventing a group name.
 	poolInvalid bool
+
+	// watchFailed means the pool's spec parsed but no informer could be
+	// established for the workload GVK, so nothing below that point ran. It
+	// exists so the watch-failure exit leaves an honest Ready condition rather
+	// than whatever the previous pass wrote. It does not stamp
+	// ObservedGeneration.
+	watchFailed bool
+}
+
+// haltedConditions reports a pool that stopped before doing any work, leaving
+// Available, TargetDegraded and GroupsReady at whatever they last said: this
+// pass learned nothing about them, and overwriting them with guesses would be
+// worse than leaving them stale.
+//
+// The conditions carry the generation last acted on rather than the current
+// one, because this pass acted on nothing. That is the property worth having
+// a named function for. Inline, the next exit to be added would copy these
+// lines and quietly disagree about the generation.
+func haltedConditions(pool *podpoolsv1alpha1.PodPool, reason, message string) {
+	for _, t := range []string{ConditionProgressing, ConditionReady} {
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               t,
+			Status:             metav1.ConditionFalse,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: pool.Status.ObservedGeneration,
+		})
+	}
 }
 
 // setConditions publishes the standard conditions and stamps
@@ -93,6 +122,23 @@ func setConditions(pool *podpoolsv1alpha1.PodPool, in conditionInputs) {
 	// Reconcile because conditions have one writer.
 	for _, t := range retiredConditionTypes {
 		meta.RemoveStatusCondition(&pool.Status.Conditions, t)
+	}
+
+	// Deliberately above the stamp. observedGeneration == generation is the
+	// API's way of saying the controller has acted on this spec, and no
+	// informer means nothing below the watch exit ran, so it has not.
+	//
+	// Stamping here would also break the recovery. Reconcile derives
+	// genChanged from the stored observedGeneration and stampGroupProgress
+	// uses it to restart LastProgressTime; stamping during an outage makes
+	// genChanged false when the CRD comes back, so the progress deadline is
+	// measured from before the outage and a long one fails the rollout that
+	// follows it.
+	if in.watchFailed {
+		haltedConditions(pool, ReasonWatchSetupFailed,
+			"No watch could be established for the workload type")
+
+		return
 	}
 
 	pool.Status.ObservedGeneration = gen

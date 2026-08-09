@@ -25,6 +25,7 @@ import (
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -36,7 +37,9 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
@@ -88,7 +91,9 @@ type groupReconcileResult struct {
 type PodPoolReconciler struct {
 	client.Client
 
-	Scheme *runtime.Scheme
+	Scheme     *runtime.Scheme
+	RESTMapper meta.RESTMapper
+	Cache      cache.Cache
 
 	// Clock is injected rather than read from the wall, because deadline
 	// behaviour is untestable against time.Now: a test cannot wait ten
@@ -99,6 +104,21 @@ type PodPoolReconciler struct {
 	// create path force-applies over an object the cache says is absent, the
 	// absence is confirmed against the API server itself.
 	APIReader client.Reader
+
+	// Watches are registered lazily, from Reconcile, which runs on several
+	// goroutines at once. The mutex guards the map; the controller handle is
+	// what watches get attached to after Build.
+	// watchStates maps each GVK to the informer instance our event handler
+	// was registered on, which is what makes "is this watch still live?"
+	// answerable rather than assumed.
+	ctrl                controller.Controller
+	watchStates         map[schema.GroupVersionKind]cache.Informer
+	watchFailureEmitted map[schema.GroupVersionKind]bool
+	// watchPendingSince is when each GVK's informer was first seen unsynced,
+	// which is the only thing that separates a cache still filling from one
+	// that never will.
+	watchPendingSince map[schema.GroupVersionKind]time.Time
+	watchMu           sync.Mutex
 
 	// Which groups have already been reported as publishing a count we could
 	// not represent. Keyed per group, not per GVK: a child reporting nonsense
@@ -178,6 +198,13 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	tmpl, err := workload.ParseTemplate(pool.Spec.WorkloadTemplate.Raw)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("parsing workload template: %w", err)
+	}
+
+	// Registered before any child is written, so the first child of a kind is
+	// born observed: a child changing is the event a pool most needs to hear,
+	// and the pool watch alone cannot deliver it.
+	if res, handled, err := r.setUpWatch(ctx, &pool, gvk); handled {
+		return res, err
 	}
 
 	result := workload.ComputeGroupTargets(pool.Spec.Replicas, pool.Spec.Groups)
@@ -327,6 +354,11 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	return ctrl.Result{RequeueAfter: deadlineAwareRequeue(&pool, groupStatuses, now)}, kerrors.NewAggregate(errs)
 }
 
+// watchSyncRequeue is how soon to look again while an informer is filling its
+// initial cache. Short, because the wait is normally milliseconds and nothing
+// else will wake the pool once the cache is warm.
+const watchSyncRequeue = 2 * time.Second
+
 // reconcileFloor is the base requeue interval for every pool. Without a floor
 // a converged pool is never looked at again until something changes it, and
 // the progress deadline could never fire on a pool that went quiet.
@@ -464,14 +496,6 @@ func stampGroupProgress(gs *podpoolsv1alpha1.GroupStatus, prev *podpoolsv1alpha1
 		// shortfall, not from the regression.
 		gs.LastProgressTime = prev.LastProgressTime
 	}
-}
-
-// SetupWithManager sets up the controller with the Manager.
-func (r *PodPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&podpoolsv1alpha1.PodPool{}).
-		Named("podpool").
-		Complete(r)
 }
 
 // patchStatus writes the pass's status exactly once, and only when it differs
@@ -923,6 +947,63 @@ func (r *PodPoolReconciler) reportOutOfRange(ctx context.Context, pool *podpools
 	logf.FromContext(ctx).Info(
 		"Child workload published counts outside the representable range; stored values are clamped",
 		"group", groupName)
+}
+
+// setUpWatch establishes the child watch and turns its outcome into an exit.
+// handled is false only when the watch is ready and Reconcile should carry on.
+//
+// Separate from ensureWatch because the two answer different questions: that
+// one reports what the informer is doing, this one decides what the pool
+// should do about it.
+func (r *PodPoolReconciler) setUpWatch(
+	ctx context.Context, pool *podpoolsv1alpha1.PodPool, gvk schema.GroupVersionKind,
+) (ctrl.Result, bool, error) {
+	err := r.ensureWatch(ctx, gvk)
+	if err == nil {
+		return ctrl.Result{}, false, nil
+	}
+
+	// A cache still filling is not a fault. No warning and no error: come back
+	// when it is warm. Returning the error would put the pool into exponential
+	// backoff waiting for something that takes milliseconds, and complain
+	// about it on every manager start.
+	if errors.Is(err, errWatchSyncPending) {
+		logf.FromContext(ctx).V(4).Info("Informer still syncing, retrying shortly", "gvk", gvk)
+
+		return ctrl.Result{RequeueAfter: watchSyncRequeue}, true, nil
+	}
+
+	// Without this the pool keeps reporting whatever the last pass wrote,
+	// which for a pool that was healthy until its CRD was uninstalled is
+	// Ready. Nothing in the object mentions the watch, and the only other
+	// signal is deduped to one line per GVK per process.
+	setConditions(pool, conditionInputs{watchFailed: true})
+	r.handleWatchFailure(ctx, pool, gvk, err)
+
+	return ctrl.Result{}, true, fmt.Errorf("setting up watch for %s: %w", gvk, err)
+}
+
+// handleWatchFailure reports a watch that will not come up, once per GVK per
+// process. Deduped because the pool retries on backoff for as long as the
+// kind stays unservable, and a line per retry buries the one that mattered.
+// The record is cleared when the informer finally syncs, so a kind that
+// breaks again later is reported again.
+func (r *PodPoolReconciler) handleWatchFailure(
+	ctx context.Context, pool *podpoolsv1alpha1.PodPool, gvk schema.GroupVersionKind, err error,
+) {
+	r.watchMu.Lock()
+	r.initWatchMapsLocked()
+
+	emitted := r.watchFailureEmitted[gvk]
+	if !emitted {
+		r.watchFailureEmitted[gvk] = true
+	}
+	r.watchMu.Unlock()
+
+	if !emitted {
+		logf.FromContext(ctx).Error(err, "Failed to set up watch for workload kind",
+			"podpool", klog.KObj(pool), "gvk", gvk, "reason", ReasonWatchSetupFailed)
+	}
 }
 
 // applyChild writes the rendered child with server-side apply.
