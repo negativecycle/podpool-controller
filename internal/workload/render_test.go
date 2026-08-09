@@ -6,6 +6,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
@@ -13,8 +14,13 @@ import (
 const (
 	testGroupBurst = "burst"
 
-	fieldStatus   = "status"
-	fieldReplicas = "replicas"
+	fieldStatus          = "status"
+	fieldReplicas        = "replicas"
+	fieldMetadata        = "metadata"
+	fieldUID             = "uid"
+	fieldResourceVersion = "resourceVersion"
+
+	testPoolName = "my-pool"
 )
 
 func TestChildName(t *testing.T) {
@@ -85,7 +91,7 @@ func rawTemplate() []byte {
 
 func testPool() *podpoolsv1alpha1.PodPool {
 	return &podpoolsv1alpha1.PodPool{
-		ObjectMeta: metav1.ObjectMeta{Name: "my-pool", Namespace: "prod", UID: "pool-uid-1"},
+		ObjectMeta: metav1.ObjectMeta{Name: testPoolName, Namespace: "prod", UID: "pool-uid-1"},
 	}
 }
 
@@ -119,7 +125,7 @@ func TestBuildChildWorkload(t *testing.T) {
 		t.Fatalf("BuildChildWorkload: %v", err)
 	}
 
-	if got := child.GetName(); got != "my-pool-base" {
+	if got := child.GetName(); got != testPoolName+"-base" {
 		t.Errorf("name = %q, want %q", got, "my-pool-base")
 	}
 
@@ -142,7 +148,7 @@ func TestBuildChildWorkload(t *testing.T) {
 	}
 
 	ref := refs[0]
-	if ref.Kind != KindPodPool || ref.Name != "my-pool" || string(ref.UID) != "pool-uid-1" {
+	if ref.Kind != KindPodPool || ref.Name != testPoolName || string(ref.UID) != "pool-uid-1" {
 		t.Errorf("ownerReference = %+v, want PodPool/my-pool/pool-uid-1", ref)
 	}
 
@@ -223,6 +229,14 @@ func TestRenderDoesNotLeakBetweenGroups(t *testing.T) {
 		t.Fatalf("building group B: %v", err)
 	}
 
+	if got := childA.GetLabels()[LabelGroup]; got != testGroupBase {
+		t.Errorf("group A label = %q, want %q", got, testGroupBase)
+	}
+
+	if got := childB.GetLabels()[LabelGroup]; got != testGroupBurst {
+		t.Errorf("group B label = %q, want %q", got, testGroupBurst)
+	}
+
 	if childA.GetName() == childB.GetName() {
 		t.Errorf("children should have distinct names, both got %q", childA.GetName())
 	}
@@ -265,7 +279,7 @@ func TestBuildChildWorkloadStripsPastedMetadata(t *testing.T) {
 	}
 
 	md := child.Object["metadata"].(map[string]any)
-	for _, key := range []string{"uid", "resourceVersion", "generation", "creationTimestamp", "managedFields", "annotations"} {
+	for _, key := range []string{fieldUID, fieldResourceVersion, "generation", "creationTimestamp", "managedFields", "annotations"} {
 		if _, present := md[key]; present {
 			t.Errorf("metadata.%s survived the strip", key)
 		}
@@ -315,5 +329,197 @@ func TestReadInt32(t *testing.T) {
 					tt.fields, got, ok, tt.want, tt.wantOK)
 			}
 		})
+	}
+}
+
+func TestMergeMaps(t *testing.T) {
+	t.Parallel()
+
+	base := map[string]any{
+		"a": "1",
+		"b": map[string]any{
+			"x": "2",
+			"y": "3",
+		},
+		"c": "keep",
+	}
+	patch := map[string]any{
+		"a": "overridden",
+		"b": map[string]any{
+			"x": "changed",
+			"z": "added",
+		},
+		"c": nil,
+	}
+
+	result := MergeMaps(base, patch)
+
+	if result["a"] != "overridden" {
+		t.Errorf("a: got %v, want overridden", result["a"])
+	}
+
+	b := result["b"].(map[string]any)
+	if b["x"] != "changed" {
+		t.Errorf("b.x: got %v, want changed", b["x"])
+	}
+
+	if b["y"] != "3" {
+		t.Errorf("b.y: got %v, want 3 (preserved from base)", b["y"])
+	}
+
+	if b["z"] != "added" {
+		t.Errorf("b.z: got %v, want added", b["z"])
+	}
+
+	if _, ok := result["c"]; ok {
+		t.Error("c should have been deleted by null patch")
+	}
+
+	if base["a"] != "1" || base["b"].(map[string]any)["x"] != "2" {
+		t.Error("MergeMaps mutated its base; a shared template merged twice would corrupt")
+	}
+}
+
+func TestBuildChildWorkloadWithOverrides(t *testing.T) {
+	t.Parallel()
+
+	override := map[string]any{
+		"spec": map[string]any{
+			"minReadySeconds": float64(30),
+		},
+	}
+	overrideBytes, _ := json.Marshal(override)
+
+	group := podpoolsv1alpha1.GroupSpec{
+		Name:      testGroupBase,
+		Overrides: &runtime.RawExtension{Raw: overrideBytes},
+	}
+
+	child, err := BuildChildWorkload(mustParse(t, rawTemplate()), group, testPool(), 5)
+	if err != nil {
+		t.Fatalf("BuildChildWorkload: %v", err)
+	}
+
+	minReady, found, _ := unstructured.NestedFloat64(child.Object, "spec", "minReadySeconds")
+	if !found || minReady != 30 {
+		t.Errorf("minReadySeconds: got %v (found=%v), want 30", minReady, found)
+	}
+}
+
+// TestRenderStripsMetadataFromOverrides closes the loophole the strip left
+// open: pasted metadata can arrive through an override just as easily as
+// through the template, and it is exactly as wrong there.
+func TestRenderStripsMetadataFromOverrides(t *testing.T) {
+	t.Parallel()
+
+	override := map[string]any{
+		fieldMetadata: map[string]any{
+			fieldUID:             "override-uid",
+			fieldResourceVersion: "99999",
+		},
+	}
+	overrideBytes, _ := json.Marshal(override)
+
+	group := podpoolsv1alpha1.GroupSpec{
+		Name:      testGroupBase,
+		Overrides: &runtime.RawExtension{Raw: overrideBytes},
+	}
+
+	child, err := BuildChildWorkload(mustParse(t, rawTemplate()), group, testPool(), 1)
+	if err != nil {
+		t.Fatalf("BuildChildWorkload: %v", err)
+	}
+
+	meta, _, _ := unstructured.NestedMap(child.Object, fieldMetadata)
+	if _, ok := meta[fieldUID]; ok {
+		t.Error("uid introduced by override should have been stripped")
+	}
+
+	if _, ok := meta[fieldResourceVersion]; ok {
+		t.Error("resourceVersion introduced by override should have been stripped")
+	}
+}
+
+func TestBuildChildWorkloadRejectsMalformedOverrides(t *testing.T) {
+	t.Parallel()
+
+	group := podpoolsv1alpha1.GroupSpec{
+		Name:      testGroupBase,
+		Overrides: &runtime.RawExtension{Raw: []byte(`{`)},
+	}
+
+	_, err := BuildChildWorkload(mustParse(t, rawTemplate()), group, testPool(), 1)
+	if err == nil {
+		t.Fatal("BuildChildWorkload accepted malformed override JSON")
+	}
+}
+
+// TestRenderSetsSelectorAndTemplateLabels pins the ownership boundary the
+// child's selector draws: it answers "which pods does this child own", it is
+// derived from controller-owned labels, and the pod template carries the
+// matching labels so the selector selects.
+func TestRenderSetsSelectorAndTemplateLabels(t *testing.T) {
+	t.Parallel()
+
+	child, err := BuildChildWorkload(mustParse(t, rawTemplate()), podpoolsv1alpha1.GroupSpec{Name: testGroupBase}, testPool(), 2)
+	if err != nil {
+		t.Fatalf("BuildChildWorkload: %v", err)
+	}
+
+	sel, found, err := unstructured.NestedStringMap(child.Object, "spec", "selector", "matchLabels")
+	if err != nil || !found {
+		t.Fatalf("selector matchLabels missing: found=%v err=%v", found, err)
+	}
+
+	if sel[LabelPool] != testPoolName || sel[LabelGroup] != testGroupBase {
+		t.Errorf("selector = %v, want pool/group labels", sel)
+	}
+
+	if _, managed := sel[LabelManagedBy]; managed {
+		t.Error("managed-by does not belong in the selector: it is not part of pod identity")
+	}
+
+	tmplLabels, found, err := unstructured.NestedStringMap(child.Object, "spec", "template", "metadata", "labels")
+	if err != nil || !found {
+		t.Fatalf("template labels missing: found=%v err=%v", found, err)
+	}
+
+	for k, want := range map[string]string{
+		LabelPool: testPoolName, LabelGroup: testGroupBase, LabelManagedBy: ManagerName,
+	} {
+		if tmplLabels[k] != want {
+			t.Errorf("template label %s = %q, want %q", k, tmplLabels[k], want)
+		}
+	}
+
+	if got := child.GetLabels()[LabelGroup]; got != testGroupBase {
+		t.Errorf("child label %s = %q, want %q", LabelGroup, got, testGroupBase)
+	}
+}
+
+func TestRenderPreservesUserLabelsOnChild(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{
+		"apiVersion": "apps/v1",
+		"kind": "Deployment",
+		"metadata": {"labels": {"team": "payments", "tier": "checkout"}},
+		"spec": {
+			"template": {"spec": {"containers": [{"name": "app", "image": "nginx:latest"}]}}
+		}
+	}`)
+
+	child, err := BuildChildWorkload(mustParse(t, raw), podpoolsv1alpha1.GroupSpec{Name: testGroupBase}, testPool(), 1)
+	if err != nil {
+		t.Fatalf("BuildChildWorkload: %v", err)
+	}
+
+	labels := child.GetLabels()
+	if labels["team"] != "payments" || labels["tier"] != "checkout" {
+		t.Errorf("user labels should survive on the child, got %v", labels)
+	}
+
+	if labels[LabelPool] != testPoolName || labels[LabelManagedBy] != ManagerName {
+		t.Errorf("controller labels should be merged in beside them, got %v", labels)
 	}
 }

@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,10 +32,6 @@ import (
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 	"github.com/negativecycle/podpool-controller/internal/workload"
 )
-
-// managerName is this controller's field-manager identity for server-side
-// apply. Moves beside the label scheme once one exists.
-const managerName = "podpool-controller"
 
 // childObservation is what one pass learned about a group's child workload.
 // It grows as the controller learns to read more; for now the only fact worth
@@ -48,6 +45,11 @@ type PodPoolReconciler struct {
 	client.Client
 
 	Scheme *runtime.Scheme
+
+	// APIReader bypasses the cache for reads that must not lag it: before the
+	// create path force-applies over an object the cache says is absent, the
+	// absence is confirmed against the API server itself.
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=podpools.dev,resources=podpools,verbs=get;list;watch;create;update;patch;delete
@@ -133,7 +135,7 @@ func (r *PodPoolReconciler) reconcileGroup(
 		return childObservation{}, fmt.Errorf("building workload: %w", err)
 	}
 
-	obs, err := r.reconcileWorkload(ctx, desired)
+	obs, err := r.reconcileWorkload(ctx, pool, desired)
 	if err != nil {
 		return childObservation{}, fmt.Errorf("reconciling workload: %w", err)
 	}
@@ -143,6 +145,7 @@ func (r *PodPoolReconciler) reconcileGroup(
 
 func (r *PodPoolReconciler) reconcileWorkload(
 	ctx context.Context,
+	pool *podpoolsv1alpha1.PodPool,
 	desired *unstructured.Unstructured,
 ) (childObservation, error) {
 	key := types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}
@@ -152,15 +155,48 @@ func (r *PodPoolReconciler) reconcileWorkload(
 
 	err := r.Get(ctx, key, existing)
 	if apierrors.IsNotFound(err) {
+		// The cache may lag the API server, so an unowned object at the same
+		// name can read as absent here and be force-applied over. Confirm
+		// absence with an uncached read before the first apply; a read
+		// failure fails closed, because assuming absence is exactly the bug.
+		uncached := &unstructured.Unstructured{}
+		uncached.SetGroupVersionKind(desired.GroupVersionKind())
+
+		if uerr := r.APIReader.Get(ctx, key, uncached); uerr == nil {
+			if !isControlledBy(uncached, pool) {
+				return childObservation{}, &workloadNotOwnedError{
+					kind:  uncached.GetKind(),
+					name:  uncached.GetName(),
+					owner: metav1.GetControllerOf(uncached),
+				}
+			}
+
+			existing = uncached
+		} else if !apierrors.IsNotFound(uerr) {
+			return childObservation{}, uerr
+		}
+
 		if err := r.applyChild(ctx, desired); err != nil {
 			return childObservation{}, err
 		}
 
-		return childObservation{created: true}, nil
+		if existing.GetName() == "" {
+			return childObservation{created: true}, nil
+		}
+
+		return childObservation{}, nil
 	}
 
 	if err != nil {
 		return childObservation{}, err
+	}
+
+	if !isControlledBy(existing, pool) {
+		return childObservation{}, &workloadNotOwnedError{
+			kind:  existing.GetKind(),
+			name:  existing.GetName(),
+			owner: metav1.GetControllerOf(existing),
+		}
 	}
 
 	if err := r.applyChild(ctx, desired); err != nil {
@@ -178,7 +214,7 @@ func (r *PodPoolReconciler) applyChild(ctx context.Context, desired *unstructure
 	desired.SetResourceVersion("")
 
 	return r.Apply(ctx, client.ApplyConfigurationFromUnstructured(desired),
-		client.FieldOwner(managerName),
+		client.FieldOwner(workload.ManagerName),
 		client.ForceOwnership,
 	)
 }

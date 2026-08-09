@@ -17,6 +17,7 @@ import (
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
+	"github.com/negativecycle/podpool-controller/internal/workload"
 )
 
 // These run against a real API server because the two properties in tension
@@ -38,7 +39,7 @@ var _ = Describe("Child workload drift", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: poolName, Namespace: ns},
 			Spec: podpoolsv1alpha1.PodPoolSpec{
 				Replicas:         2,
-				WorkloadTemplate: workloadTemplateWithSelector("drift-app"),
+				WorkloadTemplate: workloadTemplateJSON(testAppsV1, testDepKind, testContainer),
 				Groups: []podpoolsv1alpha1.GroupSpec{
 					{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minTwo}},
 				},
@@ -181,13 +182,7 @@ var _ = Describe("Child workload drift", func() {
 				fieldResourceVersion: "99999",
 			},
 			fieldSpec: map[string]any{
-				fieldSelector: map[string]any{
-					fieldMatchLabels: map[string]any{labelKeyApp: "uid-app"},
-				},
 				fieldTemplate: map[string]any{
-					fieldMetadata: map[string]any{
-						fieldLabels: map[string]any{labelKeyApp: "uid-app"},
-					},
 					fieldSpec: map[string]any{
 						fieldContainers: []any{
 							map[string]any{
@@ -234,13 +229,7 @@ var _ = Describe("Child workload drift", func() {
 				fieldFinalizers: []any{"foregroundDeletion"},
 			},
 			fieldSpec: map[string]any{
-				fieldSelector: map[string]any{
-					fieldMatchLabels: map[string]any{labelKeyApp: "fin-app"},
-				},
 				fieldTemplate: map[string]any{
-					fieldMetadata: map[string]any{
-						fieldLabels: map[string]any{labelKeyApp: "fin-app"},
-					},
 					fieldSpec: map[string]any{
 						fieldContainers: []any{
 							map[string]any{
@@ -277,5 +266,79 @@ var _ = Describe("Child workload drift", func() {
 
 		Expect(dep.Finalizers).To(BeEmpty(),
 			"pasted finalizers from template should not land on the child")
+	})
+})
+
+var _ = Describe("Foreign fields on a child", func() {
+	const poolName = "foreign-pool"
+
+	var ns string
+
+	BeforeEach(func() {
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "test-foreign-"}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		ns = nsObj.Name
+
+		minTwo := int32(2)
+		pool := &podpoolsv1alpha1.PodPool{
+			ObjectMeta: metav1.ObjectMeta{Name: poolName, Namespace: ns},
+			Spec: podpoolsv1alpha1.PodPoolSpec{
+				Replicas:         2,
+				WorkloadTemplate: workloadTemplateJSON(testAppsV1, testDepKind, testContainer),
+				Groups: []podpoolsv1alpha1.GroupSpec{
+					{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minTwo}},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+	})
+
+	It("leaves fields it does not render alone", func() {
+		childKey := types.NamespacedName{Name: poolName + "-" + testGroupBase, Namespace: ns}
+
+		var dep appsv1.Deployment
+
+		Eventually(func() error {
+			return k8sClient.Get(ctx, childKey, &dep)
+		}).Should(Succeed())
+
+		foreign := dep.DeepCopy()
+		if foreign.Annotations == nil {
+			foreign.Annotations = map[string]string{}
+		}
+
+		foreign.Annotations["other.io/owned-by-someone-else"] = "keep me"
+		// A foreign label matters more than a foreign annotation: the
+		// controller renders labels of its own, so replacing instead of
+		// merging would clobber this one. Server-side apply has to preserve
+		// it with no merge code on our side.
+		if foreign.Labels == nil {
+			foreign.Labels = map[string]string{}
+		}
+
+		foreign.Labels["app.kubernetes.io/managed-by"] = "Helm"
+		foreign.Spec.Template.Spec.Containers[0].TerminationMessagePath = "/dev/termination-custom"
+		Expect(k8sClient.Update(ctx, foreign, client.FieldOwner("other-controller"))).To(Succeed())
+
+		// No child watch yet, so give the controller its chance to clobber
+		// deliberately: nudge a pass, then hold the assertion open.
+		var pool podpoolsv1alpha1.PodPool
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: poolName, Namespace: ns}, &pool)).To(Succeed())
+		pool.Annotations = map[string]string{"test.podpools.dev/nudge": "foreign"}
+		Expect(k8sClient.Update(ctx, &pool)).To(Succeed())
+
+		Consistently(func(g Gomega) {
+			var d appsv1.Deployment
+			g.Expect(k8sClient.Get(ctx, childKey, &d)).To(Succeed())
+			g.Expect(d.Annotations).To(HaveKeyWithValue("other.io/owned-by-someone-else", "keep me"))
+			g.Expect(d.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "Helm"))
+			g.Expect(d.Spec.Template.Spec.Containers[0].TerminationMessagePath).
+				To(Equal("/dev/termination-custom"))
+
+			// ...while the labels the controller does own are still correct.
+			g.Expect(d.Labels).To(HaveKeyWithValue(workload.LabelPool, poolName))
+			g.Expect(d.Labels).To(HaveKeyWithValue(workload.LabelGroup, testGroupBase))
+			g.Expect(d.Labels).To(HaveKeyWithValue(workload.LabelManagedBy, workload.ManagerName))
+		}).WithPolling(300 * time.Millisecond).WithTimeout(3 * time.Second).Should(Succeed())
 	})
 })

@@ -46,7 +46,7 @@ func newFakeReconciler(t *testing.T, objs ...client.Object) (*PodPoolReconciler,
 		WithObjects(objs...).
 		Build()
 
-	return &PodPoolReconciler{Client: cl, Scheme: scheme}, cl
+	return &PodPoolReconciler{Client: cl, Scheme: scheme, APIReader: cl}, cl
 }
 
 func fakeTestPool() *podpoolsv1alpha1.PodPool {
@@ -57,7 +57,7 @@ func fakeTestPool() *podpoolsv1alpha1.PodPool {
 		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: testNamespace, Generation: 1, UID: "fake-pool-uid"},
 		Spec: podpoolsv1alpha1.PodPoolSpec{
 			Replicas:         3,
-			WorkloadTemplate: workloadTemplateJSON("apps/v1", "Deployment", "app", testImageNginx),
+			WorkloadTemplate: workloadTemplateJSON(testAppsV1, testDepKind, "app"),
 			Groups: []podpoolsv1alpha1.GroupSpec{
 				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minTwo}},
 				{Name: testGroupSpot, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minOne}},

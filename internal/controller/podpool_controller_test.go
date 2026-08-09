@@ -51,7 +51,7 @@ var _ = Describe("PodPool Controller", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: poolName, Namespace: ns},
 				Spec: podpoolsv1alpha1.PodPoolSpec{
 					Replicas:         5,
-					WorkloadTemplate: workloadTemplateWithSelector("ctrl-app"),
+					WorkloadTemplate: workloadTemplateJSON(testAppsV1, testDepKind, testContainer),
 					Groups: []podpoolsv1alpha1.GroupSpec{
 						// base is capped by its 70% target, so spot is the
 						// unbounded group that absorbs the remainder.
@@ -163,7 +163,7 @@ var _ = Describe("PodPool Controller", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: "rollout-pool", Namespace: ns},
 				Spec: podpoolsv1alpha1.PodPoolSpec{
 					Replicas:         2,
-					WorkloadTemplate: workloadTemplateJSON("argoproj.io/v1alpha1", "Rollout", testContainer, testImageNginx),
+					WorkloadTemplate: workloadTemplateJSON("argoproj.io/v1alpha1", "Rollout", testContainer),
 					Groups: []podpoolsv1alpha1.GroupSpec{
 						{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minTwo}},
 					},
@@ -192,7 +192,7 @@ var _ = Describe("PodPool Controller", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: "cloneset-pool", Namespace: ns},
 				Spec: podpoolsv1alpha1.PodPoolSpec{
 					Replicas:         2,
-					WorkloadTemplate: workloadTemplateJSON("apps.kruise.io/v1alpha1", "CloneSet", testContainer, testImageNginx),
+					WorkloadTemplate: workloadTemplateJSON("apps.kruise.io/v1alpha1", "CloneSet", testContainer),
 					Groups: []podpoolsv1alpha1.GroupSpec{
 						{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minTwo}},
 					},

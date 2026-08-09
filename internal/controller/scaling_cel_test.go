@@ -101,7 +101,7 @@ var _ = Describe("CEL validation of scaling combinations", func() {
 				},
 				Spec: podpoolsv1alpha1.PodPoolSpec{
 					Replicas:         5,
-					WorkloadTemplate: workloadTemplateWithSelector(labelKeyApp),
+					WorkloadTemplate: workloadTemplateJSON(testAppsV1, testDepKind, testContainer),
 					Groups: []podpoolsv1alpha1.GroupSpec{
 						{Name: "under-test", Scaling: shape.scaling},
 						// A trailing uncapped group so the pool is otherwise
