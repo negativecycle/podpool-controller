@@ -1,0 +1,9 @@
+apiVersion: podpools.dev/v1alpha1
+kind: PodPool
+metadata:
+  labels:
+    app.kubernetes.io/name: podpools
+    app.kubernetes.io/managed-by: kustomize
+  name: podpool-sample
+spec:
+  # TODO(user): Add fields here
