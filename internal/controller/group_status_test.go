@@ -105,8 +105,8 @@ func TestFailedGroupRowKeepsErrorReason(t *testing.T) {
 	got := getPool(t, cl, pool)
 
 	base := findGroupStatus(got.Status.Groups, testGroupBase)
-	if base == nil || base.Reason != ReasonGroupReconcileFailed {
-		t.Errorf("failed row = %+v, want reason GroupReconcileFailed", base)
+	if base == nil || base.Reason != ReasonGroupSpecInvalid {
+		t.Errorf("failed row = %+v, want reason GroupSpecInvalid", base)
 	}
 
 	spot := findGroupStatus(got.Status.Groups, testGroupSpot)

@@ -1,17 +1,19 @@
 package controller
 
 // Package-wide harness for the fake-client tier: the reconciler constructor,
-// pool fixtures, and reconcile drivers the stdlib tests in this package
-// share. Feature files keep their feature-specific fakes; a helper used
+// pool fixtures, reconcile drivers, and event helpers that the stdlib tests in
+// this package share. Feature files keep their feature-specific fakes; a helper used
 // across files lives here, so deleting a feature test cannot orphan the
 // harness underneath the rest of the package.
 //
 // Tests in this package stay serial on purpose: both pool fixtures share one
-// pool name, and the envtest suite runs in the same binary.
+// pool name, Reconcile writes per pool gauges to the process global metrics
+// registry, and the envtest suite runs in the same binary.
 
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -79,7 +81,7 @@ func fakeTestPool() *podpoolsv1alpha1.PodPool {
 		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: testNamespace, Generation: 1, UID: "fake-pool-uid"},
 		Spec: podpoolsv1alpha1.PodPoolSpec{
 			Replicas:         3,
-			WorkloadTemplate: workloadTemplateJSON(testAppsV1, testDepKind, "app"),
+			WorkloadTemplate: workloadTemplateJSON(testAppsV1, testDepKind, testUserLabelKey),
 			Groups: []podpoolsv1alpha1.GroupSpec{
 				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minTwo}},
 				{Name: testGroupSpot, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minOne}},
@@ -142,5 +144,50 @@ func tryReconcilePool(r *PodPoolReconciler, pool *podpoolsv1alpha1.PodPool) erro
 func reconcileRequestFor(pool *podpoolsv1alpha1.PodPool) ctrl.Request {
 	return ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace},
+	}
+}
+
+// drainEvents empties a FakeRecorder's channel without blocking. Reading with a
+// plain range would block forever: the channel is never closed, because the
+// recorder does not know when the test has finished with it.
+func drainEvents(ch <-chan string) []string {
+	var result []string
+
+	for {
+		select {
+		case e := <-ch:
+			result = append(result, e)
+		default:
+			return result
+		}
+	}
+}
+
+func countEventsByReason(evts []string, reason string) int {
+	n := 0
+
+	for _, e := range evts {
+		if strings.Contains(e, reason) {
+			n++
+		}
+	}
+
+	return n
+}
+
+// singleGroupPool keeps event counting unambiguous: with one group, "how many
+// events" and "how many events about this group" are the same number.
+func singleGroupPool() *podpoolsv1alpha1.PodPool {
+	minThree := int32(3)
+
+	return &podpoolsv1alpha1.PodPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: testNamespace, Generation: 1, UID: "fake-pool-uid"},
+		Spec: podpoolsv1alpha1.PodPoolSpec{
+			Replicas:         3,
+			WorkloadTemplate: workloadTemplateJSON(testAppsV1, testDepKind, testContainer),
+			Groups: []podpoolsv1alpha1.GroupSpec{
+				{Name: testGroupBase, Scaling: podpoolsv1alpha1.ScalingConstraints{Min: &minThree}},
+			},
+		},
 	}
 }

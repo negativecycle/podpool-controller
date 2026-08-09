@@ -7,6 +7,13 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
   - list
@@ -28,6 +35,14 @@ rules:
   - subjectaccessreviews
   verbs:
   - create
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+  - update
 - apiGroups:
   - podpools.dev
   resources:

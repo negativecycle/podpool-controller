@@ -38,6 +38,10 @@ const (
 	testContainer  = "api"
 	testPoolName   = "my-pool"
 
+	// testUserLabelKey is the label a user's own template carries, as opposed
+	// to the ones this controller sets.
+	testUserLabelKey = "app"
+
 	fieldAPIVersion      = "apiVersion"
 	fieldKind            = "kind"
 	fieldMetadata        = "metadata"

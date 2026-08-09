@@ -48,9 +48,9 @@ func TestConditionsOnFreshPool(t *testing.T) {
 // child still exists, which TestReconcileContinuesPastFailingGroup pins.
 func TestConditionsNameTheFailingGroup(t *testing.T) {
 	pool := fakeTestPool()
-	breakGroup(pool)
 
 	r, cl := newFakeReconciler(t, nil, pool)
+	failApplyForChild(t, r, pool.Name+"-"+testGroupBase)
 
 	_ = tryReconcilePool(r, pool)
 
@@ -145,13 +145,14 @@ func TestReadyMessagesFitTheColumnBudget(t *testing.T) {
 		name string
 		cond metav1.Condition
 	}{
-		{"scaled to zero", summaryReady(1, 0, 0, 0, nil, nil)},
-		{"failed groups", summaryReady(1, 0, 9, 0, longNames, nil)},
-		{"unplaced", summaryReady(1, 100000, 1000000, 900000, nil, nil)},
-		{"none ready", summaryReady(1, 0, 1000000, 0, nil, nil)},
-		{"stalled", summaryReady(1, 3, 9, 0, nil, longNames)},
-		{"updating", summaryReady(1, 999999, 1000000, 0, nil, nil)},
-		{"ready", summaryReady(1, 1000000, 1000000, 0, nil, nil)},
+		{"scaled to zero", summaryReady(1, 0, 0, 0, nil, nil, nil)},
+		{"terminal groups", summaryReady(1, 0, 9, 0, longNames, longNames, nil)},
+		{"failed groups", summaryReady(1, 0, 9, 0, longNames, nil, nil)},
+		{"unplaced", summaryReady(1, 100000, 1000000, 900000, nil, nil, nil)},
+		{"none ready", summaryReady(1, 0, 1000000, 0, nil, nil, nil)},
+		{"stalled", summaryReady(1, 3, 9, 0, nil, nil, longNames)},
+		{"updating", summaryReady(1, 999999, 1000000, 0, nil, nil, nil)},
+		{"ready", summaryReady(1, 1000000, 1000000, 0, nil, nil, nil)},
 	}
 
 	for _, tc := range cases {

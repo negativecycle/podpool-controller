@@ -185,8 +185,11 @@ func main() {
 	}
 
 	if err := (&controller.PodPoolReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("podpool-controller"),
+		// Uncached: opportunistic sizing reads a few pods occasionally rather
+		// than caching every pod in the cluster.
 		APIReader: mgr.GetAPIReader(),
 		Clock:     clock.RealClock{},
 	}).SetupWithManager(mgr); err != nil {

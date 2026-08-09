@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -9,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 )
@@ -44,15 +47,43 @@ func childExists(t *testing.T, cl client.Client, pool *podpoolsv1alpha1.PodPool,
 	return err == nil
 }
 
+// failApplyForChild makes one group's child apply fail with a plain error,
+// which is the ordinary retryable class: nothing about it says a spec edit is
+// needed, so the pool keeps the workqueue.
+func failApplyForChild(t *testing.T, r *PodPoolReconciler, childName string) {
+	t.Helper()
+
+	base, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatalf("fake client %T does not implement client.WithWatch", r.Client)
+	}
+
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{
+		Apply: func(ctx context.Context, c client.WithWatch, ac runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+			u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(ac)
+			if err == nil {
+				if md, ok := u["metadata"].(map[string]any); ok && md["name"] == childName {
+					return errors.New("simulated transient apply failure")
+				}
+			}
+
+			return c.Apply(ctx, ac, opts...)
+		},
+	})
+}
+
 // A group that cannot be reconciled used to abort the whole loop, so every
 // later group stopped being reconciled: one bad group froze the pool. Failures
 // are collected instead, later groups proceed, and the aggregate comes back
 // naming each failed group.
+//
+// A retryable failure deliberately: a terminal one would be suppressed at the
+// tail of Reconcile, and this test is about the loop, not the requeue.
 func TestReconcileContinuesPastFailingGroup(t *testing.T) {
 	pool := fakeTestPool()
-	breakGroup(pool)
 
 	r, cl := newFakeReconciler(t, nil, pool)
+	failApplyForChild(t, r, pool.Name+"-"+testGroupBase)
 
 	err := tryReconcilePool(r, pool)
 	if err == nil {

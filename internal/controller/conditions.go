@@ -33,7 +33,10 @@ const (
 	ReasonProgressDeadlineExceeded   = "ProgressDeadlineExceeded"
 	ReasonPoolReady                  = "PoolReady"
 	ReasonWorkloadUpdating           = "WorkloadUpdating"
-	ReasonWatchSetupFailed           = "WatchSetupFailed"
+	ReasonWorkloadTemplateInvalid    = "WorkloadTemplateInvalid"
+	// Used as both a condition reason and an event reason, from one constant so
+	// the two cannot drift.
+	ReasonWatchSetupFailed = "WatchSetupFailed"
 )
 
 // retiredConditionTypes are condition types this controller used to publish
@@ -68,10 +71,17 @@ type conditionInputs struct {
 	stalledGroups  []string
 
 	// notOwnedGroups are groups whose child exists but is controlled by
-	// something else. Kept separate from failedGroups' ordinary retryable
-	// class because it is the one failure that means the controller is
-	// deliberately refusing to write.
+	// something else. Kept separate from terminalGroups because the failure is
+	// not terminal (deleting the conflicting object resolves it) and not the
+	// ordinary retryable class either: it is the one failure that means the
+	// controller is deliberately refusing to write.
 	notOwnedGroups []string
+
+	// terminalGroups is the subset of failedGroups whose failure cannot
+	// succeed without a spec change. A subset, not a partition: the arithmetic
+	// below compares its length against failedGroups' to decide whether the
+	// whole pool is waiting on a human.
+	terminalGroups []string
 
 	// poolInvalid means the failure is the pool's own (e.g. an unparseable
 	// workloadTemplate), not any group's. It makes GroupsReady report the pool
@@ -227,17 +237,28 @@ func setConditions(pool *podpoolsv1alpha1.PodPool, in conditionInputs) {
 		groupsReady.Status = metav1.ConditionTrue
 		groupsReady.Reason = ReasonAllGroupsReconciled
 		groupsReady.Message = "All groups reconciled"
-	// Above the generic-failure arm deliberately. A pool with one not-owned
-	// group and one otherwise-broken group reports the ownership conflict,
-	// because a collision with another actor in the cluster is both more
-	// surprising and more likely to be someone else's ongoing mistake than an
-	// error the operator can read off their own manifest. notOwnedMessage says
-	// how many others failed so the summary does not imply ownership is the
-	// only problem.
+	// Above the terminal arm, though nothing today can reach both: an
+	// ownership conflict is never terminal, so the two sets are disjoint and
+	// this ordering is defensive rather than load-bearing. What actually
+	// produces the behaviour worth having is the arm below: a pool with one
+	// not-owned group and one spec-invalid group reports the ownership
+	// conflict, because the terminal arm requires EVERY failure to be terminal
+	// and this pool has two classes. The spec error is demoted to a count, and
+	// notOwnedMessage says how many so the summary does not imply ownership is
+	// the only problem.
 	case len(in.notOwnedGroups) > 0:
 		groupsReady.Status = metav1.ConditionFalse
 		groupsReady.Reason = ReasonWorkloadNotOwned
 		groupsReady.Message = notOwnedMessage(in.notOwnedGroups, in.failedGroups)
+	// Only when EVERY failure is terminal. One retryable failure among them
+	// means the pool may still resolve itself, and saying "requires a change"
+	// would send an operator to edit a spec that is not the problem.
+	case len(in.terminalGroups) == len(in.failedGroups):
+		groupsReady.Status = metav1.ConditionFalse
+		groupsReady.Reason = ReasonGroupSpecInvalid
+		groupsReady.Message = fmt.Sprintf(
+			"Group(s) %s have spec errors that require a change to resolve",
+			strings.Join(in.terminalGroups, ", "))
 	default:
 		groupsReady.Status = metav1.ConditionFalse
 		groupsReady.Reason = ReasonGroupReconcileFailed
@@ -249,7 +270,7 @@ func setConditions(pool *podpoolsv1alpha1.PodPool, in conditionInputs) {
 	meta.SetStatusCondition(&pool.Status.Conditions, degraded)
 	meta.SetStatusCondition(&pool.Status.Conditions, groupsReady)
 	meta.SetStatusCondition(&pool.Status.Conditions, summaryReady(
-		gen, in.ready, in.desired, in.unplaced, in.failedGroups, in.stalledGroups))
+		gen, in.ready, in.desired, in.unplaced, in.failedGroups, in.terminalGroups, in.stalledGroups))
 }
 
 const readyMessageBudget = 60
@@ -286,7 +307,7 @@ func formatGroupNamesBudgeted(groups []string) string {
 // not another branch. Messages are deliberately short: this condition is
 // projected into a kubectl print column where anything over ~60
 // characters is unreadable.
-func summaryReady(gen int64, ready, desired, unplaced int32, failedGroups, stalledGroups []string) metav1.Condition {
+func summaryReady(gen int64, ready, desired, unplaced int32, failedGroups, terminalGroups, stalledGroups []string) metav1.Condition {
 	mk := func(status metav1.ConditionStatus, reason, message string) metav1.Condition {
 		return metav1.Condition{
 			Type:               ConditionReady,
@@ -300,6 +321,11 @@ func summaryReady(gen int64, ready, desired, unplaced int32, failedGroups, stall
 	switch {
 	case desired == 0:
 		return mk(metav1.ConditionTrue, ReasonScaledToZero, "Scaled to zero")
+	// Above the generic failure arm: the print column has room for one verdict,
+	// and "needs an edit" is more actionable than "failed".
+	case len(terminalGroups) > 0:
+		return mk(metav1.ConditionFalse, ReasonGroupSpecInvalid,
+			"Group spec invalid: "+formatGroupNamesBudgeted(terminalGroups))
 	case len(failedGroups) > 0:
 		return mk(metav1.ConditionFalse, ReasonGroupReconcileFailed,
 			"Group reconcile failed: "+formatGroupNamesBudgeted(failedGroups))
