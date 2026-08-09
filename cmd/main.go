@@ -38,6 +38,7 @@ import (
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
 	"github.com/negativecycle/podpool-controller/internal/controller"
+	webhookv1alpha1 "github.com/negativecycle/podpool-controller/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -191,6 +192,17 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "podpool")
 		os.Exit(1)
+	}
+
+	// Off by an env var rather than a flag for now, which is what the scaffold
+	// gives us: envtest suites that install no webhook configuration need the
+	// manager to come up without one. A proper flag, cross-validated against
+	// the cert paths, arrives with the rest of the operability work.
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1alpha1.SetupPodPoolWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "PodPool")
+			os.Exit(1)
+		}
 	}
 	// +kubebuilder:scaffold:builder
 
