@@ -23,7 +23,7 @@ jobs:
   image:
     name: Build and publish
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     permissions:
       # write, not read: this job owns the release it announces.
       contents: write

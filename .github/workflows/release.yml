@@ -33,6 +33,7 @@ jobs:
       github.event.pull_request.merged == true &&
       !contains(github.event.pull_request.labels.*.name, 'semver:skip')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
       actions: write
