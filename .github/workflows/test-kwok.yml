@@ -22,7 +22,7 @@ jobs:
   test-kwok:
     permissions:
       contents: read
-    name: Run on Ubuntu
+    name: KWOK
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
