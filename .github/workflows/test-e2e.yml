@@ -2,6 +2,10 @@ name: E2E Tests
 
 on:
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '.github/**'
 
 # A force-push supersedes the run it interrupted; without this the obsolete
 # one keeps a runner busy to no purpose.

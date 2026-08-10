@@ -2,6 +2,9 @@ name: Security
 
 on:
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
   schedule:
     # Weekly, so newly disclosed CVEs surface without waiting for a push.
     - cron: '0 6 * * 1'
