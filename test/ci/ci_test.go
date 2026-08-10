@@ -310,6 +310,31 @@ func TestWorkflowsPassActionlint(t *testing.T) {
 	}
 }
 
+// TestVerificationScriptExists guards the claim the document makes about
+// itself.
+//
+// docs/tutorial-v2.html tells the reader that
+// hack/verify-tutorial-steps.sh proves the series green. A document citing a
+// script nobody ships is the same defect as a workflow nobody runs, and it is
+// harder to notice: the prose reads exactly as convincingly either way.
+//
+// This asserts the file exists and is executable. It deliberately does not run
+// it -- checking out every commit and testing it takes far longer than a unit
+// test should -- so what is guarded here is that the claim has something
+// behind it, not that the something currently passes.
+func TestVerificationScriptExists(t *testing.T) {
+	const script = "hack/verify-tutorial-steps.sh"
+
+	info, err := os.Stat(filepath.Join(repoRoot, script))
+	if err != nil {
+		t.Fatalf("%s is missing, but the tutorial document tells the reader to run it: %v", script, err)
+	}
+
+	if info.Mode()&0o111 == 0 {
+		t.Errorf("%s is not executable, so the command the document prints does not work", script)
+	}
+}
+
 // TestActionlintRunsInCI wires the structural check into the one place that
 // always runs it.
 //
