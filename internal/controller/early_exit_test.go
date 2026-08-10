@@ -7,18 +7,142 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/events"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
+	"github.com/negativecycle/podpool-controller/internal/workload"
 )
 
-// Reconcile has two exits above its main body: an unparseable workload
-// template, and a watch that will not come up. The full path maintains
-// invariants that neither of them does, so tests here name the invariant
-// rather than the exit: the next early return added will break the same ones.
+// Reconcile has three exits above its main body: paused, an unparseable
+// workload template, and a watch that will not come up. The full path
+// maintains invariants that none of them does, so tests here name the
+// invariant rather than the exit: the next early return added will break the
+// same ones.
+
+// ---------------------------------------------------------------------------
+// The paused pool's observedGeneration
+// ---------------------------------------------------------------------------
+
+// pauseEditResume drives the sequence every stamp assertion needs: reconcile a
+// healthy pool, then pause it and edit its spec so the generation moves while
+// nothing is reconciled.
+func pauseEditResume(t *testing.T, r *PodPoolReconciler, cl client.Client,
+	pool *podpoolsv1alpha1.PodPool,
+) *podpoolsv1alpha1.PodPool {
+	t.Helper()
+
+	reconcilePool(t, r, pool)
+
+	live := getPool(t, cl, pool)
+	live.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+	live.Spec.Replicas = 7
+	// Set explicitly: the fake client does not maintain metadata.generation the
+	// way the API server does, and an edit that does not move the generation
+	// would make every assertion here vacuous.
+	live.Generation = pool.Generation + 1
+
+	if err := cl.Update(t.Context(), live); err != nil {
+		t.Fatalf("pausing and editing the pool: %v", err)
+	}
+
+	if bumped := getPool(t, cl, pool); bumped.Generation != pool.Generation+1 {
+		t.Fatalf("generation is %d after the edit, want %d", bumped.Generation, pool.Generation+1)
+	}
+
+	reconcilePool(t, r, pool)
+
+	return getPool(t, cl, pool)
+}
+
+// observedGeneration == generation is the API's way of saying the controller
+// has acted on this spec. A paused pool has not. Anything gating on the
+// equality reads the pool as settled: kubectl wait, CI gates, Argo health
+// assessment.
+func TestPausedDoesNotObserveNewGeneration(t *testing.T) {
+	pool := fakeTestPool()
+
+	r, cl := newFakeReconciler(t, nil, pool)
+
+	got := pauseEditResume(t, r, cl, pool)
+
+	if got.Generation == got.Status.ObservedGeneration {
+		t.Errorf("observedGeneration = %d at generation %d: the pool reports the "+
+			"edit as observed, but it was paused and nothing was reconciled",
+			got.Status.ObservedGeneration, got.Generation)
+	}
+}
+
+// The invariant setConditions' own doc comment claims: the top-level field and
+// the conditions can never disagree. The paused branch writes two of the five,
+// so advancing the top-level field strands the other three at the generation
+// before it.
+func TestPausedConditionsAgreeWithObservedGeneration(t *testing.T) {
+	pool := fakeTestPool()
+
+	r, cl := newFakeReconciler(t, nil, pool)
+
+	got := pauseEditResume(t, r, cl, pool)
+
+	for _, c := range got.Status.Conditions {
+		if c.ObservedGeneration != got.Status.ObservedGeneration {
+			t.Errorf("condition %s carries generation %d, status.observedGeneration "+
+				"is %d: a reader cannot tell which one describes the object",
+				c.Type, c.ObservedGeneration, got.Status.ObservedGeneration)
+		}
+	}
+}
+
+// Why the stamp is the half that corrupts persisted state rather than merely
+// misreporting it.
+//
+// Reconcile derives genChanged from the stored observedGeneration, and
+// stampGroupProgress re-stamps LastProgressTime when the spec moved. Stamping
+// the generation during the pause makes genChanged false on resume, so
+// LastProgressTime keeps its pre-pause value and evaluateStalled measures the
+// new rollout against a clock that started before the pause. A pause longer
+// than the deadline therefore reports ProgressDeadlineExceeded the instant it
+// resumes, before the rollout has had any time at all.
+func TestResumeAfterLongPauseDoesNotTripProgressDeadline(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	pool := fakeTestPool()
+
+	r, cl := newFakeReconciler(t, nil, pool)
+	fake := clocktesting.NewFakePassiveClock(base)
+	r.Clock = fake
+
+	pauseEditResume(t, r, cl, pool)
+
+	// Longer than the 600s default deadline, which is the point: a maintenance
+	// pause is routinely longer than a rollout is allowed to take.
+	fake.SetTime(base.Add(2 * progressDeadline(pool)))
+
+	live := getPool(t, cl, pool)
+	live.Annotations = nil
+
+	if err := cl.Update(t.Context(), live); err != nil {
+		t.Fatalf("unpausing: %v", err)
+	}
+
+	reconcilePool(t, r, pool)
+
+	got := getPool(t, cl, pool)
+
+	progressing := meta.FindStatusCondition(got.Status.Conditions, ConditionProgressing)
+	if progressing == nil {
+		t.Fatal("no Progressing condition after resume")
+	}
+
+	if progressing.Reason == ReasonProgressDeadlineExceeded {
+		t.Errorf("pool reports %s immediately on resume: the deadline is being "+
+			"measured from before the pause, so a long pause fails the rollout "+
+			"that follows it", ReasonProgressDeadlineExceeded)
+	}
+}
 
 // pendingInformer reports unsynced until synced is flipped. The embedded nil
 // panics on anything ensureWatch does not call, which is the point: it fails
@@ -49,15 +173,17 @@ func (c syncCache) GetInformer(_ context.Context, _ client.Object,
 // GVK is pre-registered in watchStates so ctrl.Watch is never reached: this is
 // about what the sync check does, not about watch registration.
 func newSyncingReconciler(t *testing.T, pool *podpoolsv1alpha1.PodPool) (
-	*PodPoolReconciler, *atomic.Bool, *clocktesting.FakePassiveClock,
+	*PodPoolReconciler, *atomic.Bool, *events.FakeRecorder, *clocktesting.FakePassiveClock,
 ) {
 	t.Helper()
 
 	synced := &atomic.Bool{}
 	inf := pendingInformer{synced: synced}
+	rec := events.NewFakeRecorder(64)
 	fake := clocktesting.NewFakePassiveClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 
 	r, _ := newFakeReconciler(t, nil, pool)
+	r.Recorder = rec
 	r.Clock = fake
 	r.ctrl = &watchCounter{}
 	r.Cache = syncCache{inf: inf}
@@ -65,7 +191,7 @@ func newSyncingReconciler(t *testing.T, pool *podpoolsv1alpha1.PodPool) (
 		{Group: testAppsGroup, Version: "v1", Kind: testDepKind}: inf,
 	}
 
-	return r, synced, fake
+	return r, synced, rec, fake
 }
 
 // TestInformerStillSyncingIsNotAFailure pins the startup case.
@@ -78,7 +204,7 @@ func newSyncingReconciler(t *testing.T, pool *podpoolsv1alpha1.PodPool) (
 func TestInformerStillSyncingIsNotAFailure(t *testing.T) {
 	pool := fakeTestPool()
 
-	r, _, _ := newSyncingReconciler(t, pool)
+	r, _, _, _ := newSyncingReconciler(t, pool)
 
 	res, err := r.Reconcile(t.Context(), reconcileRequestFor(pool))
 	if err != nil {
@@ -103,7 +229,7 @@ func TestInformerStillSyncingIsNotAFailure(t *testing.T) {
 func TestInformerNeverSyncingIsReported(t *testing.T) {
 	pool := fakeTestPool()
 
-	r, _, fake := newSyncingReconciler(t, pool)
+	r, _, _, fake := newSyncingReconciler(t, pool)
 
 	if _, err := r.Reconcile(t.Context(), reconcileRequestFor(pool)); err != nil {
 		t.Fatalf("first pass should be quiet: %v", err)
@@ -123,7 +249,7 @@ func TestInformerNeverSyncingIsReported(t *testing.T) {
 func TestGraceWindowStartsWhenTheGVKIsFirstSeen(t *testing.T) {
 	pool := fakeTestPool()
 
-	r, _, fake := newSyncingReconciler(t, pool)
+	r, _, _, fake := newSyncingReconciler(t, pool)
 
 	// Long before the workload kind is ever mentioned.
 	fake.SetTime(fake.Now().Add(100 * watchSyncGrace))
@@ -140,7 +266,7 @@ func TestGraceWindowStartsWhenTheGVKIsFirstSeen(t *testing.T) {
 func TestInformerSyncCompletesQuietly(t *testing.T) {
 	pool := fakeTestPool()
 
-	r, synced, _ := newSyncingReconciler(t, pool)
+	r, synced, _, _ := newSyncingReconciler(t, pool)
 
 	if _, err := r.Reconcile(t.Context(), reconcileRequestFor(pool)); err != nil {
 		t.Fatalf("first pass: %v", err)
@@ -165,6 +291,209 @@ func TestInformerSyncCompletesQuietly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// The scale subresource's selector
+// ---------------------------------------------------------------------------
+
+// The CRD points the scale subresource's selectorpath at status.selector, and
+// the assignment sits above every early return. A pool created paused, or
+// created with a template the controller cannot parse, has never run the full
+// path, so it would otherwise expose an empty selector to anything reading
+// /scale. The field is derived from the pool name alone, so no early path
+// lacks anything it needs.
+func TestSelectorIsSetOnEveryExit(t *testing.T) {
+	tests := []struct {
+		name string
+		mut  func(*podpoolsv1alpha1.PodPool)
+	}{
+		{
+			name: "created paused",
+			mut: func(pp *podpoolsv1alpha1.PodPool) {
+				pp.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+			},
+		},
+		{
+			name: "created with an unparseable template",
+			mut: func(pp *podpoolsv1alpha1.PodPool) {
+				pp.Spec.WorkloadTemplate.Raw = []byte(`{"spec":{"template":{}}}`)
+			},
+		},
+		{
+			name: "the ordinary path",
+			// Green by construction: the point of the shared assignment is
+			// that the full path and the exits cannot drift apart.
+			mut: func(*podpoolsv1alpha1.PodPool) {},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := fakeTestPool()
+			tt.mut(pool)
+
+			r, cl := newFakeReconciler(t, nil, pool)
+
+			// Errors are beside the point: an unparseable template is a
+			// non-error early return, and the selector must survive either way.
+			_ = tryReconcilePool(r, pool)
+
+			got := getPool(t, cl, pool)
+
+			want := labels.Set{workload.LabelPool: pool.Name}.String()
+			if got.Status.Selector != want {
+				t.Errorf("status.selector = %q, want %q: /scale reports this to "+
+					"an HPA, which cannot find pods without it", got.Status.Selector, want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The pause annotation's value
+// ---------------------------------------------------------------------------
+
+// Presence-only means podpools.dev/paused: "false" pauses the pool. That is a
+// real trap for GitOps templating: a chart rendering `paused: {{ .Values.paused
+// }}` produces the literal string false and silently freezes reconciliation
+// while the manifest says the opposite.
+//
+// Unparseable values pause deliberately. An operator who typed something
+// meaning to pause gets a pause rather than a silently running pool.
+func TestIsPausedHonoursTheAnnotationValue(t *testing.T) {
+	tests := []struct {
+		value string
+		want  bool
+		why   string
+	}{
+		{value: "\x00absent", want: false, why: "no annotation at all"},
+		{value: valueTrue, want: true},
+		{value: "TRUE", want: true},
+		{value: "1", want: true},
+		{value: "t", want: true},
+		{value: valueFalse, want: false, why: "the templating trap this rule exists for"},
+		{value: "FALSE", want: false},
+		{value: "0", want: false},
+		{value: "f", want: false},
+		{value: "", want: true, why: "unparseable, and the value people write to mean 'just pause'"},
+		{value: "on", want: true, why: "unparseable: do not guess, and do not silently run"},
+		{value: "paused", want: true, why: "unparseable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			pool := fakeTestPool()
+			if tt.value != "\x00absent" {
+				pool.Annotations = map[string]string{workload.AnnotationPaused: tt.value}
+			}
+
+			if got := isPaused(pool); got != tt.want {
+				t.Errorf("isPaused(%q) = %v, want %v (%s)", tt.value, got, tt.want, tt.why)
+			}
+		})
+	}
+}
+
+// The same claim end to end, because isPaused could be right while Reconcile
+// consults the annotation map directly.
+func TestPausedFalseReconcilesNormally(t *testing.T) {
+	pool := fakeTestPool()
+	pool.Annotations = map[string]string{workload.AnnotationPaused: valueFalse}
+
+	r, cl := newFakeReconciler(t, nil, pool)
+
+	reconcilePool(t, r, pool)
+
+	got := getPool(t, cl, pool)
+
+	ready := meta.FindStatusCondition(got.Status.Conditions, ConditionReady)
+	if ready == nil {
+		t.Fatal("no Ready condition")
+	}
+
+	if ready.Reason == ReasonPaused {
+		t.Error("a pool annotated paused=false is paused; a GitOps template " +
+			"rendering a boolean freezes the pool while the manifest says it should run")
+	}
+
+	if len(got.Status.Groups) == 0 {
+		t.Error("no groups were reconciled, so the pool did not actually run")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metrics on every path that mutates conditions
+// ---------------------------------------------------------------------------
+
+// The pause exit mutates conditions and returns above the whole group loop.
+// Publishing metrics from the status defer -- derived from pool.Status, not
+// from reconcile-local aggregates -- is what makes these two pass by
+// construction rather than by anyone remembering the new exit. In the real
+// history this was a bug found after pause shipped: a dashboard showed a
+// paused pool still progressing.
+func TestPausedPoolPublishesItsMetrics(t *testing.T) {
+	const ns, name = "metrics-pause-ns", "metrics-pause-pool"
+
+	t.Cleanup(func() { deletePoolMetrics(ns, name) })
+
+	pool := fakeTestPool()
+	pool.Namespace = ns
+	pool.Name = name
+
+	r, cl := newFakeReconciler(t, nil, pool)
+
+	reconcilePool(t, r, pool)
+
+	if v := conditionSeries(t, ns, name)[ConditionProgressing+"/true"]; v != 1 {
+		t.Fatalf("Progressing=true gauge is %v before the pause, want 1", v)
+	}
+
+	live := getPool(t, cl, pool)
+	live.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+
+	if err := r.Update(t.Context(), live); err != nil {
+		t.Fatalf("pausing: %v", err)
+	}
+
+	reconcilePool(t, r, pool)
+
+	series := conditionSeries(t, ns, name)
+
+	if v := series[ConditionProgressing+"/true"]; v != 0 {
+		t.Errorf("Progressing=true gauge is %v after the pause, want 0: the metric "+
+			"still reports the pool as making progress", v)
+	}
+
+	if v := series[ConditionProgressing+"/false"]; v != 1 {
+		t.Errorf("Progressing=false gauge is %v after the pause, want 1", v)
+	}
+}
+
+// The sharper case: a pool that has never run the full path has no series
+// whatsoever, so it is invisible to monitoring rather than merely stale.
+func TestPoolCreatedPausedPublishesMetricsAtAll(t *testing.T) {
+	const ns, name = "metrics-born-paused-ns", "metrics-born-paused-pool"
+
+	t.Cleanup(func() { deletePoolMetrics(ns, name) })
+
+	pool := fakeTestPool()
+	pool.Namespace = ns
+	pool.Name = name
+	pool.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+
+	r, _ := newFakeReconciler(t, nil, pool)
+
+	reconcilePool(t, r, pool)
+
+	if n := seriesFor(specReplicas, ns, name); n == 0 {
+		t.Error("a pool created paused publishes no metrics at all; it cannot be " +
+			"alerted on, and its absence is indistinguishable from not existing")
+	}
+
+	if v := conditionSeries(t, ns, name)[ConditionReady+"/false"]; v != 1 {
+		t.Errorf("Ready=false gauge is %v, want 1", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The watch-failure exit
 // ---------------------------------------------------------------------------
 
@@ -177,7 +506,7 @@ func brokenWatchAfterHealthyPass(t *testing.T) (*PodPoolReconciler, *podpoolsv1a
 	t.Helper()
 
 	pool := fakeTestPool()
-	r, synced, fake := newSyncingReconciler(t, pool)
+	r, synced, _, fake := newSyncingReconciler(t, pool)
 
 	synced.Store(true)
 	reconcilePool(t, r, pool)
@@ -251,7 +580,7 @@ func TestWatchFailureDoesNotObserveTheGeneration(t *testing.T) {
 
 // TestEveryEarlyExitWritesReady is a class guard rather than a bug
 // reproducer. Every exit leaving a Ready condition is what makes the fix
-// above work, and a third early return that forgets would silently reopen it.
+// above work, and a fourth early return that forgets would silently reopen it.
 // Reading the code will not catch that; this will.
 func TestEveryEarlyExitWritesReady(t *testing.T) {
 	tests := []struct {
@@ -259,6 +588,19 @@ func TestEveryEarlyExitWritesReady(t *testing.T) {
 		wantReason string
 		build      func(*testing.T) (*PodPoolReconciler, *podpoolsv1alpha1.PodPool)
 	}{
+		{
+			name:       "paused",
+			wantReason: ReasonPaused,
+			build: func(t *testing.T) (*PodPoolReconciler, *podpoolsv1alpha1.PodPool) {
+				t.Helper()
+
+				pool := fakeTestPool()
+				pool.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+				r, _ := newFakeReconciler(t, nil, pool)
+
+				return r, pool
+			},
+		},
 		{
 			name: "unparseable workload template",
 			// Ready aggregates rather than naming the fault; GroupsReady is
@@ -299,5 +641,163 @@ func TestEveryEarlyExitWritesReady(t *testing.T) {
 				t.Errorf("Ready reason is %q, want %q", ready.Reason, tt.wantReason)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Paused and Resumed announce transitions, not states
+// ---------------------------------------------------------------------------
+
+// Both events reuse the condition-tuple gate the other transition events
+// already ride: no third dedup mechanism, no process-lifetime map. A paused
+// pool's Ready tuple only changes on the pass that pauses it, so the event
+// fires there and nowhere else.
+func TestPausedAnnouncedOncePerPause(t *testing.T) {
+	pool := fakeTestPool()
+	rec := events.NewFakeRecorder(64)
+
+	r, cl := newFakeReconciler(t, nil, pool)
+	r.Recorder = rec
+
+	reconcilePool(t, r, pool)
+
+	live := getPool(t, cl, pool)
+	live.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+
+	if err := cl.Update(t.Context(), live); err != nil {
+		t.Fatalf("pausing: %v", err)
+	}
+
+	for range 3 {
+		reconcilePool(t, r, pool)
+	}
+
+	if evts := drainEvents(rec.Events); countEventsByReason(evts, "Paused") != 1 {
+		t.Errorf("got %d Paused events across three paused passes, want 1; events: %v",
+			countEventsByReason(evts, "Paused"), evts)
+	}
+}
+
+// unpausedWithBrokenWatch is the interaction fixture: a pool that was paused,
+// has been unpaused, and whose workload GVK will never get an informer. The
+// realistic trigger is a pool created paused and unpaused before its workload
+// CRD is installed.
+func unpausedWithBrokenWatch(t *testing.T) (*PodPoolReconciler, *podpoolsv1alpha1.PodPool, *events.FakeRecorder) {
+	t.Helper()
+
+	pool := fakeTestPool()
+	pool.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+
+	r, _, rec, fake := newSyncingReconciler(t, pool)
+
+	reconcilePool(t, r, pool)
+
+	live := getPool(t, r.Client, pool)
+	live.Annotations = nil
+
+	if err := r.Update(t.Context(), live); err != nil {
+		t.Fatalf("unpausing: %v", err)
+	}
+
+	// One pass to register the GVK as pending, then past the grace window. The
+	// clock only starts when a GVK is first seen unsynced, so advancing it
+	// before that first sighting does nothing.
+	reconcilePool(t, r, pool)
+	fake.SetTime(fake.Now().Add(2 * watchSyncGrace))
+
+	// That first pass is the quiet sync requeue and emits nothing; drop
+	// anything buffered so far so the counts below are about the failure only.
+	drainEvents(rec.Events)
+
+	return r, pool, rec
+}
+
+// Resumed is gated on the WRITE that moves conditions off Paused, not on the
+// read of what etcd held. Gated on the read, nothing guarantees the write
+// that would clear it, and every backoff pass while the CRD is missing
+// announces the resume again -- unbounded for as long as the kind stays
+// unservable.
+func TestResumedFiresOnceWhileTheWatchIsBroken(t *testing.T) {
+	r, pool, rec := unpausedWithBrokenWatch(t)
+
+	for range 3 {
+		_ = tryReconcilePool(r, pool)
+	}
+
+	if evts := drainEvents(rec.Events); countEventsByReason(evts, "Resumed") != 1 {
+		t.Errorf("got %d Resumed events across three passes, want 1; events: %v",
+			countEventsByReason(evts, "Resumed"), evts)
+	}
+}
+
+// The interaction the sync grace window creates, and the measured failure
+// mode: the sync-pending exit deliberately writes no conditions, so gating
+// Resumed on the stored Ready re-announced it on every 2-second requeue for
+// the whole 30-second grace window -- five passes, five events. The resume is
+// announced by the pass that actually does the work, which is also the more
+// accurate moment.
+func TestResumedIsNotAnnouncedWhileTheCacheIsMerelySyncing(t *testing.T) {
+	pool := fakeTestPool()
+	pool.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+
+	r, synced, rec, _ := newSyncingReconciler(t, pool)
+
+	reconcilePool(t, r, pool)
+
+	live := getPool(t, r.Client, pool)
+	live.Annotations = nil
+
+	if err := r.Update(t.Context(), live); err != nil {
+		t.Fatalf("unpausing: %v", err)
+	}
+
+	for range 5 {
+		reconcilePool(t, r, pool)
+	}
+
+	if evts := drainEvents(rec.Events); countEventsByReason(evts, "Resumed") != 0 {
+		t.Errorf("got %v while the cache was still filling; nothing has resumed yet", evts)
+	}
+
+	synced.Store(true)
+	reconcilePool(t, r, pool)
+
+	if evts := drainEvents(rec.Events); countEventsByReason(evts, "Resumed") != 1 {
+		t.Errorf("got %v on the pass that actually ran, want exactly one Resumed", evts)
+	}
+}
+
+// The invalid-template exit rewrites conditions too, so a pool unpaused into
+// a broken template still announces its resume there. Every exit that moves
+// Ready off Paused announces; an exit that forgot would strand the resume
+// until the template is fixed, then announce it for the wrong reason.
+func TestResumedAnnouncedEvenWhenTheTemplateTurnedInvalid(t *testing.T) {
+	pool := fakeTestPool()
+	pool.Annotations = map[string]string{workload.AnnotationPaused: valueTrue}
+	rec := events.NewFakeRecorder(64)
+
+	r, cl := newFakeReconciler(t, nil, pool)
+	r.Recorder = rec
+
+	reconcilePool(t, r, pool)
+
+	live := getPool(t, cl, pool)
+	live.Annotations = nil
+	live.Spec.WorkloadTemplate.Raw = []byte(`{"spec":{"template":{}}}`)
+
+	if err := cl.Update(t.Context(), live); err != nil {
+		t.Fatalf("unpausing into a broken template: %v", err)
+	}
+
+	drainEvents(rec.Events)
+
+	for range 3 {
+		_ = tryReconcilePool(r, pool)
+	}
+
+	evts := drainEvents(rec.Events)
+	if countEventsByReason(evts, "Resumed") != 1 {
+		t.Errorf("got %d Resumed events, want exactly 1; events: %v",
+			countEventsByReason(evts, "Resumed"), evts)
 	}
 }

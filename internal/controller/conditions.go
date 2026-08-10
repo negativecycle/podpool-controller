@@ -34,6 +34,7 @@ const (
 	ReasonPoolReady                  = "PoolReady"
 	ReasonWorkloadUpdating           = "WorkloadUpdating"
 	ReasonWorkloadTemplateInvalid    = "WorkloadTemplateInvalid"
+	ReasonPaused                     = "Paused"
 	// Used as both a condition reason and an event reason, from one constant so
 	// the two cannot drift.
 	ReasonWatchSetupFailed = "WatchSetupFailed"
@@ -88,10 +89,17 @@ type conditionInputs struct {
 	// without inventing a group name.
 	poolInvalid bool
 
-	// watchFailed means the pool's spec parsed but no informer could be
-	// established for the workload GVK, so nothing below that point ran. It
-	// exists so the watch-failure exit leaves an honest Ready condition rather
-	// than whatever the previous pass wrote. It does not stamp
+	// paused short-circuits Available/TargetDegraded/GroupsReady entirely,
+	// leaving them at whatever they last reported, and forces Progressing and
+	// Ready to False/Paused. It does not stamp ObservedGeneration: no work was
+	// done on this spec.
+	paused bool
+
+	// watchFailed means the pool is not paused and its spec parsed, but no
+	// informer could be established for the workload GVK, so nothing below that
+	// point ran. It exists so the watch-failure exit leaves an honest Ready
+	// condition rather than whatever the previous pass wrote, which for a
+	// just-unpaused pool is Paused. Like paused, it does not stamp
 	// ObservedGeneration.
 	watchFailed bool
 }
@@ -134,17 +142,29 @@ func setConditions(pool *podpoolsv1alpha1.PodPool, in conditionInputs) {
 		meta.RemoveStatusCondition(&pool.Status.Conditions, t)
 	}
 
-	// Deliberately above the stamp. observedGeneration == generation is the
-	// API's way of saying the controller has acted on this spec, and no
-	// informer means nothing below the watch exit ran, so it has not.
+	// Deliberately above the stamp. A paused pool has not acted on its spec,
+	// and observedGeneration == generation is the API's way of saying it has,
+	// so stamping here reports an edit made during a pause as reconciled.
 	//
-	// Stamping here would also break the recovery. Reconcile derives
-	// genChanged from the stored observedGeneration and stampGroupProgress
-	// uses it to restart LastProgressTime; stamping during an outage makes
-	// genChanged false when the CRD comes back, so the progress deadline is
-	// measured from before the outage and a long one fails the rollout that
-	// follows it.
-	if in.watchFailed {
+	// It also breaks the resume. Reconcile derives genChanged from the stored
+	// observedGeneration, and stampGroupProgress uses it to restart
+	// LastProgressTime; stamping during the pause makes genChanged false on
+	// resume, so the progress deadline is measured from before the pause and a
+	// pause longer than the deadline fails the rollout that follows it.
+	//
+	// The conditions carry the generation last acted on rather than the current
+	// one. Writing gen here while leaving the top-level field behind would be
+	// the same disagreement in mirror image, which is what haltedConditions
+	// gives both arms for free.
+	//
+	// watchFailed sits here for the same reason: no informer means nothing
+	// below the exit ran, so that spec has not been acted on either.
+	switch {
+	case in.paused:
+		haltedConditions(pool, ReasonPaused, "Reconciliation paused")
+
+		return
+	case in.watchFailed:
 		haltedConditions(pool, ReasonWatchSetupFailed,
 			"No watch could be established for the workload type")
 

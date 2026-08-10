@@ -42,6 +42,9 @@ const (
 	// to the ones this controller sets.
 	testUserLabelKey = "app"
 
+	valueTrue  = "true"
+	valueFalse = "false"
+
 	fieldAPIVersion      = "apiVersion"
 	fieldKind            = "kind"
 	fieldMetadata        = "metadata"

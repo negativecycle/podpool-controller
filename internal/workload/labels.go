@@ -6,4 +6,6 @@ const (
 	LabelManagedBy = "podpools.dev/managed-by"
 	ManagerName    = "podpool-controller"
 	KindPodPool    = "PodPool"
+
+	AnnotationPaused = "podpools.dev/paused"
 )

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -117,6 +118,10 @@ type PodPoolReconciler struct {
 	// create path force-applies over an object the cache says is absent, the
 	// absence is confirmed against the API server itself.
 	APIReader client.Reader
+
+	MaxConcurrentReconciles int
+	RateLimiterBaseDelay    time.Duration
+	RateLimiterMaxDelay     time.Duration
 
 	// Watches are registered lazily, from Reconcile, which runs on several
 	// goroutines at once. The mutex guards the map; the controller handle is
@@ -230,11 +235,30 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	}()
 
 	// Above every early return, deliberately. The scale subresource's
-	// selectorpath points here, so a pool created with an unparseable
-	// template would otherwise expose an empty selector to every HPA reading
-	// /scale for as long as it stayed in that state. It is derived from the
-	// pool name alone, so no early path lacks anything it needs.
+	// selectorpath points here, so a pool created paused or created with an
+	// unparseable template would otherwise expose an empty selector to an HPA
+	// for as long as it stayed in that state. It is derived from the pool name
+	// alone, so no early path is missing anything it needs.
 	pool.Status.Selector = labels.Set{workload.LabelPool: pool.Name}.String()
+
+	if isPaused(&pool) {
+		setConditions(&pool, conditionInputs{paused: true})
+
+		if conditionTupleChanged(before.Status.Conditions, pool.Status.Conditions, ConditionReady) {
+			r.event(&pool, corev1.EventTypeNormal, "Paused", "PauseReconciliation",
+				"Reconciliation paused via %s annotation", workload.AnnotationPaused)
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	// Read from what etcd held at the start of the pass. The event itself is
+	// emitted only where conditions have actually been rewritten away from
+	// Paused, so a pass that exits without writing does not announce a resume
+	// it did not complete. Announcing it here instead re-fires on every retry
+	// for as long as nothing writes -- measured at five Resumed events across
+	// one 30-second sync-grace window while a CRD was missing.
+	wasPaused := readyReasonIs(before.Status.Conditions, ReasonPaused)
 
 	// Asked before any expensive work: a template that is not even
 	// addressable (no apiVersion or kind) cannot be rendered for any group.
@@ -247,6 +271,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 			desired:     pool.Spec.Replicas,
 			poolInvalid: true,
 		})
+
+		r.announceResume(&pool, before, wasPaused)
 
 		if conditionTupleChanged(before.Status.Conditions, pool.Status.Conditions, ConditionGroupsReady) {
 			r.event(&pool, corev1.EventTypeWarning, ReasonWorkloadTemplateInvalid, "ParseWorkloadTemplate",
@@ -267,7 +293,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	// Registered before any child is written, so the first child of a kind is
 	// born observed: a child changing is the event a pool most needs to hear,
 	// and the pool watch alone cannot deliver it.
-	if res, handled, err := r.setUpWatch(ctx, &pool, gvk); handled {
+	if res, handled, err := r.setUpWatch(ctx, &pool, gvk, before, wasPaused); handled {
 		return res, err
 	}
 
@@ -374,20 +400,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		errs = append(errs, sweepErrs...)
 	}
 
-	// Stamp progress timestamps on freshly reconciled groups only. Failed
-	// groups keep their previous status, including timestamps, from the
-	// carry-forward above: a group whose applies are failing is not
-	// progressing, and a generation bump should not restart its clock.
-	genChanged := before.Status.ObservedGeneration != pool.Generation
-
-	for i := range groupStatuses {
-		gs := &groupStatuses[i]
-		if !reconciledGroups[gs.Name] {
-			continue
-		}
-
-		stampGroupProgress(gs, findGroupStatus(before.Status.Groups, gs.Name), genChanged, now)
-	}
+	stampAllProgress(groupStatuses, before, reconciledGroups, pool.Generation, now)
 
 	stalledGroups := evaluateStalled(&pool, groupStatuses, now)
 
@@ -398,29 +411,11 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 
 	assignGroupReasons(groupStatuses, stalledSet, childByGroup)
 
-	// Sum in int64, then narrow once. Every group count is already bounded to
-	// int32 individually, but two groups each reporting a large valid count
-	// can sum past MaxInt32, and pool.Status.Replicas is this CRD's own scale
-	// statusReplicasPath, which the API server rejects when negative. 32
-	// groups (the schema cap) at MaxInt32 is 6.9e10, so the wide accumulator
-	// provably cannot overflow.
-	var sumReplicas, sumReady, sumUpdated int64
+	totals := summariseGroups(groupStatuses)
 
-	for _, gs := range groupStatuses {
-		sumReplicas += int64(gs.Replicas)
-		sumReady += int64(gs.ReadyReplicas)
-		sumUpdated += int64(gs.UpdatedReplicas)
-	}
-
-	totalReplicas := clampInt32(sumReplicas)
-
-	for i := range groupStatuses {
-		groupStatuses[i].SharePercent = shareOfTotal(groupStatuses[i].Replicas, totalReplicas)
-	}
-
-	pool.Status.Replicas = totalReplicas
-	pool.Status.ReadyReplicas = clampInt32(sumReady)
-	pool.Status.UpdatedReplicas = clampInt32(sumUpdated)
+	pool.Status.Replicas = totals.replicas
+	pool.Status.ReadyReplicas = totals.ready
+	pool.Status.UpdatedReplicas = totals.updated
 	pool.Status.UnplacedReplicas = result.Unplaced
 	pool.Status.GroupCount = int32(len(pool.Spec.Groups)) //nolint:gosec // spec.groups carries MaxItems=32, so len() fits int32
 	pool.Status.Groups = groupStatuses
@@ -449,6 +444,8 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		stalledGroups:  stalledGroups,
 		notOwnedGroups: notOwnedGroups,
 	})
+
+	r.announceResume(&pool, before, wasPaused)
 
 	// Per group, not per pool. `before` is the deep copy from the top of
 	// Reconcile; pool.Status.Groups already holds this pass's reasons and would
@@ -537,6 +534,65 @@ func (r *PodPoolReconciler) diagnoseStatusMissing(
 				"replica has ever become ready, and the pool cannot tell these apart, "+
 				"so it reports 0 ready",
 			gvk.Kind, formatGroupNames(silent))
+	}
+}
+
+// stampAllProgress stamps progress timestamps on freshly reconciled groups
+// only. Failed groups keep their previous status, including timestamps, from
+// the carry-forward in Reconcile: a group whose applies are failing is not
+// progressing, and a generation bump should not restart its clock.
+func stampAllProgress(
+	statuses []podpoolsv1alpha1.GroupStatus,
+	before *podpoolsv1alpha1.PodPool,
+	reconciled map[string]bool,
+	generation int64,
+	now time.Time,
+) {
+	genChanged := before.Status.ObservedGeneration != generation
+
+	for i := range statuses {
+		gs := &statuses[i]
+		if !reconciled[gs.Name] {
+			continue
+		}
+
+		stampGroupProgress(gs, findGroupStatus(before.Status.Groups, gs.Name), genChanged, now)
+	}
+}
+
+// groupTotals is the pool-level rollup of every group's counts.
+type groupTotals struct {
+	replicas, ready, updated int32
+}
+
+// summariseGroups sums the group rows and narrows once, and also fills each
+// row's SharePercent, which cannot be computed until the total is known.
+//
+// The accumulators are int64 deliberately. Every group count is already
+// bounded to int32 individually, but two groups each reporting a large valid
+// count can sum past MaxInt32, and pool.Status.Replicas is this CRD's own
+// scale statusReplicasPath, which the API server rejects when negative. 32
+// groups (the schema cap) at MaxInt32 is 6.9e10, so the wide accumulator
+// provably cannot overflow.
+func summariseGroups(statuses []podpoolsv1alpha1.GroupStatus) groupTotals {
+	var sumReplicas, sumReady, sumUpdated int64
+
+	for _, gs := range statuses {
+		sumReplicas += int64(gs.Replicas)
+		sumReady += int64(gs.ReadyReplicas)
+		sumUpdated += int64(gs.UpdatedReplicas)
+	}
+
+	total := clampInt32(sumReplicas)
+
+	for i := range statuses {
+		statuses[i].SharePercent = shareOfTotal(statuses[i].Replicas, total)
+	}
+
+	return groupTotals{
+		replicas: total,
+		ready:    clampInt32(sumReady),
+		updated:  clampInt32(sumUpdated),
 	}
 }
 
@@ -1069,6 +1125,51 @@ type pendingEvent struct {
 // Passing this pass's own status compares each reason against itself, silences
 // every group event, and does so in a way no "emits exactly one" test would
 // catch, because zero also satisfies "not more than one".
+// announceResume emits the Resumed event once conditions have moved off
+// Paused. What makes it edge-triggered is where it is called: only at exits
+// that have just rewritten conditions, never at the top of the pass, so a pass
+// that exits without writing cannot announce a resume it did not complete.
+// The tuple check is defensive -- every current call site sits after a write
+// that moves Ready off Paused, so wasPaused alone would do today -- but it
+// keeps the helper safe for an exit added later that calls it before writing.
+func (r *PodPoolReconciler) announceResume(pool, before *podpoolsv1alpha1.PodPool, wasPaused bool) {
+	if wasPaused && conditionTupleChanged(before.Status.Conditions, pool.Status.Conditions, ConditionReady) {
+		r.event(pool, corev1.EventTypeNormal, "Resumed", "ResumeReconciliation",
+			"Reconciliation resumed")
+	}
+}
+
+// readyReasonIs reports whether the Ready condition carries the given reason.
+func readyReasonIs(conds []metav1.Condition, reason string) bool {
+	c := meta.FindStatusCondition(conds, ConditionReady)
+
+	return c != nil && c.Reason == reason
+}
+
+// isPaused reports whether the pause annotation asks for a pause.
+//
+// The value is honoured, not merely its presence. Presence-only meant
+// `podpools.dev/paused: "false"` froze the pool, which is exactly what a GitOps
+// chart rendering `paused: {{ .Values.paused }}` produces, and the manifest
+// then says the opposite of what the cluster does.
+//
+// A value that will not parse pauses. Someone who typed something meaning to
+// pause should get a pause, not a silently running pool, and "" is what people
+// write when they just want the annotation to be there.
+func isPaused(pool *podpoolsv1alpha1.PodPool) bool {
+	v, ok := pool.Annotations[workload.AnnotationPaused]
+	if !ok {
+		return false
+	}
+
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return true
+	}
+
+	return parsed
+}
+
 func groupEventChanged(before []podpoolsv1alpha1.GroupStatus, groupName, reason string) bool {
 	prev := findGroupStatus(before, groupName)
 
@@ -1194,6 +1295,7 @@ func (r *PodPoolReconciler) reportOutOfRange(
 // should do about it.
 func (r *PodPoolReconciler) setUpWatch(
 	ctx context.Context, pool *podpoolsv1alpha1.PodPool, gvk schema.GroupVersionKind,
+	before *podpoolsv1alpha1.PodPool, wasPaused bool,
 ) (ctrl.Result, bool, error) {
 	err := r.ensureWatch(ctx, gvk)
 	if err == nil {
@@ -1212,9 +1314,11 @@ func (r *PodPoolReconciler) setUpWatch(
 
 	// Without this the pool keeps reporting whatever the last pass wrote,
 	// which for a pool that was healthy until its CRD was uninstalled is
-	// Ready. Nothing in the object mentions the watch, and the only other
-	// signal is deduped to one line per GVK per process.
+	// Ready, and for a pool that has just been unpaused is Paused. Nothing in
+	// the object mentions the watch, and the only other signal is deduped to
+	// one per GVK per process.
 	setConditions(pool, conditionInputs{watchFailed: true})
+	r.announceResume(pool, before, wasPaused)
 	r.handleWatchFailure(pool, gvk, err)
 
 	return ctrl.Result{}, true, fmt.Errorf("setting up watch for %s: %w", gvk, err)

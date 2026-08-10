@@ -234,9 +234,9 @@ func TestRetiredConditionMetricIsRemoved(t *testing.T) {
 	pool.Namespace = ns
 	pool.Name = name
 	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
-		Type:   "AncientCondition",
+		Type:   testRetiredType,
 		Status: metav1.ConditionTrue,
-		Reason: "LeftOverFromAnOlderVersion",
+		Reason: testRetiredReason,
 	})
 
 	r, cl := newFakeReconciler(t, nil, pool)
@@ -245,21 +245,21 @@ func TestRetiredConditionMetricIsRemoved(t *testing.T) {
 	// like any other condition on the object.
 	reconcilePool(t, r, pool)
 
-	if got := conditionSeries(t, ns, name)["AncientCondition/true"]; got != 1 {
-		t.Fatalf("%s{type=AncientCondition,status=true} = %v, want 1 before retirement",
-			conditionMetricName, got)
+	if got := conditionSeries(t, ns, name)[testRetiredType+"/true"]; got != 1 {
+		t.Fatalf("%s{type=%s,status=true} = %v, want 1 before retirement",
+			conditionMetricName, testRetiredType, got)
 	}
 
 	// Pass two: retired. setConditions prunes it from status, and the metric
 	// has to follow it out.
-	withRetiredType(t, "AncientCondition")
+	withRetiredType(t)
 	reconcilePool(t, r, getPool(t, cl, pool))
 
 	for _, status := range conditionStatuses {
-		key := "AncientCondition/" + status
+		key := testRetiredType + "/" + status
 		if got, ok := conditionSeries(t, ns, name)[key]; ok {
-			t.Errorf("%s{type=AncientCondition,status=%s} = %v still present; a retired condition's "+
-				"metric froze instead of going away", conditionMetricName, status, got)
+			t.Errorf("%s{type=%s,status=%s} = %v still present; a retired condition's "+
+				"metric froze instead of going away", conditionMetricName, testRetiredType, status, got)
 		}
 	}
 }

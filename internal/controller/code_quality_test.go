@@ -1,9 +1,18 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/clock"
+	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 
 	podpoolsv1alpha1 "github.com/negativecycle/podpool-controller/api/v1alpha1"
@@ -12,6 +21,128 @@ import (
 // testGroupScavShort keeps the child's name inside the DNS budget in tests that
 // build one by hand.
 const testGroupScavShort = "scav"
+
+// ---------------------------------------------------------------------------
+// The GroupsReady switch: the user-visible message contract
+// ---------------------------------------------------------------------------
+
+// setConditions is this codebase's one writer of conditions, which makes its
+// switch the whole user-visible contract in one place -- and a refactor that
+// touches the switch can break a message without breaking a reason. In the
+// history this tutorial is based on, the invalid-template path once passed a
+// []string{"*"} sentinel as the failed-group list, and the "*" reached the
+// condition message verbatim (#42). These pin the contract so no arm can
+// regress to naming a placeholder instead of the problem.
+
+func TestGroupsReadyMessageDoesNotLeakAPlaceholder(t *testing.T) {
+	pool := &podpoolsv1alpha1.PodPool{}
+	pool.Generation = 1
+
+	// Exactly the call the invalid-template exit makes.
+	setConditions(pool, conditionInputs{
+		desired:     3,
+		poolInvalid: true,
+	})
+
+	got := conditionByType(pool, ConditionGroupsReady)
+	if got == nil {
+		t.Fatal("GroupsReady was not set")
+	}
+
+	if got.Status != metav1.ConditionFalse {
+		t.Errorf("Status = %s, want False", got.Status)
+	}
+	// The reason is the stable part of the contract and must not move.
+	if got.Reason != ReasonGroupSpecInvalid {
+		t.Errorf("Reason = %q, want %q — consumers key on this",
+			got.Reason, ReasonGroupSpecInvalid)
+	}
+
+	if strings.Contains(got.Message, "*") {
+		t.Errorf("message leaks a placeholder to the user: %q", got.Message)
+	}
+
+	if !strings.Contains(strings.ToLower(got.Message), "workloadtemplate") {
+		t.Errorf("message should name the actual problem, got %q", got.Message)
+	}
+}
+
+// Real per-group terminal failures must keep reaching their own branch with
+// poolInvalid sitting ahead of them in the switch.
+func TestGroupsReadyStillReportsRealTerminalGroups(t *testing.T) {
+	pool := &podpoolsv1alpha1.PodPool{}
+	pool.Generation = 1
+
+	setConditions(pool, conditionInputs{
+		desired:        3,
+		failedGroups:   []string{"a", "b"},
+		terminalGroups: []string{"a", "b"},
+	})
+
+	got := conditionByType(pool, ConditionGroupsReady)
+	if got == nil {
+		t.Fatal("GroupsReady was not set")
+	}
+
+	if got.Reason != ReasonGroupSpecInvalid {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonGroupSpecInvalid)
+	}
+
+	for _, name := range []string{"a", "b"} {
+		if !strings.Contains(got.Message, name) {
+			t.Errorf("message should name group %q, got %q", name, got.Message)
+		}
+	}
+}
+
+// The non-terminal branch must stay reachable too: one retryable failure
+// among the terminal ones means the pool may still resolve itself.
+func TestGroupsReadyReportsPartialFailureSeparately(t *testing.T) {
+	pool := &podpoolsv1alpha1.PodPool{}
+	pool.Generation = 1
+
+	// Two failed, one terminal — len differs, so this is the retryable branch.
+	setConditions(pool, conditionInputs{
+		desired:        3,
+		failedGroups:   []string{"a", "b"},
+		terminalGroups: []string{"a"},
+	})
+
+	got := conditionByType(pool, ConditionGroupsReady)
+	if got == nil {
+		t.Fatal("GroupsReady was not set")
+	}
+
+	if got.Reason != ReasonGroupReconcileFailed {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonGroupReconcileFailed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #35 — the clock
+// ---------------------------------------------------------------------------
+
+// The field has existed since the progress deadline was born: every deadline
+// test in this package already swaps in a fake. These two pin the seam itself,
+// so the field cannot narrow to a concrete type — the fake and the real clock
+// are the two implementations that must keep fitting.
+
+func TestClockFieldExistsAndAcceptsFake(t *testing.T) {
+	fake := clocktesting.NewFakePassiveClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	r := &PodPoolReconciler{Clock: fake}
+
+	got := r.Clock.Now()
+	if !got.Equal(fake.Now()) {
+		t.Errorf("Clock.Now() = %v, want %v", got, fake.Now())
+	}
+}
+
+func TestClockFieldAcceptsRealClock(t *testing.T) {
+	r := &PodPoolReconciler{Clock: clock.RealClock{}}
+	if r.Clock == nil {
+		t.Fatal("Clock is nil after setting to RealClock")
+	}
+}
 
 func TestDecideProbeHeartbeatArithmeticIsTimeControlled(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -119,3 +250,50 @@ func TestOpportunisticHeartbeatHonoursAnExplicitValue(t *testing.T) {
 		t.Errorf("opportunisticHeartbeat = %v, want 90s", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The message contract, end to end
+// ---------------------------------------------------------------------------
+
+// The controller suite runs no webhook, which is the bypass this needs: a pool
+// whose workloadTemplate has no apiVersion/kind reaches the controller and
+// fails ExtractGVK.
+var _ = Describe("GroupsReady message for an uninterpretable pool", func() {
+	var ns string
+
+	BeforeEach(func() {
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "test-poolinvalid-"}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		ns = nsObj.Name
+	})
+
+	It("names the template rather than a placeholder group", func() {
+		pool := &podpoolsv1alpha1.PodPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "bad-template", Namespace: ns},
+			Spec: podpoolsv1alpha1.PodPoolSpec{
+				Replicas: 1,
+				// Parses as JSON, carries no apiVersion/kind — ExtractGVK fails.
+				WorkloadTemplate: runtime.RawExtension{Raw: []byte(`{"spec":{}}`)},
+				Groups:           []podpoolsv1alpha1.GroupSpec{{Name: testGroupBase}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+
+		var got metav1.Condition
+
+		Eventually(func(g Gomega) {
+			var p podpoolsv1alpha1.PodPool
+			g.Expect(k8sClient.Get(ctx,
+				types.NamespacedName{Name: "bad-template", Namespace: ns}, &p)).To(Succeed())
+			c := conditionByType(&p, ConditionGroupsReady)
+			g.Expect(c).NotTo(BeNil())
+			g.Expect(c.Reason).To(Equal(ReasonGroupSpecInvalid))
+			got = *c
+		}).Should(Succeed())
+
+		Expect(got.Message).NotTo(ContainSubstring("*"),
+			"a placeholder reaches the user verbatim")
+		Expect(strings.ToLower(got.Message)).To(ContainSubstring("workloadtemplate"),
+			"the message should name what is actually wrong")
+	})
+})
