@@ -1,6 +1,7 @@
 package v1alpha1_test
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -63,5 +64,46 @@ func TestProgressDeadlineHasASchemaDefault(t *testing.T) {
 
 	if f.Default == nil {
 		t.Error("progressDeadlineSeconds lost its schema default (+kubebuilder:default=600)")
+	}
+}
+
+// The value, not merely the presence of a default, is what is asserted here.
+//
+// The controller keeps an in-code fallback (defaultOpportunisticHeartbeatSeconds
+// in internal/controller) for objects stored before the schema default
+// existed, and a pool that never sets the field must mean the same interval to
+// the schema and to that fallback. Asserting Default != nil would hold for 30
+// or 99999 and leave the agreement unguarded.
+//
+// Cross-checking the Go constant from here would mean api/ importing
+// internal/controller, which is the wrong dependency direction, so the value
+// is pinned literally from both sides.
+func TestOpportunisticHeartbeatDefaultsTo300(t *testing.T) {
+	const (
+		field = "opportunisticHeartbeatSeconds"
+		want  = 300
+	)
+
+	spec := servedSpecSchema(t, loadCRDForCodeQuality(t))
+
+	f, ok := spec.Properties[field]
+	if !ok {
+		t.Fatalf("spec.%s is missing from the schema", field)
+	}
+
+	if f.Default == nil {
+		t.Fatalf("spec.%s has no schema default, so kubectl explain and the "+
+			"stored object both stay silent about the interval", field)
+	}
+
+	var got int
+	if err := json.Unmarshal(f.Default.Raw, &got); err != nil {
+		t.Fatalf("spec.%s default %q is not an integer: %v", field, f.Default.Raw, err)
+	}
+
+	if got != want {
+		t.Errorf("spec.%s default = %d, want %d; pools that never set the field "+
+			"rely on this matching defaultOpportunisticHeartbeatSeconds",
+			field, got, want)
 	}
 }

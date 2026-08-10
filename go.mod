@@ -2,6 +2,8 @@ module github.com/negativecycle/podpool-controller
 
 go 1.26.0
 
+toolchain go1.26.5
+
 require (
 	github.com/go-logr/logr v1.4.3
 	github.com/onsi/ginkgo/v2 v2.27.4

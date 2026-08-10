@@ -1,7 +1,7 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
-YEAR ?= $(shell date +%Y)
+YEAR ?= 2026
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -61,7 +61,7 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test -race $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
@@ -79,7 +79,13 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 	}
 	@case "$$($(KIND) get clusters)" in \
 		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
+			if $(KUBECTL) --context kind-$(KIND_CLUSTER) cluster-info >/dev/null 2>&1; then \
+				echo "Kind cluster '$(KIND_CLUSTER)' is running."; \
+			else \
+				echo "Kind cluster '$(KIND_CLUSTER)' exists but is not reachable. Recreating..."; \
+				$(KIND) delete cluster --name $(KIND_CLUSTER); \
+				$(KIND) create cluster --name $(KIND_CLUSTER); \
+			fi ;; \
 		*) \
 			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
 			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
@@ -109,11 +115,11 @@ setup-kwok: manifests kustomize ## Create a KWOK cluster and install CRDs for in
 			else \
 				echo "KWOK cluster '$(KWOK_CLUSTER)' exists but is not reachable. Recreating..."; \
 				kwokctl delete cluster --name $(KWOK_CLUSTER) 2>/dev/null || true; \
-				kwokctl create cluster --name $(KWOK_CLUSTER) --kube-version=v$(ENVTEST_K8S_VERSION).0; \
+				KWOK_KUBE_VERSION=v$(ENVTEST_K8S_VERSION).0 kwokctl create cluster --name $(KWOK_CLUSTER); \
 			fi ;; \
 		*) \
 			echo "Creating KWOK cluster '$(KWOK_CLUSTER)'..."; \
-			kwokctl create cluster --name $(KWOK_CLUSTER) --kube-version=v$(ENVTEST_K8S_VERSION).0 ;; \
+			KWOK_KUBE_VERSION=v$(ENVTEST_K8S_VERSION).0 kwokctl create cluster --name $(KWOK_CLUSTER) ;; \
 	esac
 	"$(KUSTOMIZE)" build config/crd | $(KUBECTL) --context kwok-$(KWOK_CLUSTER) apply -f -
 
@@ -136,6 +142,28 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
+
+.PHONY: lint-api
+lint-api: golangci-lint-kal ## Lint API types with kube-api-linter
+	"$(GOLANGCI_KAL)" run --config .golangci-kal.yml ./api/...
+
+.PHONY: verify-generate
+verify-generate: manifests generate ## Fail if generated output differs from what is committed.
+	go mod tidy
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "Generated output is out of date. Run 'make manifests generate' and commit:"; \
+		git status --porcelain; \
+		git diff; \
+		exit 1; \
+	fi
+
+.PHONY: vulncheck
+vulncheck: govulncheck ## Scan Go dependencies for known vulnerabilities.
+	"$(GOVULNCHECK)" ./...
+
+.PHONY: install-hooks
+install-hooks: ## Install git pre-commit hook.
+	ln -sf ../../hack/pre-commit .git/hooks/pre-commit
 
 ##@ Build
 
@@ -220,6 +248,8 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+GOLANGCI_KAL = $(LOCALBIN)/golangci-lint-kube-api-linter
+GOVULNCHECK ?= $(LOCALBIN)/govulncheck
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
@@ -236,6 +266,11 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
 GOLANGCI_LINT_VERSION ?= v2.12.2
+# KAL has no tagged releases; this is main HEAD as of 2026-07-16. Revisit when
+# the project cuts a tag — its release workflow exists but has never fired.
+KAL_VERSION ?= v0.0.0-20260716143926-092fe0c72997
+GOVULNCHECK_VERSION ?= v1.6.0
+
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
@@ -263,11 +298,16 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
-	@test -f .custom-gcl.yml && { \
-		echo "Building custom golangci-lint with plugins..." && \
-		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
-		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
-	} || true
+
+.PHONY: golangci-lint-kal
+golangci-lint-kal: $(GOLANGCI_KAL) ## Download kube-api-linter locally if necessary.
+$(GOLANGCI_KAL): $(LOCALBIN)
+	$(call go-install-tool,$(GOLANGCI_KAL),sigs.k8s.io/kube-api-linter/cmd/golangci-lint-kube-api-linter,$(KAL_VERSION))
+
+.PHONY: govulncheck
+govulncheck: $(GOVULNCHECK) ## Download govulncheck locally if necessary.
+$(GOVULNCHECK): $(LOCALBIN)
+	$(call go-install-tool,$(GOVULNCHECK),golang.org/x/vuln/cmd/govulncheck,$(GOVULNCHECK_VERSION))
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary

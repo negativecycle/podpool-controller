@@ -1,9 +1,11 @@
-# This rule is not used by the project podpools itself.
-# It is provided to allow the cluster admin to help manage permissions for users.
+# PodPool editor — grants create, update, delete, and scale on PodPools.
 #
-# Grants permissions to create, update, and delete resources within the podpools.dev.
-# This role is intended for users who need to manage these resources
-# but should not control RBAC or manage permissions for others.
+# Privilege equivalence: a PodPool editor can cause any workload the controller
+# supports to be created in their namespace, because the controller renders
+# spec.workloadTemplate under its own credentials. The validating webhook checks
+# (via SubjectAccessReview) that the requesting user also has "create" on the
+# target workload type, so this role alone is not sufficient without a matching
+# workload grant. See SECURITY.md for the full analysis.
 
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -25,6 +27,13 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - podpools.dev
+  resources:
+  - podpools/scale
+  verbs:
+  - get
+  - update
 - apiGroups:
   - podpools.dev
   resources:

@@ -48,12 +48,8 @@ rules:
   resources:
   - podpools
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - podpools.dev
@@ -68,4 +64,3 @@ rules:
   verbs:
   - get
   - patch
-  - update

@@ -1,0 +1,12 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aggregate-manager-role
+  labels:
+    app.kubernetes.io/name: podpools
+    app.kubernetes.io/managed-by: kustomize
+aggregationRule:
+  clusterRoleSelectors:
+  - matchLabels:
+      podpools.dev/aggregate-to-manager: "true"
+rules: []

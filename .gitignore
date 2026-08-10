@@ -6,6 +6,9 @@
 *.dylib
 bin/*
 Dockerfile.cross
+# Ad-hoc `go build cmd/main.go` output (the tracked build targets are bin/manager
+# and, in the image, /manager).
+/main
 
 # Test binary, built with `go test -c`
 *.test
@@ -22,6 +25,7 @@ go.work
 # editor and IDE paraphernalia
 .idea
 .vscode
+.claude
 *.swp
 *.swo
 *~

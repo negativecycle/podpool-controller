@@ -2,6 +2,10 @@ name: Lint
 
 on:
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '.github/**'
 
 # A force-push supersedes the run it interrupted; without this the obsolete
 # one keeps a runner busy to no purpose.
@@ -40,3 +44,11 @@ jobs:
         run: make lint-config
       - name: Run linter
         run: make lint
+      - name: Lint API types (kube-api-linter)
+        run: make lint-api
+      - name: Verify generated output
+        run: make verify-generate
+      - name: Lint workflow YAML (actionlint)
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          actionlint

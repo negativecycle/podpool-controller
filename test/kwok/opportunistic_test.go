@@ -440,7 +440,14 @@ func waitForNoPods(t *testing.T) {
 
 	remaining := -1
 
-	err := pollFor(30*time.Second, func(ctx context.Context) (bool, error) {
+	// pollTimeout, not a shorter budget of its own. Deleting a pool removes
+	// the object once its children are gone, but the ReplicaSets and Pods
+	// beneath them are collected asynchronously afterwards, so this waits on
+	// a chain the previous test's cleanup never claimed to have finished. A
+	// loaded runner needs the full budget; halving it here was an outlier
+	// with no reason behind it, and it failed on the first machine that was
+	// not the author's.
+	err := pollFor(pollTimeout, func(ctx context.Context) (bool, error) {
 		pods := &corev1.PodList{}
 		if err := k8sClient.List(ctx, pods); err == nil {
 			remaining = len(pods.Items)

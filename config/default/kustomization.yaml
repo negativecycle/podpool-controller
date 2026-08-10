@@ -24,6 +24,17 @@ resources:
 # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER'. 'WEBHOOK' components are required.
 - ../certmanager
 # [PROMETHEUS] To enable prometheus monitor, uncomment all sections with 'PROMETHEUS'.
+#
+# Left out of the default overlay on purpose. ServiceMonitor is a Prometheus
+# Operator CRD, so `make deploy` fails outright on any cluster that does not
+# have that operator installed:
+#
+#   no matches for kind "ServiceMonitor" in version "monitoring.coreos.com/v1"
+#
+# It used to be enabled here, which broke the install path in the README for
+# everyone without Prometheus Operator, and went unnoticed because no test
+# applied these manifests until the e2e suite first ran. Uncomment if you run
+# Prometheus Operator — see README, "Observability".
 #- ../prometheus
 # [METRICS] Expose the controller manager metrics service.
 - metrics_service.yaml

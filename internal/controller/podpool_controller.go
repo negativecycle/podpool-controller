@@ -166,8 +166,10 @@ type PodPoolReconciler struct {
 	outOfRangeMu      sync.Mutex
 }
 
-// +kubebuilder:rbac:groups=podpools.dev,resources=podpools,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=podpools.dev,resources=podpools/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=podpools.dev,resources=podpools,verbs=get;list;watch
+// +kubebuilder:rbac:groups=podpools.dev,resources=podpools/status,verbs=get;patch
+// OwnerReferencesPermissionEnforcement requires update on the owner's finalizers
+// subresource before admitting an ownerReference with blockOwnerDeletion: true.
 // +kubebuilder:rbac:groups=podpools.dev,resources=podpools/finalizers,verbs=update
 // Server-side apply against an absent object checks create then patch; both are
 // required or the first reconcile of every child fails.
