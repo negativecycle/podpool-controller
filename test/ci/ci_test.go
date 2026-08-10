@@ -310,6 +310,46 @@ func TestWorkflowsPassActionlint(t *testing.T) {
 	}
 }
 
+// TestBaseImageAnnotationsMatchTheDockerfile keeps two copies of the same
+// fact from drifting apart.
+//
+// The final stage's FROM pins the base by digest, and base.name/base.digest
+// repeat it as annotations so a scanner can tell our layers from the base's.
+// Nothing makes them agree. A dependency bot bumping the FROM line and
+// leaving the labels alone produces an image that reports a parent it does
+// not have -- which is worse than reporting none, because it looks answered.
+func TestBaseImageAnnotationsMatchTheDockerfile(t *testing.T) {
+	body := readRepoFile(t, "Dockerfile")
+
+	// The last FROM is the stage the published image is built from.
+	from := regexp.MustCompile(`(?m)^FROM ([^\s@]+)@(sha256:[0-9a-f]{64})`)
+
+	matches := from.FindAllStringSubmatch(body, -1)
+	if len(matches) == 0 {
+		t.Fatal("no digest-pinned FROM in the Dockerfile; the base is floating again")
+	}
+
+	final := matches[len(matches)-1]
+	wantName, wantDigest := final[1], final[2]
+
+	label := func(key string) string {
+		re := regexp.MustCompile(`org\.opencontainers\.image\.` + regexp.QuoteMeta(key) + `=([^\s\\]+)`)
+		if m := re.FindStringSubmatch(body); m != nil {
+			return m[1]
+		}
+
+		return ""
+	}
+
+	if got := label("base.name"); got != wantName {
+		t.Errorf("base.name is %q but the final FROM builds on %q", got, wantName)
+	}
+
+	if got := label("base.digest"); got != wantDigest {
+		t.Errorf("base.digest is %q but the final FROM pins %q", got, wantDigest)
+	}
+}
+
 // TestVerificationScriptExists guards the claim the document makes about
 // itself.
 //

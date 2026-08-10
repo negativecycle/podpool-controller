@@ -5,6 +5,11 @@
 *.so
 *.dylib
 bin/*
+# `make build-installer` renders config/ into dist/install.yaml. It is a
+# release artifact, published to the GitHub release rather than committed --
+# and verify-generate reads `git status --porcelain`, so leaving it untracked
+# would make a local installer build look like generated-output drift.
+dist/
 Dockerfile.cross
 # Ad-hoc `go build cmd/main.go` output (the tracked build targets are bin/manager
 # and, in the image, /manager).
