@@ -374,20 +374,7 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		errs = append(errs, sweepErrs...)
 	}
 
-	// Stamp progress timestamps on freshly reconciled groups only. Failed
-	// groups keep their previous status, including timestamps, from the
-	// carry-forward above: a group whose applies are failing is not
-	// progressing, and a generation bump should not restart its clock.
-	genChanged := before.Status.ObservedGeneration != pool.Generation
-
-	for i := range groupStatuses {
-		gs := &groupStatuses[i]
-		if !reconciledGroups[gs.Name] {
-			continue
-		}
-
-		stampGroupProgress(gs, findGroupStatus(before.Status.Groups, gs.Name), genChanged, now)
-	}
+	stampAllProgress(groupStatuses, before, reconciledGroups, pool.Generation, now)
 
 	stalledGroups := evaluateStalled(&pool, groupStatuses, now)
 
@@ -398,29 +385,11 @@ func (r *PodPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 
 	assignGroupReasons(groupStatuses, stalledSet, childByGroup)
 
-	// Sum in int64, then narrow once. Every group count is already bounded to
-	// int32 individually, but two groups each reporting a large valid count
-	// can sum past MaxInt32, and pool.Status.Replicas is this CRD's own scale
-	// statusReplicasPath, which the API server rejects when negative. 32
-	// groups (the schema cap) at MaxInt32 is 6.9e10, so the wide accumulator
-	// provably cannot overflow.
-	var sumReplicas, sumReady, sumUpdated int64
+	totals := summariseGroups(groupStatuses)
 
-	for _, gs := range groupStatuses {
-		sumReplicas += int64(gs.Replicas)
-		sumReady += int64(gs.ReadyReplicas)
-		sumUpdated += int64(gs.UpdatedReplicas)
-	}
-
-	totalReplicas := clampInt32(sumReplicas)
-
-	for i := range groupStatuses {
-		groupStatuses[i].SharePercent = shareOfTotal(groupStatuses[i].Replicas, totalReplicas)
-	}
-
-	pool.Status.Replicas = totalReplicas
-	pool.Status.ReadyReplicas = clampInt32(sumReady)
-	pool.Status.UpdatedReplicas = clampInt32(sumUpdated)
+	pool.Status.Replicas = totals.replicas
+	pool.Status.ReadyReplicas = totals.ready
+	pool.Status.UpdatedReplicas = totals.updated
 	pool.Status.UnplacedReplicas = result.Unplaced
 	pool.Status.GroupCount = int32(len(pool.Spec.Groups)) //nolint:gosec // spec.groups carries MaxItems=32, so len() fits int32
 	pool.Status.Groups = groupStatuses
@@ -537,6 +506,65 @@ func (r *PodPoolReconciler) diagnoseStatusMissing(
 				"replica has ever become ready, and the pool cannot tell these apart, "+
 				"so it reports 0 ready",
 			gvk.Kind, formatGroupNames(silent))
+	}
+}
+
+// stampAllProgress stamps progress timestamps on freshly reconciled groups
+// only. Failed groups keep their previous status, including timestamps, from
+// the carry-forward in Reconcile: a group whose applies are failing is not
+// progressing, and a generation bump should not restart its clock.
+func stampAllProgress(
+	statuses []podpoolsv1alpha1.GroupStatus,
+	before *podpoolsv1alpha1.PodPool,
+	reconciled map[string]bool,
+	generation int64,
+	now time.Time,
+) {
+	genChanged := before.Status.ObservedGeneration != generation
+
+	for i := range statuses {
+		gs := &statuses[i]
+		if !reconciled[gs.Name] {
+			continue
+		}
+
+		stampGroupProgress(gs, findGroupStatus(before.Status.Groups, gs.Name), genChanged, now)
+	}
+}
+
+// groupTotals is the pool-level rollup of every group's counts.
+type groupTotals struct {
+	replicas, ready, updated int32
+}
+
+// summariseGroups sums the group rows and narrows once, and also fills each
+// row's SharePercent, which cannot be computed until the total is known.
+//
+// The accumulators are int64 deliberately. Every group count is already
+// bounded to int32 individually, but two groups each reporting a large valid
+// count can sum past MaxInt32, and pool.Status.Replicas is this CRD's own
+// scale statusReplicasPath, which the API server rejects when negative. 32
+// groups (the schema cap) at MaxInt32 is 6.9e10, so the wide accumulator
+// provably cannot overflow.
+func summariseGroups(statuses []podpoolsv1alpha1.GroupStatus) groupTotals {
+	var sumReplicas, sumReady, sumUpdated int64
+
+	for _, gs := range statuses {
+		sumReplicas += int64(gs.Replicas)
+		sumReady += int64(gs.ReadyReplicas)
+		sumUpdated += int64(gs.UpdatedReplicas)
+	}
+
+	total := clampInt32(sumReplicas)
+
+	for i := range statuses {
+		statuses[i].SharePercent = shareOfTotal(statuses[i].Replicas, total)
+	}
+
+	return groupTotals{
+		replicas: total,
+		ready:    clampInt32(sumReady),
+		updated:  clampInt32(sumUpdated),
 	}
 }
 
