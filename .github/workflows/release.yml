@@ -1,0 +1,149 @@
+name: Release
+
+# Merging a pull request cuts a release. The size of the bump comes from a
+# label on the pull request rather than from its commit messages, and that is
+# deliberate: the commit titles in this repository are the tutorial's prose,
+# rendered verbatim into the document. Conventional Commits would put `feat:`
+# in front of sentences written to be read, so the metadata lives on the pull
+# request where it costs the history nothing.
+#
+#   semver:major   breaking
+#   semver:minor   default, applied when no label is present
+#   semver:patch   fixes only
+#   semver:skip    cut nothing at all
+on:
+  pull_request:
+    types:
+      - closed
+    # The same filter every other workflow carries. A change that cannot
+    # reach the binary cannot warrant a version of it, so a documentation
+    # or workflow-only pull request cuts nothing rather than relying on
+    # somebody remembering a label.
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '.github/**'
+
+permissions: {}
+
+jobs:
+  tag:
+    name: Cut a version
+    if: >-
+      github.event.pull_request.merged == true &&
+      !contains(github.event.pull_request.labels.*.name, 'semver:skip')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+      # the version guard asks ghcr whether this tag is already published
+      packages: read
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # The whole history, because the next version is a function of the
+          # last tag and a shallow clone has none.
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Work out the next version
+        id: next
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          bump="minor"
+          case " $LABELS " in
+            *" semver:major "*) bump="major" ;;
+            *" semver:patch "*) bump="patch" ;;
+            *" semver:minor "*) bump="minor" ;;
+          esac
+
+          # sort -V so v0.10.0 outranks v0.9.0, which lexical sort gets wrong.
+          latest=$(git tag --list 'v[0-9]*' | sort -V | tail -1)
+
+          if [ -z "$latest" ]; then
+            # No release has been cut. Automation cannot infer a starting
+            # point, so the first one is stated rather than derived.
+            next=v0.1.0
+            echo "no existing v* tag; starting the series at $next"
+          else
+            IFS=. read -r major minor patch <<EOF
+          ${latest#v}
+          EOF
+            case "$bump" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+            esac
+            next="v${major}.${minor}.${patch}"
+            echo "$latest + $bump -> $next"
+          fi
+
+          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
+            echo "::error::$next already exists; refusing to move a published tag"
+            exit 1
+          fi
+
+          # And the registry, because the two can disagree. A tag deleted from
+          # git while its image survives leaves this loop computing a version
+          # that is already published: the push would overwrite that tag with
+          # a different digest and silently invalidate any signature recorded
+          # against the old one.
+          #
+          # 200 is a definite collision and stops the release. 404 is a
+          # definite absence and proceeds. Anything else means the question
+          # was not answered -- no token, ghcr unreachable, an unexpected
+          # status -- and that is reported rather than treated as an answer,
+          # because a check that quietly decides "fine" when it failed is not
+          # a check.
+          reg_token=$(curl -sSL -u "x:${GH_TOKEN}" \
+            "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY}:pull" 2>/dev/null \
+            | jq -r '.token // empty')
+
+          if [ -z "$reg_token" ]; then
+            echo "::warning::could not obtain a ghcr token; the registry collision check did not run"
+          else
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${reg_token}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json' \
+              "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/${next#v}" 2>/dev/null || echo 000)
+
+            case "$code" in
+              200) echo "::error::${next#v} is already published to ghcr.io/${GITHUB_REPOSITORY}; pushing it again would overwrite a signed digest"
+                   exit 1 ;;
+              404) : ;;
+              *)   echo "::warning::ghcr answered ${code} for ${next#v}; the registry collision check did not run" ;;
+            esac
+          fi
+
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+
+      - name: Tag it
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+          BUMP: ${{ steps.next.outputs.bump }}
+          PR: ${{ github.event.pull_request.number }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "$VERSION ($BUMP)" -m "#${PR}: ${TITLE}"
+          git push origin "$VERSION"
+
+      # A tag pushed with GITHUB_TOKEN does not start another workflow -- the
+      # recursion guard treats it as machine-made -- so the image build is
+      # asked for explicitly rather than left to fire on its own. That run
+      # publishes the release once the image is built, signed and verified;
+      # this workflow deliberately announces nothing itself.
+      - name: Build and publish the image for this tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.next.outputs.version }}
+        run: gh workflow run image.yml --ref "$VERSION"

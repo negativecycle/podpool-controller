@@ -2,10 +2,6 @@ name: Tests
 
 on:
   pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '**.md'
-      - '.github/**'
 
 # A force-push supersedes the run it interrupted; without this the obsolete
 # one keeps a runner busy to no purpose.
@@ -19,8 +15,9 @@ jobs:
   test:
     permissions:
       contents: read
-    name: Run on Ubuntu
+    name: Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

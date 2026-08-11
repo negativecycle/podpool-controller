@@ -1,0 +1,69 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "description": [
+    "Updates wait five days after release before a pull request is raised, so a version yanked in its first week is never one this repository adopted.",
+    "platformAutomerge is off deliberately. GitHub's native auto-merge only waits when a status check is required, and none are required on main -- a pull request here is mergeable the moment it opens, so handing the merge to the platform would merge it before CI had run at all. With this off, Renovate performs the merge itself and only once every check it can see has passed.",
+    "Every pull request is labelled semver:patch. Merging one otherwise cuts a minor release, because release.yml treats an unlabelled pull request as a minor bump."
+  ],
+  "timezone": "America/New_York",
+  "minimumReleaseAge": "5 days",
+  "labels": [
+    "semver:patch"
+  ],
+  "platformAutomerge": false,
+  "packageRules": [
+    {
+      "description": "Patch, pin and digest updates land as one batch a week and merge themselves once every check is green.",
+      "matchUpdateTypes": [
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "groupName": "patch updates",
+      "schedule": [
+        "before 6am on monday"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Minor updates batch monthly. Cheap enough to group, not cheap enough to merge unread.",
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "groupName": "minor updates",
+      "schedule": [
+        "before 6am on the first day of the month"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Major updates are never grouped. Five majors in one branch is five migrations that cannot be bisected, merged apart, or reverted apart.",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "schedule": [
+        "before 6am on the first day of the month"
+      ],
+      "automerge": false,
+      "labels": [
+        "semver:patch",
+        "dependencies:major"
+      ]
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "description": "A cooldown that delays a CVE fix is worse than no cooldown, so these bypass both the wait and the schedule.",
+    "minimumReleaseAge": null,
+    "schedule": [
+      "at any time"
+    ],
+    "labels": [
+      "semver:patch",
+      "security"
+    ],
+    "automerge": false
+  }
+}

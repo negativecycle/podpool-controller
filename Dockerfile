@@ -1,5 +1,8 @@
 # Build the manager binary
-FROM golang:1.26 AS builder
+# Pinned by digest, like every action and every tool in this repository.
+# The base image is the one input that ends up inside the artifact being
+# signed and inventoried, so it is the last one that should float.
+FROM golang:1.26@sha256:2005724102f45917a63e9d092fc0e4ea56ea575048ce147caad5f5f61502c365 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -23,7 +26,28 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o ma
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot
+FROM gcr.io/distroless/static:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
+
+# Static annotations only. created, revision and version are deliberately
+# absent: baking them in would invalidate this layer on every build and go
+# stale the moment the image outlives the commit that wrote it. The workflow
+# supplies those three at push time, where they can be correct.
+#
+# licenses is absent too, and that is a statement rather than an oversight:
+# this repository ships no LICENSE file, so there is no SPDX expression to
+# assert. Claiming one here while the registry index reported an empty value
+# left the image contradicting itself about its own terms.
+#
+# base.name and base.digest name the immediate parent, so a scanner can tell
+# which layers are ours. They repeat the digest in the FROM line above, and a
+# test in test/ci fails if the two ever disagree -- which is exactly what a
+# dependency bot updating one and not the other would produce.
+LABEL org.opencontainers.image.source=https://github.com/negativecycle/podpool-controller \
+      org.opencontainers.image.title=podpool-controller \
+      org.opencontainers.image.description="A Kubernetes controller that distributes replicas across scaling groups" \
+      org.opencontainers.image.base.name=gcr.io/distroless/static:nonroot \
+      org.opencontainers.image.base.digest=sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
+
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532

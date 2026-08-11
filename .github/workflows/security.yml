@@ -23,6 +23,7 @@ jobs:
       contents: read
     name: Go vulnerability scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -42,6 +43,7 @@ jobs:
       contents: read
     name: Dockerfile lint
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -64,6 +66,7 @@ jobs:
       contents: read
     name: Container image scan
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
