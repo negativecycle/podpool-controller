@@ -6,6 +6,10 @@ type: application
 version: 0.1.0
 # The controller image version this chart deploys by default.
 appVersion: "0.1.1"
+# Pod Security Standard *enforce* labels are stable from 1.25. (The topology
+# spread matchLabelKeys default is best on 1.27+, but degrades harmlessly
+# below.) Helm refuses to install on an older cluster.
+kubeVersion: ">=1.25.0-0"
 home: https://github.com/negativecycle/podpool-controller
 sources:
   - https://github.com/negativecycle/podpool-controller

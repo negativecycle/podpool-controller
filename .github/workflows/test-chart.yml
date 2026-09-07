@@ -33,6 +33,14 @@ jobs:
         with:
           version: v3.16.3
 
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kubeconform
+        run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
+
       - name: Lint the chart
         run: helm lint dist/chart
 
@@ -46,6 +54,21 @@ jobs:
           helm template pp dist/chart --debug \
             --set policy.kyverno.enabled=true \
             --set policy.kyverno.validationFailureAction=Enforce > /dev/null
+
+      # helm lint checks the templating; it does not check that the rendered
+      # objects are valid Kubernetes. kubeconform validates them against the API
+      # schemas -- a wrong apiVersion or a mistyped field that renders cleanly is
+      # caught here. The full render (HA replicas, policy on) exercises the PDB
+      # and ClusterPolicy paths too; -ignore-missing-schemas skips the CRs
+      # kubeconform has no schema for (cert-manager, Kyverno).
+      - name: Validate rendered manifests against the Kubernetes schemas
+        run: |
+          set -euo pipefail
+          helm template pp dist/chart \
+            --set controllerManager.replicas=2 \
+            --set policy.kyverno.enabled=true \
+            | kubeconform -strict -ignore-missing-schemas -summary \
+                -kubernetes-version 1.31.0
 
       # The rendered policy must actually be a ClusterPolicy when enabled, and
       # actually absent when not -- a gate that renders nothing still "passes".

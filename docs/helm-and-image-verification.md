@@ -3,6 +3,16 @@
 The controller can be installed with Helm, and its image can be verified — both
 by you before you trust it, and by the cluster at admission time.
 
+## Prerequisites
+
+- **Kubernetes ≥ 1.25** — the chart enforces it via `kubeVersion` (Pod Security
+  Standard *enforce* labels are stable from 1.25).
+- **cert-manager** — installed in the cluster **before** you install this chart.
+  The admission webhook's serving certificate is issued by cert-manager
+  (`certmanager.enable` is on by default); without it the webhook never gets a
+  cert and the rollout stalls. If you don't need the webhook, set
+  `--set webhook.enable=false --set certmanager.enable=false`.
+
 ## Install with Helm
 
 The chart lives in-repo at [`dist/chart`](../dist/chart) and deploys the signed
@@ -75,6 +85,11 @@ These are no-ops at `replicas: 1`. Override or drop them via
 `controllerManager.topologySpreadConstraints` (set `[]` to remove). The chart
 also exposes `nodeSelector`, `tolerations`, `affinity`, `priorityClassName`, and
 `imagePullSecrets` on `controllerManager`.
+
+At `replicas > 1` the chart also renders a **PodDisruptionBudget**
+(`minAvailable: 1` by default) so a node drain can't evict every replica at once
+and leave no leader. It is deliberately not rendered at `replicas: 1`, where a
+budget would block node drains entirely. Tune via `podDisruptionBudget`.
 
 ## Verify the image yourself
 

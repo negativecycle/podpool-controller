@@ -3,6 +3,12 @@
 Check the controller is running:
 
   kubectl -n {{ .Release.Namespace }} rollout status deployment/podpools-controller-manager
+{{ if .Values.certmanager.enable }}
+Requires cert-manager: the webhook's serving certificate is issued by cert-manager,
+which must already be installed in the cluster. If the rollout hangs with the
+webhook pod waiting on its cert, that is the likely cause. Install cert-manager,
+or disable the webhook and cert-manager if you do not need admission webhooks.
+{{ end -}}
 
 The image is signed and carries a signed SLSA provenance attestation. Verify it:
 

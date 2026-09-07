@@ -78,6 +78,14 @@
     "extraObjects": {
       "type": "array",
       "items": { "type": "object" }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": ["integer", "string"] },
+        "maxUnavailable": { "type": ["integer", "string"] }
+      }
     }
   }
 }

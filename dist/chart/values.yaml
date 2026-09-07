@@ -151,18 +151,15 @@ policy:
 # [EXTRA OBJECTS]: Arbitrary manifests rendered alongside the chart, for things
 # it does not model directly. Each entry is a full Kubernetes object and is run
 # through `tpl`, so it may reference values and release metadata. For example, a
-# PodDisruptionBudget for an HA (replicas > 1) deployment:
+# ConfigMap the controller consumes, or a NetworkPolicy the chart does not model:
 #
 #   extraObjects:
-#     - apiVersion: policy/v1
-#       kind: PodDisruptionBudget
+#     - apiVersion: v1
+#       kind: ConfigMap
 #       metadata:
-#         name: '{{ include "chart.name" . }}-pdb'
-#       spec:
-#         minAvailable: 1
-#         selector:
-#           matchLabels:
-#             control-plane: controller-manager
+#         name: '{{ include "chart.name" . }}-extra'
+#       data:
+#         key: value
 extraObjects: []
 
 # [POD SECURITY]: Enforce a Pod Security Standard on the release namespace. On
@@ -174,3 +171,13 @@ podSecurityStandards:
   # The level to enforce and warn on. "restricted" is the strictest; the
   # controller satisfies it. "baseline" is the looser profile.
   standard: restricted
+
+# [POD DISRUPTION BUDGET]: Keep a minimum available during voluntary disruptions
+# (node drains, upgrades). On by default, but only takes effect at replicas > 1
+# -- a budget over a single replica would block node drains entirely, so the
+# chart does not render one there. Set minAvailable OR maxUnavailable, not both;
+# either accepts a count or a percentage ("50%").
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+  maxUnavailable: ""
