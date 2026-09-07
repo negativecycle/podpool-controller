@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "title": "podpool-controller chart values",
+  "description": "Validates the values that cause confusing, far-from-the-cause failures when wrong -- enums, types, and the image digest format. additionalProperties is left permissive on purpose, so extraObjects and values added later are not rejected before the schema is updated.",
+  "type": "object",
+  "properties": {
+    "controllerManager": {
+      "type": "object",
+      "properties": {
+        "replicas": { "type": "integer", "minimum": 1 },
+        "serviceAccountName": { "type": "string" },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+        "container": {
+          "type": "object",
+          "properties": {
+            "imagePullPolicy": {
+              "type": "string",
+              "enum": ["Always", "IfNotPresent", "Never"]
+            },
+            "args": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "image": {
+              "type": "object",
+              "properties": {
+                "repository": { "type": "string", "minLength": 1 },
+                "tag": { "type": "string" },
+                "digest": {
+                  "type": "string",
+                  "pattern": "^(sha256:[a-f0-9]{64})?$",
+                  "description": "Empty, or a full sha256: digest."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "rbac":         { "type": "object", "properties": { "enable": { "type": "boolean" } } },
+    "crd":          { "type": "object", "properties": { "enable": { "type": "boolean" }, "keep": { "type": "boolean" } } },
+    "metrics":      { "type": "object", "properties": { "enable": { "type": "boolean" } } },
+    "webhook":      { "type": "object", "properties": { "enable": { "type": "boolean" } } },
+    "prometheus":   { "type": "object", "properties": { "enable": { "type": "boolean" } } },
+    "certmanager":  { "type": "object", "properties": { "enable": { "type": "boolean" } } },
+    "networkPolicy":{ "type": "object", "properties": { "enable": { "type": "boolean" } } },
+    "policy": {
+      "type": "object",
+      "properties": {
+        "kyverno": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "validationFailureAction": {
+              "type": "string",
+              "enum": ["Audit", "Enforce"]
+            }
+          }
+        }
+      }
+    },
+    "podSecurityStandards": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "standard": {
+          "type": "string",
+          "enum": ["restricted", "baseline", "privileged"]
+        }
+      }
+    },
+    "extraObjects": {
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  }
+}

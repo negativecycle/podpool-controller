@@ -31,6 +31,10 @@ full set):
 | `policy.kyverno.enabled` | `false` | Install the admission verification policy (below) |
 | `extraObjects` | `[]` | Inject arbitrary manifests (PDB, HPA, extra RBAC…) without forking |
 
+Values are validated against [`values.schema.json`](../dist/chart/values.schema.json)
+on install/upgrade, so a typo'd enum (e.g. `standard: restrictd`) or a bad type
+fails up front with a clear message instead of rendering broken YAML.
+
 ## Pod Security Standard
 
 The controller meets the **restricted** [Pod Security Standard](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
