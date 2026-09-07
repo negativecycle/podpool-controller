@@ -1,0 +1,30 @@
+name: Renovate Config
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  validate:
+    name: Validate renovate config
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Digest-pinned like every other image and action in the repo: no
+      # latest-from-npm executing at CI time. With no file argument and cwd at
+      # the repo root, the validator auto-detects .github/renovate.json as a
+      # repository config. Bump the tag+digest as Renovate releases (the config
+      # schema moves slowly, so a slightly older validator is safe).
+      - name: renovate-config-validator
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/repo:ro" -w /repo \
+            ghcr.io/renovatebot/renovate:44.69.3@sha256:76b1bc6d6956dfe985b9ea2559398991e9277c3ce7316d1870fd7c2442106bd5 \
+            renovate-config-validator --strict

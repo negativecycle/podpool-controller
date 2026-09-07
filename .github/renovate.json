@@ -6,7 +6,7 @@
   "description": [
     "Updates wait five days after release before a pull request is raised, so a version yanked in its first week is never one this repository adopted.",
     "platformAutomerge is off deliberately. GitHub's native auto-merge only waits when a status check is required, and none are required on main -- a pull request here is mergeable the moment it opens, so handing the merge to the platform would merge it before CI had run at all. With this off, Renovate performs the merge itself and only once every check it can see has passed.",
-    "Every pull request is labelled semver:patch. Merging one otherwise cuts a minor release, because release.yml treats an unlabelled pull request as a minor bump.",
+    "Every pull request is labelled semver:patch, which is also release.yml's default bump. A dependency update -- even a major one -- cuts a patch release of the controller, because the controller's version tracks its own changes, not its dependencies'. A human feature pull request overrides with semver:minor or semver:major.",
     "Updates are grouped by ecosystem, never across one. An Actions bump, a Go module bump and a base-image bump each land in their own pull request, so one ecosystem's churn is never blocked by another's review."
   ],
   "timezone": "America/New_York",
@@ -187,7 +187,7 @@
     }
   ],
   "osvVulnerabilityAlerts": true,
-  "dependencyDashboardOSVVulnerabilitySummary": "unresolved",
+  "dependencyDashboardOSVVulnerabilitySummary": "all",
   "vulnerabilityAlerts": {
     "description": "A cooldown that delays a CVE fix is worse than no cooldown, so these bypass both the wait and the schedule. They also merge themselves once every check is green -- the same trust placed in ordinary patches, applied to the updates that matter most, so a fix is not left waiting on a human when CI already vouches for it.",
     "minimumReleaseAge": null,

@@ -16,8 +16,8 @@ name: Release
 # `feat:` in front of sentences meant to be read:
 #
 #   semver:major   breaking
-#   semver:minor   default, applied when no label is present
-#   semver:patch   fixes only
+#   semver:minor   a feature
+#   semver:patch   default, applied when no label is present
 #   semver:skip    cut nothing at all
 #
 # The two series version independently, so each tag maps to a real artifact:
@@ -66,7 +66,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          bump="minor"
+          bump="patch"
           case " $LABELS " in
             *" semver:major "*) bump="major" ;;
             *" semver:patch "*) bump="patch" ;;
