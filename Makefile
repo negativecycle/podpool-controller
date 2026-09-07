@@ -209,6 +209,23 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default > dist/install.yaml
 
+.PHONY: helm-sync
+helm-sync: manifests generate ## Regenerate the Helm chart's generated templates from config/ (helm/v2-alpha).
+	@command -v kubebuilder >/dev/null 2>&1 || { echo "kubebuilder is required for helm-sync: https://book.kubebuilder.io/quick-start#installation"; exit 1; }
+	kubebuilder edit --plugins=helm.kubebuilder.io/v2-alpha
+	# The plugin's internal build-installer rewrites the manager image; the chart
+	# is regenerated, so restore the source to its committed pin.
+	git checkout -- config/manager/kustomization.yaml
+
+.PHONY: helm-verify
+helm-verify: helm-sync ## Fail if the committed Helm chart drifted from config/ (CRD, RBAC, webhooks, ...).
+	@if ! git diff --quiet -- dist/chart; then \
+		echo "::error::dist/chart is out of sync with config/. It has been regenerated -- review and 'git add dist/chart'."; \
+		git --no-pager diff --stat -- dist/chart; \
+		exit 1; \
+	fi
+	@echo "helm chart is in sync with config/"
+
 ##@ Deployment
 
 ifndef ignore-not-found

@@ -178,3 +178,20 @@ enforcement — set `validationFailureAction: Enforce` (chart value) or edit the
 > The verification the policy performs only succeeds against images produced by
 > the signing release pipeline. Build images from that pipeline (tagged
 > releases) before enabling Enforce.
+
+## Maintaining the chart
+
+The chart's `crd`, `rbac`, `webhook`, and manager templates are generated from
+`config/` by the kubebuilder `helm/v2-alpha` plugin; the rest (`values.yaml`,
+`Chart.yaml`, the Pod Security / PDB / Kyverno / extra-objects templates, the
+schema) is hand-maintained and preserved across regeneration.
+
+After changing the API or RBAC markers, resync the generated half:
+
+```bash
+make helm-sync     # make manifests + regenerate the chart, preserving customizations
+```
+
+`make helm-verify` regenerates and fails if the committed chart drifted from
+`config/` — it runs in the pre-commit hook whenever `api/`, `config/{crd,rbac,webhook}/`,
+or `dist/chart/` is staged (and skips with a warning if `kubebuilder` is not installed).
