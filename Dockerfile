@@ -7,7 +7,7 @@
 # a multi-arch build runs the compiler once on amd64 and cross-compiles to each
 # TARGETARCH below. Without it buildx would emulate an arm64 builder under QEMU
 # -- running go build under emulation, which overran the job's timeout.
-FROM --platform=${BUILDPLATFORM} golang:1.26@sha256:9d2f36f06329b2a141b9db99ffa32765cf695ee57b813ca29e245e8670bcbfff AS builder
+FROM --platform=${BUILDPLATFORM} golang:1.27@sha256:512690a5660563b57d37ecc31129e7f136e831db2aed24a1dbeb8ad7380dc0fa AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
