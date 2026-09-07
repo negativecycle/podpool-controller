@@ -824,7 +824,7 @@ func TestCIGateCoversEverySuite(t *testing.T) {
 
 	var suites []string
 
-	for _, line := range strings.Split(body, "\n") {
+	for line := range strings.SplitSeq(body, "\n") {
 		if m := jobHeader.FindStringSubmatch(line); m != nil {
 			current = m[1]
 
