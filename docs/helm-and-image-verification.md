@@ -32,8 +32,11 @@ Or from a checkout of this repo (the chart source lives at
 helm install podpool-controller ./dist/chart --namespace podpool-system
 ```
 
-The chart's version and app version track the release tag, so chart `X.Y.Z`
-deploys image `X.Y.Z`.
+The chart is versioned independently of the image (chart releases on `chart-v*`
+tags, the image on `v*`). A chart's **appVersion** is the image it deploys — the
+newest image release at the time the chart was cut — so the chart version and
+the image version may differ. `helm show chart …` reports the appVersion the
+chart will deploy.
 
 ### Verify the chart
 

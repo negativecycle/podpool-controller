@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Chart/app version to publish (e.g. 0.1.2). Defaults to the tag.
+        description: Chart version to publish (e.g. 0.2.0). Defaults to the chart-v* tag.
         required: false
 
 concurrency:
@@ -35,6 +35,9 @@ jobs:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          # The whole history: the appVersion is the newest image tag, and a
+          # shallow clone has no tags to read.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Helm
@@ -45,24 +48,36 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      # The chart version and app version both follow the release tag, so an
-      # install of chart X.Y.Z deploys image X.Y.Z -- one number to reason about.
-      - name: Resolve the version and registry
+      # The chart carries its own version (the chart-v* tag), independent of the
+      # image. Its appVersion -- the image it deploys -- is the newest image tag,
+      # so `helm show chart` reports the real image even when the two version
+      # lines have drifted apart.
+      - name: Resolve the versions and registry
         id: v
         env:
           INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
           if [ -n "${INPUT_VERSION}" ]; then
-            version="${INPUT_VERSION#v}"
-          elif printf '%s' "${GITHUB_REF}" | grep -q '^refs/tags/v'; then
-            version="${GITHUB_REF_NAME#v}"
+            version="${INPUT_VERSION#chart-v}"; version="${version#v}"
+          elif printf '%s' "${GITHUB_REF}" | grep -q '^refs/tags/chart-v'; then
+            version="${GITHUB_REF_NAME#chart-v}"
           else
-            echo "::error::no version: run on a v* tag or pass the version input"; exit 1
+            echo "::error::no chart version: run on a chart-v* tag or pass the version input"; exit 1
           fi
+
+          appversion=$(git tag --list 'v[0-9]*' | sort -V | tail -1)
+          appversion="${appversion#v}"
+          if [ -z "$appversion" ]; then
+            # No image has been released yet; fall back to the chart's own
+            # Chart.yaml default rather than inventing a version.
+            appversion=""
+          fi
+
           owner=$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
           {
             echo "version=$version"
+            echo "appversion=$appversion"
             echo "registry=oci://ghcr.io/${owner}/charts"
             echo "ref=ghcr.io/${owner}/charts/podpool-controller"
           } >> "$GITHUB_OUTPUT"
@@ -79,10 +94,17 @@ jobs:
         id: push
         env:
           VERSION: ${{ steps.v.outputs.version }}
+          APPVERSION: ${{ steps.v.outputs.appversion }}
           REGISTRY: ${{ steps.v.outputs.registry }}
         run: |
           set -euo pipefail
-          helm package dist/chart --version "$VERSION" --app-version "$VERSION" --destination .
+          args=(dist/chart --version "$VERSION" --destination .)
+          # Only override appVersion when an image has been released; otherwise
+          # keep the Chart.yaml default.
+          if [ -n "$APPVERSION" ]; then
+            args+=(--app-version "$APPVERSION")
+          fi
+          helm package "${args[@]}"
           out=$(helm push "podpool-controller-${VERSION}.tgz" "$REGISTRY" 2>&1)
           echo "$out"
           digest=$(printf '%s\n' "$out" | awk '/[Dd]igest:/ {print $2}')

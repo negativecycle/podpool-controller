@@ -1,24 +1,33 @@
 name: Release
 
-# Merging a pull request cuts a release. The size of the bump comes from a
-# label on the pull request rather than from its commit messages, and that is
-# deliberate: the commit titles in this repository are the tutorial's prose,
-# rendered verbatim into the document. Conventional Commits would put `feat:`
-# in front of sentences written to be read, so the metadata lives on the pull
-# request where it costs the history nothing.
+# Merging a pull request cuts releases, and there are two independent tracks,
+# scoped by what the pull request touched:
+#
+#   image  (v* tags)        Go source, go.mod/go.sum, Dockerfile, config/**
+#   chart  (chart-v* tags)  dist/chart/**
+#
+# A chart change releases the chart. An image change releases the image AND
+# refreshes the chart -- the chart's appVersion follows the image, so a new
+# image reaches `helm install` users without waiting for a chart edit. A change
+# that touches neither cuts nothing.
+#
+# The bump size comes from a label rather than commit messages, because the
+# commit titles here are the tutorial's prose and Conventional Commits would put
+# `feat:` in front of sentences meant to be read:
 #
 #   semver:major   breaking
 #   semver:minor   default, applied when no label is present
 #   semver:patch   fixes only
 #   semver:skip    cut nothing at all
+#
+# The two series version independently, so each tag maps to a real artifact:
+# there is never a v* with no image or a chart-v* with no chart.
 on:
   pull_request:
     types:
       - closed
-    # The same filter every other workflow carries. A change that cannot
-    # reach the binary cannot warrant a version of it, so a documentation
-    # or workflow-only pull request cuts nothing rather than relying on
-    # somebody remembering a label.
+    # A coarse filter; the job classifies precisely. A pull request that only
+    # touches these cannot reach either artifact, so it never starts the job.
     paths-ignore:
       - 'docs/**'
       - '**.md'
@@ -27,8 +36,8 @@ on:
 permissions: {}
 
 jobs:
-  tag:
-    name: Cut a version
+  release:
+    name: Cut versions
     if: >-
       github.event.pull_request.merged == true &&
       !contains(github.event.pull_request.labels.*.name, 'semver:skip')
@@ -37,7 +46,7 @@ jobs:
     permissions:
       contents: write
       actions: write
-      # the version guard asks ghcr whether this tag is already published
+      # the version guard asks ghcr whether the image tag is already published
       packages: read
     steps:
       - name: Clone the code
@@ -48,10 +57,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Work out the next version
-        id: next
+      - name: Work out what to release
+        id: cut
         env:
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          PR: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -63,96 +73,126 @@ jobs:
             *" semver:minor "*) bump="minor" ;;
           esac
 
-          # sort -V so v0.10.0 outranks v0.9.0, which lexical sort gets wrong.
-          latest=$(git tag --list 'v[0-9]*' | sort -V | tail -1)
+          # Classify the pull request's files. --paginate so a large pull request
+          # is not silently truncated at one page and misjudged. Captured into a
+          # variable first, so a failed API call fails the step rather than
+          # reading as an empty change set and quietly releasing nothing.
+          files=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[].path')
 
-          if [ -z "$latest" ]; then
-            # No release has been cut. Automation cannot infer a starting
-            # point, so the first one is stated rather than derived.
-            next=v0.1.0
-            echo "no existing v* tag; starting the series at $next"
-          else
-            IFS=. read -r major minor patch <<EOF
-          ${latest#v}
-          EOF
-            case "$bump" in
-              major) major=$((major + 1)); minor=0; patch=0 ;;
-              minor) minor=$((minor + 1)); patch=0 ;;
-              patch) patch=$((patch + 1)) ;;
+          image_changed=false
+          chart_changed=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              dist/chart/*) chart_changed=true ;;
+              docs/*|*.md|.github/*|test/*|hack/*) : ;;
+              *.go|go.mod|go.sum|Dockerfile|.dockerignore|config/*) image_changed=true ;;
+              *) : ;;
             esac
-            next="v${major}.${minor}.${patch}"
-            echo "$latest + $bump -> $next"
-          fi
+          done <<< "$files"
 
-          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
-            echo "::error::$next already exists; refusing to move a published tag"
-            exit 1
-          fi
+          echo "image_changed=$image_changed  chart_changed=$chart_changed  bump=$bump"
 
-          # And the registry, because the two can disagree. A tag deleted from
-          # git while its image survives leaves this loop computing a version
-          # that is already published: the push would overwrite that tag with
-          # a different digest and silently invalidate any signature recorded
-          # against the old one.
-          #
-          # 200 is a definite collision and stops the release. 404 is a
-          # definite absence and proceeds. Anything else means the question
-          # was not answered -- no token, ghcr unreachable, an unexpected
-          # status -- and that is reported rather than treated as an answer,
-          # because a check that quietly decides "fine" when it failed is not
-          # a check.
-          reg_token=$(curl -sSL -u "x:${GH_TOKEN}" \
-            "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY}:pull" 2>/dev/null \
-            | jq -r '.token // empty')
-
-          if [ -z "$reg_token" ]; then
-            echo "::warning::could not obtain a ghcr token; the registry collision check did not run"
-          else
-            code=$(curl -sS -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer ${reg_token}" \
-              -H 'Accept: application/vnd.oci.image.index.v1+json' \
-              "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/${next#v}" 2>/dev/null || echo 000)
-
-            case "$code" in
-              200) echo "::error::${next#v} is already published to ghcr.io/${GITHUB_REPOSITORY}; pushing it again would overwrite a signed digest"
-                   exit 1 ;;
-              404) : ;;
-              *)   echo "::warning::ghcr answered ${code} for ${next#v}; the registry collision check did not run" ;;
+          # next_version <prefix> <bump>: the successor to the newest tag in a
+          # series, or the series' first version if there is none. Parsed with
+          # parameter expansion -- no heredoc to misindent inside the YAML.
+          next_version() {
+            latest=$(git tag --list "${1}[0-9]*" | sort -V | tail -1)
+            if [ -z "$latest" ]; then echo "${1}0.1.0"; return; fi
+            ver="${latest#"$1"}"
+            maj="${ver%%.*}"; ver="${ver#*.}"
+            min="${ver%%.*}"; pat="${ver#*.}"
+            case "$2" in
+              major) maj=$((maj + 1)); min=0; pat=0 ;;
+              minor) min=$((min + 1)); pat=0 ;;
+              patch) pat=$((pat + 1)) ;;
             esac
+            echo "${1}${maj}.${min}.${pat}"
+          }
+
+          image_tag=""
+          chart_tag=""
+
+          if [ "$image_changed" = true ]; then
+            image_tag=$(next_version "v" "$bump")
+
+            if git rev-parse -q --verify "refs/tags/$image_tag" >/dev/null; then
+              echo "::error::$image_tag already exists; refusing to move a published tag"
+              exit 1
+            fi
+
+            # ghcr can disagree with git: a tag deleted from git while its image
+            # survives would have this loop recompute a published version, and
+            # the push would overwrite that digest and invalidate its signature.
+            # 200 collides and stops; 404 is absence and proceeds; anything else
+            # is unanswered and reported, never treated as "fine".
+            reg_token=$(curl -sSL -u "x:${GH_TOKEN}" \
+              "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY}:pull" 2>/dev/null \
+              | jq -r '.token // empty')
+
+            if [ -z "$reg_token" ]; then
+              echo "::warning::could not obtain a ghcr token; the image collision check did not run"
+            else
+              code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer ${reg_token}" \
+                -H 'Accept: application/vnd.oci.image.index.v1+json' \
+                "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/${image_tag#v}" 2>/dev/null || echo 000)
+
+              case "$code" in
+                200) echo "::error::${image_tag#v} is already published to ghcr.io/${GITHUB_REPOSITORY}; pushing it again would overwrite a signed digest"
+                     exit 1 ;;
+                404) : ;;
+                *)   echo "::warning::ghcr answered ${code} for ${image_tag#v}; the image collision check did not run" ;;
+              esac
+            fi
           fi
 
-          echo "version=$next" >> "$GITHUB_OUTPUT"
-          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          # The chart releases when the chart changed, and also when the image
+          # changed -- that is the appVersion refresh. chart-release derives the
+          # appVersion from the newest v* tag, which by then is this image's.
+          if [ "$image_changed" = true ] || [ "$chart_changed" = true ]; then
+            chart_tag=$(next_version "chart-v" "$bump")
 
-      - name: Tag it
+            if git rev-parse -q --verify "refs/tags/$chart_tag" >/dev/null; then
+              echo "::error::$chart_tag already exists; refusing to move a published tag"
+              exit 1
+            fi
+          fi
+
+          if [ -z "$image_tag" ] && [ -z "$chart_tag" ]; then
+            echo "the pull request touched neither the image nor the chart; nothing to release"
+          fi
+
+          {
+            echo "image_tag=$image_tag"
+            echo "chart_tag=$chart_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      # A tag pushed with GITHUB_TOKEN does not start another workflow -- the
+      # recursion guard treats it as machine-made -- so each tag-triggered
+      # release is asked for explicitly. The image is pushed and requested
+      # before the chart, so chart-release reads the new image as its appVersion.
+      - name: Tag and release
+        if: steps.cut.outputs.image_tag != '' || steps.cut.outputs.chart_tag != ''
         env:
-          VERSION: ${{ steps.next.outputs.version }}
-          BUMP: ${{ steps.next.outputs.bump }}
+          IMAGE_TAG: ${{ steps.cut.outputs.image_tag }}
+          CHART_TAG: ${{ steps.cut.outputs.chart_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
           TITLE: ${{ github.event.pull_request.title }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$VERSION" -m "$VERSION ($BUMP)" -m "#${PR}: ${TITLE}"
-          git push origin "$VERSION"
 
-      # A tag pushed with GITHUB_TOKEN does not start another workflow -- the
-      # recursion guard treats it as machine-made -- so the tag-triggered
-      # workflows are asked for explicitly rather than left to fire on their
-      # own. The image build publishes the GitHub release once the image is
-      # built, signed and verified; the chart release publishes the packaged,
-      # signed chart. Both take the version from the tag, so they move in
-      # lockstep with the bump this job just computed. This workflow
-      # deliberately announces nothing itself.
-      - name: Build and publish the image for this tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.next.outputs.version }}
-        run: gh workflow run image.yml --ref "$VERSION"
+          if [ -n "$IMAGE_TAG" ]; then
+            git tag -a "$IMAGE_TAG" -m "$IMAGE_TAG" -m "#${PR}: ${TITLE}"
+            git push origin "$IMAGE_TAG"
+            gh workflow run image.yml --ref "$IMAGE_TAG"
+          fi
 
-      - name: Publish the chart for this tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.next.outputs.version }}
-        run: gh workflow run chart-release.yml --ref "$VERSION"
+          if [ -n "$CHART_TAG" ]; then
+            git tag -a "$CHART_TAG" -m "$CHART_TAG" -m "#${PR}: ${TITLE}"
+            git push origin "$CHART_TAG"
+            gh workflow run chart-release.yml --ref "$CHART_TAG"
+          fi
