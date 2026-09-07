@@ -53,6 +53,46 @@ controllerManager:
   terminationGracePeriodSeconds: 10
   serviceAccountName: podpools-controller-manager
 
+  # Pull secrets for a private registry mirror. The published image is public.
+  imagePullSecrets: []
+  # e.g. system-cluster-critical, so the controller is evicted last under
+  # node pressure. Empty leaves it at the default priority.
+  priorityClassName: ""
+  # Standard scheduling escape hatches. Empty by default.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  # Spread the controller's replicas across failure domains. These only bite at
+  # replicas > 1 (a single replica has nothing to spread); at replicas: 1 they
+  # are no-ops. The default requires one-per-node and tries one-per-zone:
+  #   - hostname / DoNotSchedule: two replicas never share a node. On a cluster
+  #     with fewer nodes than replicas this leaves the extra replicas Pending --
+  #     that is the "require" you asked for; lower it to ScheduleAnyway or raise
+  #     the node count.
+  #   - zone / ScheduleAnyway: spread across zones when possible, but never block
+  #     scheduling to achieve it.
+  # matchLabelKeys pins each constraint to the current rollout (pod-template-hash),
+  # so a rolling update's old and new pods are not counted together and cannot
+  # deadlock the surge. Set to [] to drop the defaults entirely.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          control-plane: controller-manager
+      matchLabelKeys:
+        - pod-template-hash
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          control-plane: controller-manager
+      matchLabelKeys:
+        - pod-template-hash
+
 # [RBAC]: To enable RBAC (Permissions) configurations
 rbac:
   enable: true

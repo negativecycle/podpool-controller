@@ -52,6 +52,30 @@ Set `podSecurityStandards.standard=baseline` for the looser profile, or
 `podSecurityStandards.enabled=false` to manage the namespace and its labels
 yourself. The kustomize install (`install.yaml`) carries the same labels.
 
+## High availability and scheduling
+
+The controller is leader-elected, so extra replicas are warm standbys, not extra
+throughput. For failover, raise the replica count:
+
+```bash
+helm upgrade podpool-controller ./dist/chart --reuse-values \
+  --set controllerManager.replicas=2
+```
+
+By default the chart spreads replicas across failure domains:
+
+- **one per node** — `kubernetes.io/hostname` with `DoNotSchedule`, so two
+  replicas never share a machine. On a cluster with fewer nodes than replicas
+  the extra replicas stay `Pending` (that is the point of a hard constraint);
+  lower it or add nodes.
+- **one per zone, best-effort** — `topology.kubernetes.io/zone` with
+  `ScheduleAnyway`, so a single-zone cluster still schedules.
+
+These are no-ops at `replicas: 1`. Override or drop them via
+`controllerManager.topologySpreadConstraints` (set `[]` to remove). The chart
+also exposes `nodeSelector`, `tolerations`, `affinity`, `priorityClassName`, and
+`imagePullSecrets` on `controllerManager`.
+
 ## Verify the image yourself
 
 Every released image is signed keyless with cosign and carries a signed SLSA

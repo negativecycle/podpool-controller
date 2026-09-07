@@ -754,3 +754,43 @@ func TestRestrictedPodSecurityIsEnforcedEverywhere(t *testing.T) {
 		}
 	}
 }
+
+// TestChartDefaultsSpreadAcrossNodesAndZones pins the scheduling posture the
+// chart ships by default: replicas must land one-per-node, and should land
+// one-per-zone when the cluster can manage it.
+//
+// The two halves are deliberately different strengths -- DoNotSchedule on the
+// node so HA replicas cannot pile onto one machine, ScheduleAnyway on the zone
+// so a single-zone cluster still schedules. A well-meaning edit that makes the
+// node constraint soft would quietly let both replicas share a node and defeat
+// the point of running two; one that makes the zone constraint hard would wedge
+// every single-zone cluster. Parse the values and assert the pairing so neither
+// slip through.
+func TestChartDefaultsSpreadAcrossNodesAndZones(t *testing.T) {
+	var v struct {
+		ControllerManager struct {
+			TopologySpreadConstraints []struct {
+				TopologyKey       string `json:"topologyKey"`
+				WhenUnsatisfiable string `json:"whenUnsatisfiable"`
+			} `json:"topologySpreadConstraints"`
+		} `json:"controllerManager"`
+	}
+	if err := yaml.Unmarshal([]byte(readRepoFile(t, "dist/chart/values.yaml")), &v); err != nil {
+		t.Fatalf("parsing chart values: %v", err)
+	}
+
+	got := map[string]string{}
+	for _, c := range v.ControllerManager.TopologySpreadConstraints {
+		got[c.TopologyKey] = c.WhenUnsatisfiable
+	}
+
+	if got["kubernetes.io/hostname"] != "DoNotSchedule" {
+		t.Errorf("hostname spread is %q, want DoNotSchedule so two replicas never share a node",
+			got["kubernetes.io/hostname"])
+	}
+
+	if got["topology.kubernetes.io/zone"] != "ScheduleAnyway" {
+		t.Errorf("zone spread is %q, want ScheduleAnyway so a single-zone cluster still schedules",
+			got["topology.kubernetes.io/zone"])
+	}
+}
