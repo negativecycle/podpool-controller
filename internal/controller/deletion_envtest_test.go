@@ -79,13 +79,26 @@ var _ = Describe("Terminating pool", func() {
 
 		Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
 
+		// The guard reads the pool from the controller's cache, not the API
+		// server. Deleting the child before that cache has observed the
+		// deletionTimestamp lets the delete-triggered reconcile read a pool
+		// that still looks live and recreate the child -- a race that only
+		// surfaces on a loaded runner. Wait for the controller's own cache to
+		// show the pool terminating, so the reconcile the delete enqueues
+		// cannot miss the guard.
+		Eventually(func(g Gomega) {
+			var cached podpoolsv1alpha1.PodPool
+			g.Expect(reconciler.Get(ctx, poolKey, &cached)).To(Succeed())
+			g.Expect(cached.DeletionTimestamp.IsZero()).To(BeFalse())
+		}).Should(Succeed())
+
 		// envtest runs no garbage collector, so deleting the child by hand
 		// stands in for the foreground GC's cascade.
 		Expect(k8sClient.Delete(ctx, &child)).To(Succeed())
 
-		// The pool-delete event alone enqueues a pass; without the guard the
-		// recreate lands in well under a second, so 5s is generous without
-		// being slow.
+		// Both the pool delete and the child delete enqueue a pass; without
+		// the guard the recreate lands in well under a second, so 5s is
+		// generous without being slow.
 		Consistently(func() error {
 			return k8sClient.Get(ctx, childKey, &appsv1.Deployment{})
 		}, 5*time.Second, 250*time.Millisecond).ShouldNot(Succeed(),
