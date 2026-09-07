@@ -41,6 +41,9 @@ controllerManager:
           - "ALL"
   securityContext:
     runAsNonRoot: true
+    # Distroless's nonroot UID -- the one the image already runs as. Explicit,
+    # and high enough to avoid a host-user collision. Matches config/manager.
+    runAsUser: 65532
     seccompProfile:
       type: RuntimeDefault
   terminationGracePeriodSeconds: 10

@@ -35,6 +35,10 @@ spec:
         # This ensures that deployments meet the highest security requirements for Kubernetes.
         # For more details, see: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
         runAsNonRoot: true
+        # 65532 is distroless's nonroot user -- the UID the image already runs
+        # as. Stating it here is explicit (and high enough to avoid colliding
+        # with a host user), rather than leaving it to the image's USER line.
+        runAsUser: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
