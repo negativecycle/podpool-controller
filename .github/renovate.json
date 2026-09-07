@@ -187,7 +187,7 @@
     }
   ],
   "osvVulnerabilityAlerts": true,
-  "dependencyDashboardOSVVulnerabilitySummary": "unresolved",
+  "dependencyDashboardOSVVulnerabilitySummary": "all",
   "vulnerabilityAlerts": {
     "description": "A cooldown that delays a CVE fix is worse than no cooldown, so these bypass both the wait and the schedule. They also merge themselves once every check is green -- the same trust placed in ordinary patches, applied to the updates that matter most, so a fix is not left waiting on a human when CI already vouches for it.",
     "minimumReleaseAge": null,
