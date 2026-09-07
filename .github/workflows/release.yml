@@ -138,12 +138,21 @@ jobs:
           git push origin "$VERSION"
 
       # A tag pushed with GITHUB_TOKEN does not start another workflow -- the
-      # recursion guard treats it as machine-made -- so the image build is
-      # asked for explicitly rather than left to fire on its own. That run
-      # publishes the release once the image is built, signed and verified;
-      # this workflow deliberately announces nothing itself.
+      # recursion guard treats it as machine-made -- so the tag-triggered
+      # workflows are asked for explicitly rather than left to fire on their
+      # own. The image build publishes the GitHub release once the image is
+      # built, signed and verified; the chart release publishes the packaged,
+      # signed chart. Both take the version from the tag, so they move in
+      # lockstep with the bump this job just computed. This workflow
+      # deliberately announces nothing itself.
       - name: Build and publish the image for this tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.next.outputs.version }}
         run: gh workflow run image.yml --ref "$VERSION"
+
+      - name: Publish the chart for this tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.next.outputs.version }}
+        run: gh workflow run chart-release.yml --ref "$VERSION"
