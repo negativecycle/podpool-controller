@@ -333,6 +333,35 @@ func waitForCondition(t *testing.T, name, condType string, status metav1.Conditi
 	}
 }
 
+// waitForReadyReplicas polls until status.readyReplicas equals want.
+//
+// Available is not enough to assert a final ready count against: the controller
+// reports Available as soon as one replica is ready (a group's minimum), while
+// distribution across groups converges over later reconciles -- the
+// opportunistic capacity probe rebalances on a 15s requeue as a group's real
+// capacity is learned. Asserting the total the instant Available flips races
+// that convergence; polling the count waits it out, and a genuine failure to
+// converge surfaces as a clear timeout rather than a flake.
+func waitForReadyReplicas(t *testing.T, name string, want int32) {
+	t.Helper()
+
+	var last int32
+
+	err := pollFor(pollTimeout, func(ctx context.Context) (bool, error) {
+		pool := &podpoolsv1alpha1.PodPool{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, pool); err == nil {
+			last = pool.Status.ReadyReplicas
+
+			return last == want, nil
+		}
+
+		return false, nil
+	})
+	if err != nil {
+		t.Fatalf("timed out waiting for readyReplicas=%d on %s, last saw %d", want, name, last)
+	}
+}
+
 func TestPodPoolFullLifecycle(t *testing.T) {
 	poolName := "kwok-lifecycle"
 
@@ -670,18 +699,34 @@ func TestAsymmetricTopology(t *testing.T) {
 
 	waitForCondition(t, poolName, "Available", metav1.ConditionTrue)
 
+	// Wait for the distribution to converge, not just for the pool to report
+	// Available at the on-demand minimum: the spot group reaches its share only
+	// after the opportunistic probe has learned its capacity, several reconciles
+	// later. Asserting the total the moment Available flips is what made this
+	// flake.
+	waitForReadyReplicas(t, poolName, 8)
+
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: poolName, Namespace: testNamespace}, pool); err != nil {
 		t.Fatalf("getting pool: %v", err)
 	}
 
-	if pool.Status.ReadyReplicas != 8 {
-		t.Errorf("readyReplicas: got %d, want 8", pool.Status.ReadyReplicas)
-	}
-
 	t.Logf("asymmetric topology: %d ready across %d groups", pool.Status.ReadyReplicas, len(pool.Status.Groups))
 
+	ready := map[string]int32{}
 	for _, g := range pool.Status.Groups {
+		ready[g.Name] = g.ReadyReplicas
 		t.Logf("  %s: %d replicas, %d ready", g.Name, g.Replicas, g.ReadyReplicas)
+	}
+
+	// The point of the asymmetry is that both groups carry load: on-demand holds
+	// at least its minimum, and spot -- targeted at 70% -- is non-empty rather
+	// than everything piling onto on-demand.
+	if ready["on-demand"] < 3 {
+		t.Errorf("on-demand ready: got %d, want >= 3 (its minimum)", ready["on-demand"])
+	}
+
+	if ready["spot"] == 0 {
+		t.Errorf("spot ready: got 0, want > 0 (targeted at 70%%, it should carry load)")
 	}
 }
 
