@@ -2,7 +2,12 @@
 # Pinned by digest, like every action and every tool in this repository.
 # The base image is the one input that ends up inside the artifact being
 # signed and inventoried, so it is the last one that should float.
-FROM golang:1.26@sha256:9d2f36f06329b2a141b9db99ffa32765cf695ee57b813ca29e245e8670bcbfff AS builder
+#
+# --platform=${BUILDPLATFORM} nails the builder to the runner's native arch, so
+# a multi-arch build runs the compiler once on amd64 and cross-compiles to each
+# TARGETARCH below. Without it buildx would emulate an arm64 builder under QEMU
+# -- running go build under emulation, which overran the job's timeout.
+FROM --platform=${BUILDPLATFORM} golang:1.26@sha256:9d2f36f06329b2a141b9db99ffa32765cf695ee57b813ca29e245e8670bcbfff AS builder
 ARG TARGETOS
 ARG TARGETARCH
 

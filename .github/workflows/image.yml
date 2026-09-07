@@ -23,7 +23,10 @@ jobs:
   image:
     name: Build and publish
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Two architectures to build, then on a release run: sign, scan for the
+    # SBOM, two attestations pushed to the registry, and two verifies. 20 left
+    # no margin for the registry round-trips.
+    timeout-minutes: 30
     permissions:
       # write, not read: this job owns the release it announces.
       contents: write
