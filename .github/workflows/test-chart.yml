@@ -60,3 +60,15 @@ jobs:
             echo "::error::policy did not render when enabled"
             exit 1
           fi
+
+      # trivy renders the chart itself and scans the manifests for
+      # misconfigurations. HIGH and CRITICAL fail the run; the lower-severity
+      # findings that remain are the controller's own required RBAC and
+      # registry/pull-policy opinions, which are reviewed, not blocked.
+      - name: Scan the chart for misconfigurations
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: dist/chart
+          severity: HIGH,CRITICAL
+          exit-code: '1'

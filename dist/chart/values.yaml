@@ -32,6 +32,10 @@ controllerManager:
         port: 8081
     securityContext:
       allowPrivilegeEscalation: false
+      # Matches the kustomize source (config/manager). The helm plugin drops
+      # this when it generates values; without it the chart ships a container
+      # that can write its own root filesystem, which the source does not.
+      readOnlyRootFilesystem: true
       capabilities:
         drop:
           - "ALL"
@@ -96,3 +100,20 @@ policy:
     # Audit reports violations without blocking; Enforce rejects images that
     # fail verification. Start with Audit, review the policy report, then Enforce.
     validationFailureAction: Audit
+
+# [EXTRA OBJECTS]: Arbitrary manifests rendered alongside the chart, for things
+# it does not model directly. Each entry is a full Kubernetes object and is run
+# through `tpl`, so it may reference values and release metadata. For example, a
+# PodDisruptionBudget for an HA (replicas > 1) deployment:
+#
+#   extraObjects:
+#     - apiVersion: policy/v1
+#       kind: PodDisruptionBudget
+#       metadata:
+#         name: '{{ include "chart.name" . }}-pdb'
+#       spec:
+#         minAvailable: 1
+#         selector:
+#           matchLabels:
+#             control-plane: controller-manager
+extraObjects: []

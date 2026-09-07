@@ -1,0 +1,17 @@
+{{ .Chart.Name }} {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Check the controller is running:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/podpools-controller-manager
+
+The image is signed and carries a signed SLSA provenance attestation. Verify it:
+
+  gh attestation verify oci://{{ .Values.controllerManager.container.image.repository }}:{{ .Values.controllerManager.container.image.tag | default .Chart.AppVersion }} \
+    --repo negativecycle/podpool-controller
+
+{{ if .Values.policy.kyverno.enabled -}}
+Admission verification (Kyverno) is ENABLED in {{ .Values.policy.kyverno.validationFailureAction }} mode.
+{{- if eq .Values.policy.kyverno.validationFailureAction "Audit" }} It reports violations without blocking; review the policy report, then set policy.kyverno.validationFailureAction=Enforce.{{ end }}
+{{- else -}}
+Admission verification (Kyverno) is off. Enable it with --set policy.kyverno.enabled=true (requires Kyverno in the cluster).
+{{- end }}
