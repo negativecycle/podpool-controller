@@ -15,12 +15,39 @@ by you before you trust it, and by the cluster at admission time.
 
 ## Install with Helm
 
-The chart lives in-repo at [`dist/chart`](../dist/chart) and deploys the signed
-release image (`ghcr.io/negativecycle/podpool-controller`) pinned to the chart's
-`appVersion`.
+Each release publishes the chart as a signed OCI artifact to
+`ghcr.io/negativecycle/charts/podpool-controller` (a path distinct from the
+image). Install a specific version:
+
+```bash
+helm install podpool-controller \
+  oci://ghcr.io/negativecycle/charts/podpool-controller \
+  --version <version> --namespace podpool-system
+```
+
+Or from a checkout of this repo (the chart source lives at
+[`dist/chart`](../dist/chart)):
 
 ```bash
 helm install podpool-controller ./dist/chart --namespace podpool-system
+```
+
+The chart's version and app version track the release tag, so chart `X.Y.Z`
+deploys image `X.Y.Z`.
+
+### Verify the chart
+
+Like the image, the published chart is signed keyless and carries a signed
+provenance attestation:
+
+```bash
+cosign verify ghcr.io/negativecycle/charts/podpool-controller:<version> \
+  --certificate-identity-regexp '^https://github.com/negativecycle/podpool-controller/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+gh attestation verify \
+  oci://ghcr.io/negativecycle/charts/podpool-controller:<version> \
+  --repo negativecycle/podpool-controller
 ```
 
 Note: **do not pass `--create-namespace`.** By default the chart renders the
