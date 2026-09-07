@@ -1,0 +1,148 @@
+name: CI
+
+# The single entry point for pull-request checks. It always runs (no path
+# filter) so its gate can always report -- a required check that is skipped by a
+# path filter never reports and wedges the pull request forever. The heavy work
+# is gated per job instead: a docs-only pull request skips every suite and the
+# gate still turns green, so it merges without waiting on tests.
+#
+# The real suites live in their own workflows, called here as reusable
+# workflows. Branch protection requires only this workflow's `gate` job.
+on:
+  pull_request:
+
+# A force-push supersedes the run it interrupted. This covers the reusable
+# workflows too: they run as part of this run, so cancelling it cancels them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Reusable workflows inherit the caller's token permissions, so grant the read
+# every suite needs here. The changes and gate jobs narrow it per job below.
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      chart: ${{ steps.filter.outputs.chart }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+      renovate: ${{ steps.filter.outputs.renovate }}
+      nondocs: ${{ steps.filter.outputs.nondocs }}
+    steps:
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            code:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Dockerfile'
+              - 'config/**'
+              - 'Makefile'
+            chart:
+              - 'dist/chart/**'
+            workflows:
+              - '.github/workflows/**'
+            renovate:
+              - '.github/renovate.json'
+            nondocs:
+              - '**'
+              - '!docs/**'
+              - '!**/*.md'
+              # Its own validator covers it; nothing in `make test` does.
+              - '!.github/renovate.json'
+
+  # golangci-lint, lint-api and verify-generate cover Go and config; the same
+  # workflow runs actionlint, so it also runs when a workflow file changes.
+  lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.workflows == 'true'
+    uses: ./.github/workflows/lint.yml
+
+  # `make test` -- unit tests plus the ci suite that validates the workflows
+  # themselves, so it runs on any non-docs change, .github included.
+  test:
+    needs: changes
+    if: needs.changes.outputs.nondocs == 'true'
+    uses: ./.github/workflows/test.yml
+
+  e2e:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/test-e2e.yml
+
+  kwok:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/test-kwok.yml
+
+  chart:
+    needs: changes
+    if: needs.changes.outputs.chart == 'true'
+    uses: ./.github/workflows/test-chart.yml
+
+  security:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/security.yml
+
+  renovate:
+    needs: changes
+    if: needs.changes.outputs.renovate == 'true'
+    uses: ./.github/workflows/renovate-validate.yml
+
+  # The one required status check. It always runs and always reports: it passes
+  # when every suite it depends on either succeeded or was skipped (its paths did
+  # not change), and fails if any suite failed or was cancelled.
+  gate:
+    name: gate
+    needs: [changes, lint, test, e2e, kwok, chart, security, renovate]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require the applicable suites to have passed
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RESULTS: >-
+            lint=${{ needs.lint.result }}
+            test=${{ needs.test.result }}
+            e2e=${{ needs.e2e.result }}
+            kwok=${{ needs.kwok.result }}
+            chart=${{ needs.chart.result }}
+            security=${{ needs.security.result }}
+            renovate=${{ needs.renovate.result }}
+        run: |
+          set -euo pipefail
+
+          if [ "$CHANGES" != "success" ]; then
+            echo "::error::change detection did not succeed ($CHANGES)"
+            exit 1
+          fi
+
+          bad=""
+          for kv in $RESULTS; do
+            name="${kv%%=*}"
+            res="${kv##*=}"
+            case "$res" in
+              success|skipped) echo "ok: $name=$res" ;;
+              *) echo "::error::$name=$res"; bad=1 ;;
+            esac
+          done
+
+          if [ -n "$bad" ]; then
+            echo "one or more required suites did not pass"
+            exit 1
+          fi
+
+          echo "all applicable suites passed"

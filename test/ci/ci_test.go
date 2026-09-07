@@ -201,7 +201,11 @@ func kwokJobWorkflow(t *testing.T) (name, body string) {
 	t.Helper()
 
 	for n, b := range workflows(t) {
-		if strings.Contains(b, "test-kwok") {
+		// Match the workflow that *runs* the suite, not one that merely
+		// references it: ci.yml calls test-kwok.yml as a reusable workflow, so
+		// "test-kwok" alone is ambiguous. "make test-kwok" is the run command,
+		// unique to the workflow that actually executes the suite.
+		if strings.Contains(b, "make test-kwok") {
 			return n, b
 		}
 	}
@@ -413,6 +417,13 @@ func TestWorkflowActionsArePinnedBySHA(t *testing.T) {
 	for name, body := range workflows(t) {
 		for _, m := range uses.FindAllStringSubmatch(body, -1) {
 			ref := m[1]
+
+			// A reusable workflow called by path (uses: ./.github/...) is
+			// in-repo, not a third-party action, so it carries no SHA and
+			// needs none. ci.yml calls the suites this way.
+			if strings.HasPrefix(ref, "./") {
+				continue
+			}
 
 			at := strings.LastIndex(ref, "@")
 			if at < 0 {
@@ -792,5 +803,47 @@ func TestChartDefaultsSpreadAcrossNodesAndZones(t *testing.T) {
 	if got["topology.kubernetes.io/zone"] != "ScheduleAnyway" {
 		t.Errorf("zone spread is %q, want ScheduleAnyway so a single-zone cluster still schedules",
 			got["topology.kubernetes.io/zone"])
+	}
+}
+
+// TestCIGateCoversEverySuite stops a suite from being wired into ci.yml but left
+// out of the gate.
+//
+// ci.yml calls each suite as a reusable workflow and a single `gate` job is the
+// required status check: it passes when every suite it lists either succeeded or
+// was skipped. A suite added to ci.yml but forgotten in the gate would run, and
+// could fail, while the gate stayed green -- the one failure mode that turns the
+// required check into theatre. Every reusable-workflow call must therefore be
+// referenced by the gate as needs.<job>.result.
+func TestCIGateCoversEverySuite(t *testing.T) {
+	body := readRepoFile(t, ".github/workflows/ci.yml")
+
+	jobHeader := regexp.MustCompile(`^  ([a-z][a-z0-9-]*):\s*$`)
+
+	var current string
+
+	var suites []string
+
+	for _, line := range strings.Split(body, "\n") {
+		if m := jobHeader.FindStringSubmatch(line); m != nil {
+			current = m[1]
+
+			continue
+		}
+
+		if strings.Contains(line, "uses: ./.github/workflows/") && current != "" {
+			suites = append(suites, current)
+		}
+	}
+
+	if len(suites) == 0 {
+		t.Fatal("ci.yml calls no reusable-workflow suites; the parser or the file changed shape")
+	}
+
+	for _, s := range suites {
+		if !strings.Contains(body, "needs."+s+".result") {
+			t.Errorf("ci.yml calls suite %q but the gate never reads needs.%s.result; "+
+				"a suite the gate ignores can fail while the required check stays green", s, s)
+		}
 	}
 }
