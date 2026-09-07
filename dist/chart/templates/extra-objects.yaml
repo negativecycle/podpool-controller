@@ -1,0 +1,7 @@
+# Arbitrary user-supplied manifests, each rendered through `tpl` against the
+# release context -- the seam that lets the chart stay opinionated without being
+# a cage.
+{{- range .Values.extraObjects }}
+---
+{{ tpl (toYaml .) $ }}
+{{- end }}

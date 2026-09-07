@@ -1,0 +1,42 @@
+# Checkov configuration. Run: checkov -d .
+#
+# The controller already runs read-only, non-root, no-added-capabilities,
+# seccomp RuntimeDefault -- it meets the "restricted" Pod Security Standard. The
+# skips below are findings reviewed and deliberately accepted, each with the
+# reason it does not apply here. Anything not listed still fails the scan, so
+# this stays a signal, not a mute button. Revisit the list when the cause
+# changes (e.g. if the chart gains a digest-pinned image value).
+skip-check:
+  # The published install.yaml is digest-pinned by the release pipeline
+  # (image.yml runs build-installer with IMG=...@<digest>). The base manifest
+  # and the chart default to a tag on purpose; the artifact users apply is a
+  # digest, and the chart takes image.digest for those who want to pin one.
+  - CKV_K8S_43  # Image should use digest
+
+  # config/manager/manager.yaml carries `controller:latest` as a placeholder
+  # that kustomize's images: transform overrides to a real version. It is never
+  # the image that deploys.
+  - CKV_K8S_14  # Image Tag should be fixed - not latest or blank
+
+  # Pinned images are pulled IfNotPresent by design; Always would re-pull an
+  # immutable reference on every restart for no benefit.
+  - CKV_K8S_15  # Image Pull Policy should be Always
+
+  # config/default sets `namespace: podpools-system`; the deployed resources are
+  # namespaced there. This fires only when the base RBAC is scanned in isolation,
+  # where the overlay's namespace has not been applied.
+  - CKV_K8S_21  # The default namespace should not be used
+
+  # The controller reconciles cluster state, so its ServiceAccount token must be
+  # mounted. There is no "only where necessary" short of not functioning.
+  - CKV_K8S_38  # Ensure Service Account Tokens are only mounted where necessary
+
+  # podpool-admin-role is the aggregated admin convenience role kubebuilder
+  # scaffolds for cluster admins to manage the CRD; its wildcard is the point.
+  # The controller's own role (role.yaml) is explicit, not wildcarded.
+  - CKV_K8S_49  # Minimize wildcard use in Roles and ClusterRoles
+
+  # The image is distroless: no shell, so a Dockerfile HEALTHCHECK cannot run.
+  # Health is covered by the manager's liveness/readiness probes on /healthz
+  # and /readyz, which is how Kubernetes checks it.
+  - CKV_DOCKER_2  # Ensure HEALTHCHECK instructions have been added

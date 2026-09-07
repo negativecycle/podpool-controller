@@ -638,3 +638,159 @@ func TestAssertionsAcceptPostFixConfig(t *testing.T) {
 		}
 	})
 }
+
+// TestKyvernoPolicyCopiesShareTheirSecurityInvariants keeps the two copies of
+// the verification policy honest about each other.
+//
+// The policy exists twice on purpose: config/kyverno holds the kustomize form,
+// and the Helm chart holds a templated form gated behind a value. Two copies is
+// two chances to drift, and drift in the parts that decide *what is trusted* is
+// the dangerous kind -- loosen the issuer or the workflow identity in one and
+// forget the other, and a cluster adopting that copy trusts something it should
+// not. Content-addressing cannot catch this; nothing makes the two agree except
+// a test that reads both and insists the load-bearing strings appear in each.
+func TestKyvernoPolicyCopiesShareTheirSecurityInvariants(t *testing.T) {
+	standalone := readRepoFile(t, "config/kyverno/verify-podpool-controller-image.yaml")
+	chart := readRepoFile(t, "dist/chart/templates/kyverno/verify-podpool-controller-image.yaml")
+
+	// The strings that decide trust: who signed (issuer + workflow identity on a
+	// tag), what the provenance must be (SLSA v1, this build type, this repo),
+	// and the transparency log it is checked against. If either copy stops
+	// asserting one of these, it stops being the same policy.
+	for _, invariant := range []string{
+		`https://token.actions.githubusercontent.com`,
+		`^https://github\\.com/negativecycle/podpool-controller/\\.github/workflows/image\\.yml@refs/tags/v`,
+		`https://rekor.sigstore.dev`,
+		`type: SigstoreBundle`,
+		`https://slsa.dev/provenance/v1`,
+		`https://actions.github.io/buildtypes/workflow/v1`,
+		`https://github.com/negativecycle/podpool-controller`,
+	} {
+		if !strings.Contains(standalone, invariant) {
+			t.Errorf("config/kyverno policy is missing trust invariant %q", invariant)
+		}
+
+		if !strings.Contains(chart, invariant) {
+			t.Errorf("chart Kyverno template is missing trust invariant %q", invariant)
+		}
+	}
+
+	// The standalone copy must stand alone: a Helm template expression in it
+	// would mean someone edited the chart form and pasted it back untemplated.
+	if strings.Contains(standalone, "{{ .Values") || strings.Contains(standalone, "{{ $repo") {
+		t.Error("config/kyverno policy contains Helm templating; it must be plain, appliable YAML")
+	}
+
+	// The chart copy must be gated, or enabling the chart installs a Kyverno
+	// policy on clusters that do not run Kyverno.
+	if !strings.Contains(chart, "{{- if .Values.policy.kyverno.enabled }}") {
+		t.Error("chart Kyverno template is not gated behind policy.kyverno.enabled")
+	}
+}
+
+// TestRestrictedPodSecurityIsEnforcedEverywhere locks in the "restricted" Pod
+// Security posture across both install paths.
+//
+// Two things have to stay true together, or the posture is a comfortable
+// fiction: the manager pod must actually satisfy restricted, and the namespace
+// it runs in must actually enforce it. Either without the other is a gap -- a
+// compliant pod in an unlabelled namespace is one careless edit from being
+// admitted anyway, and a labelled namespace around a pod that regressed would
+// reject its own controller. This asserts both, in the kustomize source and the
+// chart, so a change that loosens one and forgets the other fails here.
+func TestRestrictedPodSecurityIsEnforcedEverywhere(t *testing.T) {
+	// The container/pod securityContext settings restricted requires.
+	restricted := []string{
+		"runAsNonRoot: true",
+		"readOnlyRootFilesystem: true",
+		"allowPrivilegeEscalation: false",
+		"type: RuntimeDefault",
+	}
+
+	for _, tc := range []struct {
+		name        string
+		securityIn  string
+		enforceIn   string
+		enforceWant []string
+	}{
+		{
+			"kustomize", "config/manager/manager.yaml", "config/manager/manager.yaml",
+			[]string{
+				"pod-security.kubernetes.io/enforce: restricted",
+				"pod-security.kubernetes.io/warn: restricted",
+			},
+		},
+		{
+			// The chart templates the level from a value: the labels carry the
+			// keys, and the default level is asserted separately below.
+			"chart", "dist/chart/values.yaml", "dist/chart/templates/namespace.yaml",
+			[]string{
+				"pod-security.kubernetes.io/enforce: {{ .Values.podSecurityStandards.standard }}",
+				"pod-security.kubernetes.io/warn: {{ .Values.podSecurityStandards.standard }}",
+			},
+		},
+	} {
+		sec := readRepoFile(t, tc.securityIn)
+		for _, want := range restricted {
+			if !strings.Contains(sec, want) {
+				t.Errorf("%s: %s no longer sets %q; the pod falls below restricted", tc.name, tc.securityIn, want)
+			}
+		}
+
+		ns := readRepoFile(t, tc.enforceIn)
+		for _, want := range tc.enforceWant {
+			if !strings.Contains(ns, want) {
+				t.Errorf("%s: %s no longer enforces the standard (%q missing)", tc.name, tc.enforceIn, want)
+			}
+		}
+	}
+
+	// The chart's default must be restricted and on, or the toggle ships a
+	// namespace looser than the kustomize install does by default.
+	values := readRepoFile(t, "dist/chart/values.yaml")
+	for _, want := range []string{"enabled: true", "standard: restricted"} {
+		if !strings.Contains(values, want) {
+			t.Errorf("chart values no longer default podSecurityStandards to %q", want)
+		}
+	}
+}
+
+// TestChartDefaultsSpreadAcrossNodesAndZones pins the scheduling posture the
+// chart ships by default: replicas must land one-per-node, and should land
+// one-per-zone when the cluster can manage it.
+//
+// The two halves are deliberately different strengths -- DoNotSchedule on the
+// node so HA replicas cannot pile onto one machine, ScheduleAnyway on the zone
+// so a single-zone cluster still schedules. A well-meaning edit that makes the
+// node constraint soft would quietly let both replicas share a node and defeat
+// the point of running two; one that makes the zone constraint hard would wedge
+// every single-zone cluster. Parse the values and assert the pairing so neither
+// slip through.
+func TestChartDefaultsSpreadAcrossNodesAndZones(t *testing.T) {
+	var v struct {
+		Manager struct {
+			TopologySpreadConstraints []struct {
+				TopologyKey       string `json:"topologyKey"`
+				WhenUnsatisfiable string `json:"whenUnsatisfiable"`
+			} `json:"topologySpreadConstraints"`
+		} `json:"manager"`
+	}
+	if err := yaml.Unmarshal([]byte(readRepoFile(t, "dist/chart/values.yaml")), &v); err != nil {
+		t.Fatalf("parsing chart values: %v", err)
+	}
+
+	got := map[string]string{}
+	for _, c := range v.Manager.TopologySpreadConstraints {
+		got[c.TopologyKey] = c.WhenUnsatisfiable
+	}
+
+	if got["kubernetes.io/hostname"] != "DoNotSchedule" {
+		t.Errorf("hostname spread is %q, want DoNotSchedule so two replicas never share a node",
+			got["kubernetes.io/hostname"])
+	}
+
+	if got["topology.kubernetes.io/zone"] != "ScheduleAnyway" {
+		t.Errorf("zone spread is %q, want ScheduleAnyway so a single-zone cluster still schedules",
+			got["topology.kubernetes.io/zone"])
+	}
+}

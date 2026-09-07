@@ -1,0 +1,15 @@
+{{- if .Values.podSecurityStandards.enabled }}
+# The chart renders the release namespace itself so it can carry the Pod
+# Security Standard labels -- Helm cannot label a namespace it does not own.
+# Install WITHOUT --create-namespace, or set podSecurityStandards.enabled=false.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    {{- include "podpools.commonLabels" . | nindent 4 }}
+    pod-security.kubernetes.io/enforce: {{ .Values.podSecurityStandards.standard }}
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: {{ .Values.podSecurityStandards.standard }}
+    pod-security.kubernetes.io/warn-version: latest
+{{- end }}

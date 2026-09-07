@@ -9,7 +9,12 @@ bin/*
 # release artifact, published to the GitHub release rather than committed --
 # and verify-generate reads `git status --porcelain`, so leaving it untracked
 # would make a local installer build look like generated-output drift.
-dist/
+#
+# dist/chart is the exception: the Helm chart is source, committed and reviewed,
+# so it is re-included. Everything else under dist/ (install.yaml, packaged
+# .tgz) stays ignored.
+dist/*
+!dist/chart
 Dockerfile.cross
 # Ad-hoc `go build cmd/main.go` output (the tracked build targets are bin/manager
 # and, in the image, /manager).

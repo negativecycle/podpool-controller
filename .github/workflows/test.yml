@@ -2,6 +2,12 @@ name: Tests
 
 on:
   pull_request:
+    # A docs change cannot alter a test outcome. .github is deliberately NOT
+    # ignored: `make test` runs the ci suite that validates the workflows
+    # themselves (actionlint, SHA pinning), so a workflow edit must run it.
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
 
 # A force-push supersedes the run it interrupted; without this the obsolete
 # one keeps a runner busy to no purpose.

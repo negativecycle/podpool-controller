@@ -1,0 +1,241 @@
+## String to partially override chart.fullname template (will maintain the release name)
+##
+# nameOverride: ""
+
+## String to fully override chart.fullname template
+##
+# fullnameOverride: ""
+
+## Configure the controller manager deployment
+##
+manager:
+  ## Set to false to skip manager installation
+  ##
+  enabled: true
+
+  replicas: 1
+
+  image:
+    repository: ghcr.io/negativecycle/podpool-controller
+    ## Image tag (defaults to Chart.appVersion if not set). To pin by digest,
+    ## put it in the repository, e.g. repository: ghcr.io/…@sha256:… (the tag is
+    ## then skipped automatically).
+    ##
+    # tag: ""
+    pullPolicy: IfNotPresent
+
+  ## Arguments
+  ##
+  args:
+    - --leader-elect
+
+  ## Image pull secrets
+  ##
+  # imagePullSecrets:
+  #   - name: myregistrykey
+
+  ## Pod-level security settings
+  ##
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile:
+      type: RuntimeDefault
+
+  ## Container-level security settings
+  ##
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+      - ALL
+    readOnlyRootFilesystem: true
+
+  ## Resource limits and requests
+  ##
+  resources:
+    limits:
+      cpu: 500m
+      memory: 128Mi
+    requests:
+      cpu: 10m
+      memory: 64Mi
+
+  ## Manager pod's affinity
+  ##
+  affinity: {}
+
+  ## Manager pod's node selector
+  ##
+  nodeSelector: {}
+
+  ## Manager pod's tolerations
+  ##
+  tolerations: []
+
+  ## Deployment strategy
+  ##
+  # strategy:
+  #   type: RollingUpdate
+  #   rollingUpdate:
+  #     maxSurge: 25%
+  #     maxUnavailable: 25%
+
+  ## Priority class name
+  ##
+  # priorityClassName: ""
+
+  ## Topology spread constraints. Default: require one replica per node
+  ## (hostname/DoNotSchedule) and try one per zone (zone/ScheduleAnyway). No-op
+  ## at replicas: 1. matchLabelKeys pins each to the current rollout so a
+  ## rolling update cannot deadlock its own surge. Set to [] to drop.
+  ##
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          control-plane: controller-manager
+      matchLabelKeys:
+        - pod-template-hash
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          control-plane: controller-manager
+      matchLabelKeys:
+        - pod-template-hash
+
+  ## Termination grace period seconds
+  ##
+  terminationGracePeriodSeconds: 60
+
+  ## Custom Deployment labels
+  ##
+  # labels: {}
+
+  ## Custom Deployment annotations
+  ##
+  # annotations: {}
+
+  ## Custom Pod labels and annotations
+  ##
+  # pod:
+  #   labels: {}
+  #   annotations: {}
+
+## RBAC configuration
+##
+rbac:
+  ## RBAC resource scope
+  ## - false (default): ClusterRole/ClusterRoleBinding (all namespaces)
+  ## - true: Role/RoleBinding (release namespace only)
+  ##
+  namespaced: false
+
+  ## Helper roles for CRD management (admin/editor/viewer)
+  ##
+  helpers:
+    ## Install convenience admin/editor/viewer roles for CRDs
+    ##
+    enabled: false
+
+## ServiceAccount configuration
+##
+serviceAccount:
+  # Install default ServiceAccount provided
+  enabled: true
+
+  ## Existing ServiceAccount name (only when enabled=false)
+  ## Note: When enabled=true, respects nameOverride/fullnameOverride
+  ##
+  # name: ""
+
+  ## Custom ServiceAccount annotations
+  ##
+  # annotations: {}
+
+  ## Custom ServiceAccount labels
+  ##
+  # labels: {}
+
+## Custom Resource Definitions
+##
+crd:
+  # Install CRDs with the chart
+  enabled: true
+  # Keep CRDs when uninstalling
+  keep: true
+
+## Controller metrics endpoint.
+## Enable to expose /metrics endpoint
+##
+metrics:
+  enabled: true
+  # Metrics server port
+  port: 8443
+  # Enable secure metrics: HTTPS with certs/auth (true) or HTTP (false).
+  # Note: Metrics authn/authz needs ClusterRole access.
+  secure: true
+
+## Cert-manager integration for TLS certificates.
+## Required for webhook certificates and metrics endpoint certificates.
+##
+certManager:
+  enabled: true
+
+## Webhook server configuration
+##
+webhook:
+  enabled: true
+  # Webhook server port
+  port: 9443
+
+## Prometheus ServiceMonitor for metrics scraping.
+## Requires prometheus-operator to be installed in the cluster.
+##
+prometheus:
+  enabled: false
+
+## Network policies for controlling traffic flow.
+## Enable to restrict ingress to the controller manager.
+##
+networkPolicy:
+  enabled: false
+
+
+## [POD SECURITY]: Enforce a Pod Security Standard on the release namespace. On
+## by default -- the controller meets "restricted". The chart renders the
+## namespace to carry the labels, so with this enabled install WITHOUT
+## --create-namespace. Disable to manage (and label) the namespace yourself.
+podSecurityStandards:
+  enabled: true
+  # The level to enforce and warn on: restricted (strictest; the controller
+  # satisfies it), baseline, or privileged.
+  standard: restricted
+
+## [POD DISRUPTION BUDGET]: Keep a minimum available during voluntary
+## disruptions (node drains, upgrades). On by default, but only rendered at
+## manager.replicas > 1 -- a budget over a single replica would block node
+## drains entirely. Set minAvailable OR maxUnavailable (count or percentage).
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+  maxUnavailable: ""
+
+## [POLICY]: Admission-time image verification (requires Kyverno in the
+## cluster). Off by default. When enabled, installs a Kyverno ClusterPolicy
+## requiring this controller's image to carry a cosign signature and a signed
+## SLSA provenance attestation from the project's release workflow.
+policy:
+  kyverno:
+    enabled: false
+    # Audit reports violations without blocking; Enforce rejects failures.
+    validationFailureAction: Audit
+
+## [EXTRA OBJECTS]: Arbitrary manifests rendered alongside the chart. Each entry
+## is a full Kubernetes object, run through `tpl`, so it may reference values
+## and release metadata. Use for a ConfigMap, a NetworkPolicy, extra RBAC, etc.
+extraObjects: []

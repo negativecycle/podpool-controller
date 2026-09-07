@@ -54,4 +54,28 @@ if [ -n "$STAGED_GO_FILES" ]; then
     fi
 fi
 
+# --- Helm chart drift: the chart's generated templates (CRD, RBAC, webhooks)
+# must match config/. Only runs when the sources or the chart are staged. ---
+STAGED_SYNC=$(echo "$STAGED_FILES" | grep -E '^(api/|config/(crd|rbac|webhook)/|dist/chart/)' || true)
+
+if [ -n "$STAGED_SYNC" ]; then
+    if command -v kubebuilder >/dev/null 2>&1; then
+        echo "pre-commit: checking the Helm chart is in sync with config/..."
+        # helm-verify regenerates the chart and fails if it changed. On drift the
+        # regenerated chart is left in the working tree for the author to stage.
+        if ! make -s helm-verify >/dev/null 2>&1; then
+            echo "pre-commit: the Helm chart drifted from config/ and has been regenerated."
+            echo "            review the changes, stage them, and commit again:"
+            echo "              git add dist/chart"
+            git --no-pager diff --stat -- dist/chart
+            exit 1
+        fi
+    else
+        # kubebuilder is a standalone binary, not installed via the Makefile.
+        # Warn rather than block a contributor who lacks it; CI can backstop.
+        echo "pre-commit: kubebuilder not installed, skipping the Helm chart sync check"
+        echo "            see https://book.kubebuilder.io/quick-start#installation"
+    fi
+fi
+
 echo "pre-commit: checks passed"

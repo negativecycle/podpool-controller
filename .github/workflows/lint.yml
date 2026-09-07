@@ -2,6 +2,12 @@ name: Lint
 
 on:
   pull_request:
+    # golangci-lint, lint-api and verify-generate act on Go and config, never on
+    # docs or workflow files.
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '.github/**'
 
 # A force-push supersedes the run it interrupted; without this the obsolete
 # one keeps a runner busy to no purpose.

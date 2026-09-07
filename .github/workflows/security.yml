@@ -5,6 +5,7 @@ on:
     paths-ignore:
       - 'docs/**'
       - '**.md'
+      - '.github/**'
   schedule:
     # Weekly, so newly disclosed CVEs surface without waiting for a push.
     - cron: '0 6 * * 1'

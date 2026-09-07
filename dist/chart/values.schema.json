@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "title": "podpool-controller chart values",
+  "description": "Validates the values whose mistakes fail far from their cause -- enums, types, and structure. additionalProperties is left permissive so extraObjects and values added later are not rejected before the schema is updated.",
+  "type": "object",
+  "properties": {
+    "manager": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replicas": { "type": "integer", "minimum": 1 },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+        "priorityClassName": { "type": "string" },
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "type": "string" },
+            "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+          }
+        },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "nodeSelector": { "type": "object" },
+        "tolerations": { "type": "array", "items": { "type": "object" } },
+        "affinity": { "type": "object" },
+        "topologySpreadConstraints": { "type": "array", "items": { "type": "object" } },
+        "imagePullSecrets": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "rbac": {
+      "type": "object",
+      "properties": {
+        "namespaced": { "type": "boolean" },
+        "helpers": { "type": "object", "properties": { "enabled": { "type": "boolean" } } }
+      }
+    },
+    "serviceAccount": { "type": "object", "properties": { "enabled": { "type": "boolean" } } },
+    "crd":           { "type": "object", "properties": { "enabled": { "type": "boolean" }, "keep": { "type": "boolean" } } },
+    "metrics":       { "type": "object", "properties": { "enabled": { "type": "boolean" }, "secure": { "type": "boolean" }, "port": { "type": "integer" } } },
+    "webhook":       { "type": "object", "properties": { "enabled": { "type": "boolean" }, "port": { "type": "integer" } } },
+    "certManager":   { "type": "object", "properties": { "enabled": { "type": "boolean" } } },
+    "prometheus":    { "type": "object", "properties": { "enabled": { "type": "boolean" } } },
+    "networkPolicy": { "type": "object", "properties": { "enabled": { "type": "boolean" } } },
+    "podSecurityStandards": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "standard": { "type": "string", "enum": ["restricted", "baseline", "privileged"] }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": ["integer", "string"] },
+        "maxUnavailable": { "type": ["integer", "string"] }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "properties": {
+        "kyverno": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "validationFailureAction": { "type": "string", "enum": ["Audit", "Enforce"] }
+          }
+        }
+      }
+    },
+    "extraObjects": { "type": "array", "items": { "type": "object" } }
+  }
+}

@@ -1,0 +1,22 @@
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.manager.replicas) 1) }}
+# Only rendered at replicas > 1. A budget over a single replica would forbid
+# every voluntary eviction and hang a node drain, so there is none there.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "podpools.resourceName" (dict "suffix" "controller-manager" "context" $) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "podpools.commonLabels" . | nindent 4 }}
+    control-plane: controller-manager
+spec:
+  {{- if .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else if .Values.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "podpools.name" . }}
+      control-plane: controller-manager
+{{- end }}
