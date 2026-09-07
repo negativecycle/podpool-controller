@@ -172,6 +172,22 @@
       "automerge": false
     },
     {
+      "description": "The Go toolchain and golangci-lint move together. A new Go minor needs the linter -- and the staticcheck it bundles -- that understands it; split into separate pull requests, the Go bump lands and crashes the old linter, which panics on syntax it has never seen. Grouped, they arrive in one reviewable pull request. Majors stay ungrouped, per the rule below.",
+      "matchPackageNames": [
+        "go",
+        "github.com/golangci/golangci-lint/v2"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "Go toolchain and linter",
+      "schedule": [
+        "before 6am on the first day of the month"
+      ],
+      "automerge": false
+    },
+    {
       "description": "Major updates are never grouped. Five majors in one branch is five migrations that cannot be bisected, merged apart, or reverted apart.",
       "matchUpdateTypes": [
         "major"
