@@ -4,8 +4,12 @@ controllerManager:
   container:
     image:
       repository: ghcr.io/negativecycle/podpool-controller
-      # Blank falls back to the chart appVersion; override to pin a tag or digest.
+      # Blank falls back to the chart appVersion.
       tag: ""
+      # Pin by digest (include the sha256: prefix), e.g.
+      # "sha256:abc123...". When set it overrides tag entirely -- an immutable,
+      # tamper-evident reference. Empty means use the tag above.
+      digest: ""
     imagePullPolicy: IfNotPresent
     args:
       - "--leader-elect"

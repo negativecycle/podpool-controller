@@ -23,7 +23,8 @@ full set):
 
 | Value | Default | Purpose |
 |-------|---------|---------|
-| `controllerManager.container.image.tag` | `""` → `appVersion` | Pin a specific image tag or digest |
+| `controllerManager.container.image.tag` | `""` → `appVersion` | Image tag to deploy |
+| `controllerManager.container.image.digest` | `""` | Pin by digest (`sha256:…`); overrides the tag |
 | `crd.enable` / `crd.keep` | `true` / `true` | Install the CRD, and keep it on uninstall |
 | `metrics.enable` | `true` | Metrics service + RBAC |
 | `podSecurityStandards.enabled` | `true` | Create + label the namespace to enforce a Pod Security Standard (below) |

@@ -1,3 +1,18 @@
+{{- /*
+chart.image renders the manager image reference. A digest wins over a tag: set
+image.digest (including the sha256: prefix) to pin immutably -- the strongest
+supply-chain option, and what satisfies scanners that require a digest.
+Otherwise the tag is used, defaulting to the chart appVersion.
+*/ -}}
+{{- define "chart.image" -}}
+{{- $img := .Values.controllerManager.container.image -}}
+{{- if $img.digest -}}
+{{- printf "%s@%s" $img.repository $img.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $img.repository ($img.tag | default .Chart.AppVersion) -}}
+{{- end -}}
+{{- end }}
+
 {{- define "chart.name" -}}
 {{- if .Chart }}
   {{- if .Chart.Name }}

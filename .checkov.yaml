@@ -10,7 +10,7 @@ skip-check:
   # The published install.yaml is digest-pinned by the release pipeline
   # (image.yml runs build-installer with IMG=...@<digest>). The base manifest
   # and the chart default to a tag on purpose; the artifact users apply is a
-  # digest.
+  # digest, and the chart takes image.digest for those who want to pin one.
   - CKV_K8S_43  # Image should use digest
 
   # config/manager/manager.yaml carries `controller:latest` as a placeholder
