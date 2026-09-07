@@ -252,7 +252,9 @@ GOLANGCI_KAL = $(LOCALBIN)/golangci-lint-kube-api-linter
 GOVULNCHECK ?= $(LOCALBIN)/govulncheck
 
 ## Tool Versions
+# renovate: datasource=go depName=sigs.k8s.io/kustomize/kustomize/v5
 KUSTOMIZE_VERSION ?= v5.8.1
+# renovate: datasource=go depName=sigs.k8s.io/controller-tools
 CONTROLLER_TOOLS_VERSION ?= v0.21.0
 
 #ENVTEST_VERSION is the controller-runtime version to use for setup-envtest, derived from go.mod
@@ -265,10 +267,12 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   [ -n "$$v" ] || { echo "Set ENVTEST_K8S_VERSION manually (k8s.io/api replace has no tag)" >&2; exit 1; }; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
+# renovate: datasource=go depName=github.com/golangci/golangci-lint/v2
 GOLANGCI_LINT_VERSION ?= v2.12.2
 # KAL has no tagged releases; this is main HEAD as of 2026-07-16. Revisit when
 # the project cuts a tag — its release workflow exists but has never fired.
 KAL_VERSION ?= v0.0.0-20260716143926-092fe0c72997
+# renovate: datasource=go depName=golang.org/x/vuln
 GOVULNCHECK_VERSION ?= v1.6.0
 
 .PHONY: kustomize

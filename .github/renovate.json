@@ -6,7 +6,8 @@
   "description": [
     "Updates wait five days after release before a pull request is raised, so a version yanked in its first week is never one this repository adopted.",
     "platformAutomerge is off deliberately. GitHub's native auto-merge only waits when a status check is required, and none are required on main -- a pull request here is mergeable the moment it opens, so handing the merge to the platform would merge it before CI had run at all. With this off, Renovate performs the merge itself and only once every check it can see has passed.",
-    "Every pull request is labelled semver:patch. Merging one otherwise cuts a minor release, because release.yml treats an unlabelled pull request as a minor bump."
+    "Every pull request is labelled semver:patch. Merging one otherwise cuts a minor release, because release.yml treats an unlabelled pull request as a minor bump.",
+    "Updates are grouped by ecosystem, never across one. An Actions bump, a Go module bump and a base-image bump each land in their own pull request, so one ecosystem's churn is never blocked by another's review."
   ],
   "timezone": "America/New_York",
   "minimumReleaseAge": "5 days",
@@ -14,26 +15,157 @@
     "semver:patch"
   ],
   "platformAutomerge": false,
+  "postUpdateOptions": [
+    "gomodTidy",
+    "gomodUpdateImportPaths"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track the tool versions pinned in the Makefile. Each line is annotated with the Go module it installs from, so Renovate resolves releases through the Go proxy -- which also sidesteps kustomize's prefixed tags. ENVTEST and KAL are deliberately left unannotated: the first two are derived from go.mod, and KAL has no tagged release to move to.",
+      "managerFilePatterns": [
+        "/(^|/)Makefile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+_VERSION \\?= (?<currentValue>\\S+)"
+      ]
+    }
+  ],
   "packageRules": [
     {
-      "description": "Patch, pin and digest updates land as one batch a week and merge themselves once every check is green.",
+      "description": "Pin GitHub Actions and container base images to an immutable digest -- converting any that arrive on a bare tag -- with the released version kept as a trailing comment. A moving tag is a supply-chain hole; a digest is not, and the comment stays human-readable.",
+      "matchManagers": [
+        "github-actions",
+        "dockerfile",
+        "devcontainer"
+      ],
+      "pinDigests": true
+    },
+    {
+      "description": "config/manager/kustomization.yaml names this repository's own controller image. Its tag is the release pipeline's to move -- release.yml and `make build-installer` set the image at publish time -- so Renovate leaves it alone rather than opening pull requests to bump our own artifact.",
+      "matchPackageNames": [
+        "ghcr.io/negativecycle/podpool-controller"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "GitHub Actions: patch, pin and digest updates batch weekly and merge themselves once every check is green.",
+      "matchManagers": [
+        "github-actions"
+      ],
       "matchUpdateTypes": [
         "patch",
         "pin",
+        "pinDigest",
         "digest"
       ],
-      "groupName": "patch updates",
+      "groupName": "GitHub Actions patch and digest",
       "schedule": [
         "before 6am on monday"
       ],
       "automerge": true
     },
     {
-      "description": "Minor updates batch monthly. Cheap enough to group, not cheap enough to merge unread.",
+      "description": "GitHub Actions minor updates batch monthly and merge by hand.",
+      "matchManagers": [
+        "github-actions"
+      ],
       "matchUpdateTypes": [
         "minor"
       ],
-      "groupName": "minor updates",
+      "groupName": "GitHub Actions minor",
+      "schedule": [
+        "before 6am on the first day of the month"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Go modules: patch and digest updates batch weekly and merge themselves once every check is green.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchUpdateTypes": [
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "groupName": "Go module patch and digest",
+      "schedule": [
+        "before 6am on monday"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Go module minor updates batch monthly and merge by hand.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "groupName": "Go module minor",
+      "schedule": [
+        "before 6am on the first day of the month"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Base and devcontainer images: patch and digest updates batch weekly and merge themselves once every check is green.",
+      "matchManagers": [
+        "dockerfile",
+        "devcontainer"
+      ],
+      "matchUpdateTypes": [
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "groupName": "container image patch and digest",
+      "schedule": [
+        "before 6am on monday"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Base and devcontainer image minor updates batch monthly and merge by hand.",
+      "matchManagers": [
+        "dockerfile",
+        "devcontainer"
+      ],
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "groupName": "container image minor",
+      "schedule": [
+        "before 6am on the first day of the month"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Makefile-pinned Go tools (kustomize, controller-tools, golangci-lint, govulncheck): patch and digest batch weekly and merge themselves once every check is green. A tool bump that breaks the build fails CI and is held, not merged.",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchUpdateTypes": [
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "groupName": "Go tooling patch and digest",
+      "schedule": [
+        "before 6am on monday"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Makefile-pinned Go tool minor updates batch monthly and merge by hand.",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "groupName": "Go tooling minor",
       "schedule": [
         "before 6am on the first day of the month"
       ],
@@ -54,8 +186,10 @@
       ]
     }
   ],
+  "osvVulnerabilityAlerts": true,
+  "dependencyDashboardOSVVulnerabilitySummary": "unresolved",
   "vulnerabilityAlerts": {
-    "description": "A cooldown that delays a CVE fix is worse than no cooldown, so these bypass both the wait and the schedule.",
+    "description": "A cooldown that delays a CVE fix is worse than no cooldown, so these bypass both the wait and the schedule. They also merge themselves once every check is green -- the same trust placed in ordinary patches, applied to the updates that matter most, so a fix is not left waiting on a human when CI already vouches for it.",
     "minimumReleaseAge": null,
     "schedule": [
       "at any time"
@@ -64,6 +198,6 @@
       "semver:patch",
       "security"
     ],
-    "automerge": false
+    "automerge": true
   }
 }
