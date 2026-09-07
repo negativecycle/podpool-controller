@@ -10,8 +10,13 @@ release image (`ghcr.io/negativecycle/podpool-controller`) pinned to the chart's
 `appVersion`.
 
 ```bash
-helm install podpool-controller ./dist/chart --namespace podpool-system --create-namespace
+helm install podpool-controller ./dist/chart --namespace podpool-system
 ```
+
+Note: **do not pass `--create-namespace`.** By default the chart renders the
+namespace itself so it can label it for Pod Security (below); Helm cannot label
+a namespace it did not create. If you'd rather manage the namespace yourself,
+set `podSecurityStandards.enabled=false` and then `--create-namespace` is fine.
 
 Useful values (see [`dist/chart/values.yaml`](../dist/chart/values.yaml) for the
 full set):
@@ -21,7 +26,26 @@ full set):
 | `controllerManager.container.image.tag` | `""` → `appVersion` | Pin a specific image tag or digest |
 | `crd.enable` / `crd.keep` | `true` / `true` | Install the CRD, and keep it on uninstall |
 | `metrics.enable` | `true` | Metrics service + RBAC |
+| `podSecurityStandards.enabled` | `true` | Create + label the namespace to enforce a Pod Security Standard (below) |
 | `policy.kyverno.enabled` | `false` | Install the admission verification policy (below) |
+| `extraObjects` | `[]` | Inject arbitrary manifests (PDB, HPA, extra RBAC…) without forking |
+
+## Pod Security Standard
+
+The controller meets the **restricted** [Pod Security Standard](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
+— it runs non-root, read-only-root, no added capabilities, seccomp
+`RuntimeDefault`. By default (`podSecurityStandards.enabled=true`) the chart
+labels its namespace to **enforce** and **warn** at that level, so a workload
+that regresses below restricted is rejected there:
+
+```yaml
+pod-security.kubernetes.io/enforce: restricted
+pod-security.kubernetes.io/warn: restricted
+```
+
+Set `podSecurityStandards.standard=baseline` for the looser profile, or
+`podSecurityStandards.enabled=false` to manage the namespace and its labels
+yourself. The kustomize install (`install.yaml`) carries the same labels.
 
 ## Verify the image yourself
 

@@ -687,3 +687,70 @@ func TestKyvernoPolicyCopiesShareTheirSecurityInvariants(t *testing.T) {
 		t.Error("chart Kyverno template is not gated behind policy.kyverno.enabled")
 	}
 }
+
+// TestRestrictedPodSecurityIsEnforcedEverywhere locks in the "restricted" Pod
+// Security posture across both install paths.
+//
+// Two things have to stay true together, or the posture is a comfortable
+// fiction: the manager pod must actually satisfy restricted, and the namespace
+// it runs in must actually enforce it. Either without the other is a gap -- a
+// compliant pod in an unlabelled namespace is one careless edit from being
+// admitted anyway, and a labelled namespace around a pod that regressed would
+// reject its own controller. This asserts both, in the kustomize source and the
+// chart, so a change that loosens one and forgets the other fails here.
+func TestRestrictedPodSecurityIsEnforcedEverywhere(t *testing.T) {
+	// The container/pod securityContext settings restricted requires.
+	restricted := []string{
+		"runAsNonRoot: true",
+		"readOnlyRootFilesystem: true",
+		"allowPrivilegeEscalation: false",
+		"type: RuntimeDefault",
+	}
+
+	for _, tc := range []struct {
+		name        string
+		securityIn  string
+		enforceIn   string
+		enforceWant []string
+	}{
+		{
+			"kustomize", "config/manager/manager.yaml", "config/manager/manager.yaml",
+			[]string{
+				"pod-security.kubernetes.io/enforce: restricted",
+				"pod-security.kubernetes.io/warn: restricted",
+			},
+		},
+		{
+			// The chart templates the level from a value: the labels carry the
+			// keys, and the default level is asserted separately below.
+			"chart", "dist/chart/values.yaml", "dist/chart/templates/namespace.yaml",
+			[]string{
+				"pod-security.kubernetes.io/enforce: {{ .Values.podSecurityStandards.standard }}",
+				"pod-security.kubernetes.io/warn: {{ .Values.podSecurityStandards.standard }}",
+			},
+		},
+	} {
+		sec := readRepoFile(t, tc.securityIn)
+		for _, want := range restricted {
+			if !strings.Contains(sec, want) {
+				t.Errorf("%s: %s no longer sets %q; the pod falls below restricted", tc.name, tc.securityIn, want)
+			}
+		}
+
+		ns := readRepoFile(t, tc.enforceIn)
+		for _, want := range tc.enforceWant {
+			if !strings.Contains(ns, want) {
+				t.Errorf("%s: %s no longer enforces the standard (%q missing)", tc.name, tc.enforceIn, want)
+			}
+		}
+	}
+
+	// The chart's default must be restricted and on, or the toggle ships a
+	// namespace looser than the kustomize install does by default.
+	values := readRepoFile(t, "dist/chart/values.yaml")
+	for _, want := range []string{"enabled: true", "standard: restricted"} {
+		if !strings.Contains(values, want) {
+			t.Errorf("chart values no longer default podSecurityStandards to %q", want)
+		}
+	}
+}

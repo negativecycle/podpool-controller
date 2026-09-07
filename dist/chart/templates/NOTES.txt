@@ -9,6 +9,9 @@ The image is signed and carries a signed SLSA provenance attestation. Verify it:
   gh attestation verify oci://{{ .Values.controllerManager.container.image.repository }}:{{ .Values.controllerManager.container.image.tag | default .Chart.AppVersion }} \
     --repo negativecycle/podpool-controller
 
+{{ if .Values.podSecurityStandards.enabled -}}
+Namespace "{{ .Release.Namespace }}" enforces the {{ .Values.podSecurityStandards.standard }} Pod Security Standard.
+{{ end -}}
 {{ if .Values.policy.kyverno.enabled -}}
 Admission verification (Kyverno) is ENABLED in {{ .Values.policy.kyverno.validationFailureAction }} mode.
 {{- if eq .Values.policy.kyverno.validationFailureAction "Audit" }} It reports violations without blocking; review the policy report, then set policy.kyverno.validationFailureAction=Enforce.{{ end }}

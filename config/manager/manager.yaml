@@ -5,6 +5,14 @@ metadata:
     control-plane: controller-manager
     app.kubernetes.io/name: podpools
     app.kubernetes.io/managed-by: kustomize
+    # The controller meets the restricted Pod Security Standard, so enforce it
+    # on its own namespace: a workload that regresses below restricted is
+    # rejected here rather than admitted. warn surfaces the same at apply time.
+    # To opt out, remove these labels (or patch them in an overlay).
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
   name: system
 ---
 apiVersion: apps/v1

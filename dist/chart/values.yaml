@@ -120,3 +120,13 @@ policy:
 #           matchLabels:
 #             control-plane: controller-manager
 extraObjects: []
+
+# [POD SECURITY]: Enforce a Pod Security Standard on the release namespace. On
+# by default -- the controller meets "restricted". The chart renders the
+# namespace to carry the labels, so with this enabled install WITHOUT
+# --create-namespace. Disable to manage (and label) the namespace yourself.
+podSecurityStandards:
+  enabled: true
+  # The level to enforce and warn on. "restricted" is the strictest; the
+  # controller satisfies it. "baseline" is the looser profile.
+  standard: restricted
