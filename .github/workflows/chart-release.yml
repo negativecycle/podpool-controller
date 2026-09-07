@@ -6,7 +6,9 @@ name: Chart Release
 on:
   push:
     tags:
-      - 'v*'
+      # The chart's own series. Image tags (v*) belong to image.yml; a chart
+      # release is a chart-v* tag, pushed by release.yml or by hand.
+      - 'chart-v*'
   workflow_dispatch:
     inputs:
       version:
