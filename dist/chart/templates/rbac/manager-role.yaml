@@ -1,11 +1,16 @@
-{{- if .Values.rbac.enable }}
----
 apiVersion: rbac.authorization.k8s.io/v1
+{{- if .Values.rbac.namespaced }}
+kind: Role
+{{- else }}
 kind: ClusterRole
+{{- end }}
 metadata:
+{{- if .Values.rbac.namespaced }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}
   labels:
-    {{- include "chart.labels" . | nindent 4 }}
-  name: podpools-manager-role
+    podpools.dev/aggregate-to-manager: "true"
+  name: {{ include "podpools.resourceName" (dict "suffix" "manager-role" "context" $) }}
 rules:
 - apiGroups:
   - ""
@@ -67,4 +72,3 @@ rules:
   verbs:
   - get
   - patch
-{{- end -}}

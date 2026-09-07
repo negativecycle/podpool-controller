@@ -18,3 +18,5 @@ keywords:
   - operator
   - controller
   - scaling
+annotations:
+  kubebuilder.io/generated-by: kubebuilder

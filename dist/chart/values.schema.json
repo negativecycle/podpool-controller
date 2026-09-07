@@ -1,83 +1,52 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema",
   "title": "podpool-controller chart values",
-  "description": "Validates the values that cause confusing, far-from-the-cause failures when wrong -- enums, types, and the image digest format. additionalProperties is left permissive on purpose, so extraObjects and values added later are not rejected before the schema is updated.",
+  "description": "Validates the values whose mistakes fail far from their cause -- enums, types, and structure. additionalProperties is left permissive so extraObjects and values added later are not rejected before the schema is updated.",
   "type": "object",
   "properties": {
-    "controllerManager": {
+    "manager": {
       "type": "object",
       "properties": {
+        "enabled": { "type": "boolean" },
         "replicas": { "type": "integer", "minimum": 1 },
-        "serviceAccountName": { "type": "string" },
         "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
         "priorityClassName": { "type": "string" },
-        "imagePullSecrets": { "type": "array", "items": { "type": "object" } },
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "type": "string" },
+            "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+          }
+        },
+        "args": { "type": "array", "items": { "type": "string" } },
         "nodeSelector": { "type": "object" },
         "tolerations": { "type": "array", "items": { "type": "object" } },
         "affinity": { "type": "object" },
         "topologySpreadConstraints": { "type": "array", "items": { "type": "object" } },
-        "container": {
-          "type": "object",
-          "properties": {
-            "imagePullPolicy": {
-              "type": "string",
-              "enum": ["Always", "IfNotPresent", "Never"]
-            },
-            "args": {
-              "type": "array",
-              "items": { "type": "string" }
-            },
-            "image": {
-              "type": "object",
-              "properties": {
-                "repository": { "type": "string", "minLength": 1 },
-                "tag": { "type": "string" },
-                "digest": {
-                  "type": "string",
-                  "pattern": "^(sha256:[a-f0-9]{64})?$",
-                  "description": "Empty, or a full sha256: digest."
-                }
-              }
-            }
-          }
-        }
+        "imagePullSecrets": { "type": "array", "items": { "type": "object" } }
       }
     },
-    "rbac":         { "type": "object", "properties": { "enable": { "type": "boolean" } } },
-    "crd":          { "type": "object", "properties": { "enable": { "type": "boolean" }, "keep": { "type": "boolean" } } },
-    "metrics":      { "type": "object", "properties": { "enable": { "type": "boolean" } } },
-    "webhook":      { "type": "object", "properties": { "enable": { "type": "boolean" } } },
-    "prometheus":   { "type": "object", "properties": { "enable": { "type": "boolean" } } },
-    "certmanager":  { "type": "object", "properties": { "enable": { "type": "boolean" } } },
-    "networkPolicy":{ "type": "object", "properties": { "enable": { "type": "boolean" } } },
-    "policy": {
+    "rbac": {
       "type": "object",
       "properties": {
-        "kyverno": {
-          "type": "object",
-          "properties": {
-            "enabled": { "type": "boolean" },
-            "validationFailureAction": {
-              "type": "string",
-              "enum": ["Audit", "Enforce"]
-            }
-          }
-        }
+        "namespaced": { "type": "boolean" },
+        "helpers": { "type": "object", "properties": { "enabled": { "type": "boolean" } } }
       }
     },
+    "serviceAccount": { "type": "object", "properties": { "enabled": { "type": "boolean" } } },
+    "crd":           { "type": "object", "properties": { "enabled": { "type": "boolean" }, "keep": { "type": "boolean" } } },
+    "metrics":       { "type": "object", "properties": { "enabled": { "type": "boolean" }, "secure": { "type": "boolean" }, "port": { "type": "integer" } } },
+    "webhook":       { "type": "object", "properties": { "enabled": { "type": "boolean" }, "port": { "type": "integer" } } },
+    "certManager":   { "type": "object", "properties": { "enabled": { "type": "boolean" } } },
+    "prometheus":    { "type": "object", "properties": { "enabled": { "type": "boolean" } } },
+    "networkPolicy": { "type": "object", "properties": { "enabled": { "type": "boolean" } } },
     "podSecurityStandards": {
       "type": "object",
       "properties": {
         "enabled": { "type": "boolean" },
-        "standard": {
-          "type": "string",
-          "enum": ["restricted", "baseline", "privileged"]
-        }
+        "standard": { "type": "string", "enum": ["restricted", "baseline", "privileged"] }
       }
-    },
-    "extraObjects": {
-      "type": "array",
-      "items": { "type": "object" }
     },
     "podDisruptionBudget": {
       "type": "object",
@@ -86,6 +55,19 @@
         "minAvailable": { "type": ["integer", "string"] },
         "maxUnavailable": { "type": ["integer", "string"] }
       }
-    }
+    },
+    "policy": {
+      "type": "object",
+      "properties": {
+        "kyverno": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "validationFailureAction": { "type": "string", "enum": ["Audit", "Enforce"] }
+          }
+        }
+      }
+    },
+    "extraObjects": { "type": "array", "items": { "type": "object" } }
   }
 }

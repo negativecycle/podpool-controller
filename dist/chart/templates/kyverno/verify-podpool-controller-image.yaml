@@ -1,14 +1,14 @@
 {{- if .Values.policy.kyverno.enabled }}
-{{- $repo := .Values.controllerManager.container.image.repository }}
+{{- $repo := .Values.manager.image.repository }}
 # Canonical copy lives at config/kyverno/verify-podpool-controller-image.yaml;
-# this is the Helm-gated form of the same policy. Installed only when
-# policy.kyverno.enabled is true, and requires Kyverno to be present.
+# this is the Helm-gated form. Installed only when policy.kyverno.enabled is
+# true, and requires Kyverno in the cluster.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
   name: verify-podpool-controller-image
   labels:
-    {{- include "chart.labels" . | nindent 4 }}
+    {{- include "podpools.commonLabels" . | nindent 4 }}
   annotations:
     policies.kyverno.io/title: Verify podpool-controller image
     policies.kyverno.io/category: Supply Chain Security
@@ -20,10 +20,7 @@ metadata:
       workflow via keyless OIDC.
 spec:
   background: false
-  # Audit reports violations; Enforce blocks them. Driven by the chart value so
-  # a cluster can adopt in Audit and graduate to Enforce without editing YAML.
   validationFailureAction: {{ .Values.policy.kyverno.validationFailureAction }}
-  # Registry, Fulcio and Rekor round-trips outlast the 10s default.
   webhookTimeoutSeconds: 30
   rules:
     - name: require-signature
@@ -60,7 +57,6 @@ spec:
           mutateDigest: true
           verifyDigest: true
           required: true
-          # GitHub artifact attestations ride as sigstore bundles / OCI referrers.
           type: SigstoreBundle
           attestations:
             - type: "https://slsa.dev/provenance/v1"

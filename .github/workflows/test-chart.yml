@@ -65,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           helm template pp dist/chart \
-            --set controllerManager.replicas=2 \
+            --set manager.replicas=2 \
             --set policy.kyverno.enabled=true \
             | kubeconform -strict -ignore-missing-schemas -summary \
                 -kubernetes-version 1.31.0

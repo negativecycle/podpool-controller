@@ -1,13 +1,11 @@
 {{- /*
 Fail fast on a values combination this chart cannot make work. The webhook's
-serving certificate is provisioned by cert-manager (the MutatingWebhookConfiguration
-carries cert-manager's inject-ca-from annotation and there is no other cert
-source here), so the webhook without cert-manager is a webhook with no cert.
-This is a pure values check -- offline-safe, so lint/template/scan are unaffected.
-The other half of the requirement, that cert-manager is actually installed in
-the cluster, cannot be checked at render time without breaking offline tooling;
-NOTES.txt and the docs carry that.
+serving certificate is provisioned by cert-manager, so the webhook without
+cert-manager is a webhook with no cert. Pure values check -- offline-safe.
+That cert-manager is actually installed in the cluster is covered by NOTES.txt
+and the docs, since it cannot be checked at render time without breaking
+offline tooling.
 */ -}}
-{{- if and .Values.webhook.enable (not .Values.certmanager.enable) }}
-{{- fail "\nwebhook.enable=true requires certmanager.enable=true: the webhook's serving certificate is provisioned by cert-manager, and with it off the webhook has no cert and will fail.\nEnable cert-manager (and make sure it is installed in the cluster), or disable the webhook.\n" }}
+{{- if and .Values.webhook.enabled (not .Values.certManager.enabled) }}
+{{- fail "\nwebhook.enabled=true requires certManager.enabled=true: the webhook's serving certificate is provisioned by cert-manager, and with it off the webhook has no cert and will fail.\nEnable cert-manager (and make sure it is installed in the cluster), or disable the webhook.\n" }}
 {{- end }}

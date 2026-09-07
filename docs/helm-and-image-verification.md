@@ -9,9 +9,9 @@ by you before you trust it, and by the cluster at admission time.
   Standard *enforce* labels are stable from 1.25).
 - **cert-manager** — installed in the cluster **before** you install this chart.
   The admission webhook's serving certificate is issued by cert-manager
-  (`certmanager.enable` is on by default); without it the webhook never gets a
+  (`certManager.enabled` is on by default); without it the webhook never gets a
   cert and the rollout stalls. If you don't need the webhook, set
-  `--set webhook.enable=false --set certmanager.enable=false`.
+  `--set webhook.enabled=false --set certManager.enabled=false`.
 
 ## Install with Helm
 
@@ -63,10 +63,11 @@ full set):
 
 | Value | Default | Purpose |
 |-------|---------|---------|
-| `controllerManager.container.image.tag` | `""` → `appVersion` | Image tag to deploy |
-| `controllerManager.container.image.digest` | `""` | Pin by digest (`sha256:…`); overrides the tag |
-| `crd.enable` / `crd.keep` | `true` / `true` | Install the CRD, and keep it on uninstall |
-| `metrics.enable` | `true` | Metrics service + RBAC |
+| `manager.image.repository` | `ghcr.io/…/podpool-controller` | Image; append `@sha256:…` to pin a digest |
+| `manager.image.tag` | `""` → `appVersion` | Image tag to deploy |
+| `manager.replicas` | `1` | Replica count (leader-elected; >1 is HA failover) |
+| `crd.enabled` / `crd.keep` | `true` / `true` | Install the CRD, and keep it on uninstall |
+| `metrics.enabled` | `true` | Metrics service + RBAC |
 | `podSecurityStandards.enabled` | `true` | Create + label the namespace to enforce a Pod Security Standard (below) |
 | `policy.kyverno.enabled` | `false` | Install the admission verification policy (below) |
 | `extraObjects` | `[]` | Inject arbitrary manifests (PDB, HPA, extra RBAC…) without forking |
@@ -99,7 +100,7 @@ throughput. For failover, raise the replica count:
 
 ```bash
 helm upgrade podpool-controller ./dist/chart --reuse-values \
-  --set controllerManager.replicas=2
+  --set manager.replicas=2
 ```
 
 By default the chart spreads replicas across failure domains:
@@ -112,9 +113,9 @@ By default the chart spreads replicas across failure domains:
   `ScheduleAnyway`, so a single-zone cluster still schedules.
 
 These are no-ops at `replicas: 1`. Override or drop them via
-`controllerManager.topologySpreadConstraints` (set `[]` to remove). The chart
+`manager.topologySpreadConstraints` (set `[]` to remove). The chart
 also exposes `nodeSelector`, `tolerations`, `affinity`, `priorityClassName`, and
-`imagePullSecrets` on `controllerManager`.
+`imagePullSecrets` on `manager`.
 
 At `replicas > 1` the chart also renders a **PodDisruptionBudget**
 (`minAvailable: 1` by default) so a node drain can't evict every replica at once

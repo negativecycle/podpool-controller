@@ -2,25 +2,22 @@
 
 Check the controller is running:
 
-  kubectl -n {{ .Release.Namespace }} rollout status deployment/podpools-controller-manager
-{{ if .Values.certmanager.enable }}
-Requires cert-manager: the webhook's serving certificate is issued by cert-manager,
-which must already be installed in the cluster. If the rollout hangs with the
-webhook pod waiting on its cert, that is the likely cause. Install cert-manager,
-or disable the webhook and cert-manager if you do not need admission webhooks.
-{{ end -}}
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "podpools.resourceName" (dict "suffix" "controller-manager" "context" $) }}
 
 The image is signed and carries a signed SLSA provenance attestation. Verify it:
 
-  gh attestation verify oci://{{ .Values.controllerManager.container.image.repository }}:{{ .Values.controllerManager.container.image.tag | default .Chart.AppVersion }} \
+  gh attestation verify oci://{{ .Values.manager.image.repository }}:{{ .Values.manager.image.tag | default .Chart.AppVersion }} \
     --repo negativecycle/podpool-controller
-
-{{ if .Values.podSecurityStandards.enabled -}}
+{{ if .Values.certManager.enabled }}
+Requires cert-manager: the webhook's serving certificate is issued by cert-manager,
+which must already be installed in the cluster. If the rollout hangs on the webhook
+waiting for its cert, that is the likely cause.
+{{ end -}}
+{{ if .Values.podSecurityStandards.enabled }}
 Namespace "{{ .Release.Namespace }}" enforces the {{ .Values.podSecurityStandards.standard }} Pod Security Standard.
 {{ end -}}
-{{ if .Values.policy.kyverno.enabled -}}
-Admission verification (Kyverno) is ENABLED in {{ .Values.policy.kyverno.validationFailureAction }} mode.
-{{- if eq .Values.policy.kyverno.validationFailureAction "Audit" }} It reports violations without blocking; review the policy report, then set policy.kyverno.validationFailureAction=Enforce.{{ end }}
-{{- else -}}
-Admission verification (Kyverno) is off. Enable it with --set policy.kyverno.enabled=true (requires Kyverno in the cluster).
+{{ if .Values.policy.kyverno.enabled }}
+Kyverno image verification is ENABLED in {{ .Values.policy.kyverno.validationFailureAction }} mode.
+{{- else }}
+Enable admission-time image verification with --set policy.kyverno.enabled=true (requires Kyverno).
 {{- end }}

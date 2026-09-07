@@ -768,19 +768,19 @@ func TestRestrictedPodSecurityIsEnforcedEverywhere(t *testing.T) {
 // slip through.
 func TestChartDefaultsSpreadAcrossNodesAndZones(t *testing.T) {
 	var v struct {
-		ControllerManager struct {
+		Manager struct {
 			TopologySpreadConstraints []struct {
 				TopologyKey       string `json:"topologyKey"`
 				WhenUnsatisfiable string `json:"whenUnsatisfiable"`
 			} `json:"topologySpreadConstraints"`
-		} `json:"controllerManager"`
+		} `json:"manager"`
 	}
 	if err := yaml.Unmarshal([]byte(readRepoFile(t, "dist/chart/values.yaml")), &v); err != nil {
 		t.Fatalf("parsing chart values: %v", err)
 	}
 
 	got := map[string]string{}
-	for _, c := range v.ControllerManager.TopologySpreadConstraints {
+	for _, c := range v.Manager.TopologySpreadConstraints {
 		got[c.TopologyKey] = c.WhenUnsatisfiable
 	}
 

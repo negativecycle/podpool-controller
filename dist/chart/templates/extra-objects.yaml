@@ -1,9 +1,6 @@
-# Arbitrary user-supplied manifests. Each entry in .Values.extraObjects is a
-# full Kubernetes object, rendered through `tpl` against the release context --
-# so entries may reference values, .Release, and the chart's named templates.
-# This is the seam that lets a chart stay opinionated without being a cage: a
-# PodDisruptionBudget, an HPA, extra RBAC, a NetworkPolicy or a ConfigMap can be
-# added at install time instead of by forking the chart.
+# Arbitrary user-supplied manifests, each rendered through `tpl` against the
+# release context -- the seam that lets the chart stay opinionated without being
+# a cage.
 {{- range .Values.extraObjects }}
 ---
 {{ tpl (toYaml .) $ }}
