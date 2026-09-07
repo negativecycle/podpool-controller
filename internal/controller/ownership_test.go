@@ -112,13 +112,12 @@ func TestErrWorkloadNotOwned(t *testing.T) {
 		}
 	})
 
-	t.Run("errors.As unwraps", func(t *testing.T) {
+	t.Run("unwraps from an error tree", func(t *testing.T) {
 		orig := &workloadNotOwnedError{kind: testStsKind, name: testChildName}
 		wrapped := errors.Join(orig)
 
-		var target *workloadNotOwnedError
-		if !errors.As(wrapped, &target) {
-			t.Error("errors.As should unwrap workloadNotOwnedError")
+		if _, ok := errors.AsType[*workloadNotOwnedError](wrapped); !ok {
+			t.Error("workloadNotOwnedError should be found in the error tree")
 		}
 	})
 }
@@ -170,8 +169,7 @@ func TestReconcileRefusesForeignChild(t *testing.T) {
 	found := false
 
 	for _, e := range agg.Errors() {
-		var notOwned *workloadNotOwnedError
-		if errors.As(e, &notOwned) {
+		if _, ok := errors.AsType[*workloadNotOwnedError](e); ok {
 			found = true
 
 			break
