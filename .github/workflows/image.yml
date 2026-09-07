@@ -75,6 +75,10 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          # arm64 as well as amd64: clusters run on both, and the binary is a
+          # pure-Go cross-compile (CGO_ENABLED=0), so buildx builds each arch
+          # natively on the amd64 runner with no QEMU emulation to slow it down.
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -82,8 +86,11 @@ jobs:
           # annotations land on the index, and ghcr reads the index. Without
           # this the package shows nothing and does not link to the repo.
           annotations: ${{ steps.meta.outputs.annotations }}
+          # Provenance stays: it rides in the index, travels with the image, and
+          # is what the "annotations landed" check reads back. The SBOM does not:
+          # syft generates one below that is signed, pushed as a referrer, and
+          # attached to the release -- one SBOM, not a second unsigned one here.
           provenance: mode=max
-          sbom: true
           # Without this every run recompiles the whole module from source.
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -117,6 +124,63 @@ jobs:
             --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             > /dev/null
+
+      # syft reads the pushed image and writes an SPDX inventory of everything
+      # in it. This is the one SBOM: signed just below, pushed to the registry
+      # as a referrer, and attached to the release for anyone who wants it
+      # without pulling the image.
+      - name: Generate the SBOM with syft
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          image: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          # The release step attaches it deliberately; the default workflow
+          # artifact upload would only duplicate that.
+          upload-artifact: false
+
+      # BuildKit's in-index provenance is unsigned. This mints a SLSA provenance
+      # attestation signed against the workflow's OIDC identity, recorded in the
+      # public transparency log, and pushed beside the image as a referrer -- so
+      # it verifies with `gh attestation verify`, no Rekor spelunking required.
+      - name: Attest the build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # Same treatment for the SBOM: a signed attestation binds the syft
+      # inventory to this exact image digest, so a consumer can trust the
+      # inventory the way they trust the signature.
+      - name: Attest the SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
+
+      # Attesting can succeed and still leave something nobody can verify, the
+      # same way signing can. Read both attestations back against the digest --
+      # provenance by default, the SBOM by its predicate type -- so the run
+      # fails here rather than shipping an attestation that does not check out.
+      - name: Verify the attestations
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" \
+            --repo "${GITHUB_REPOSITORY}" > /dev/null
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --predicate-type https://spdx.dev/Document > /dev/null
 
       # Reads back what actually landed rather than trusting that it did.
       # source is the one that matters: without it the package is orphaned in
@@ -171,6 +235,17 @@ jobs:
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
             echo '```'
             echo
+            echo "Provenance and SBOM are signed attestations. Verify:"
+            echo
+            echo '```'
+            echo "gh attestation verify oci://ghcr.io/${GITHUB_REPOSITORY}@${DIGEST} \\"
+            echo "  --repo ${GITHUB_REPOSITORY}"
+            echo '```'
+            echo
+            echo "## SBOM"
+            echo
+            echo "\`sbom.spdx.json\` below inventories the published image (SPDX, generated by syft)."
+            echo
             echo "## Install"
             echo
             echo '```'
@@ -183,4 +258,5 @@ jobs:
             --notes-file /tmp/notes.md \
             --generate-notes \
             --verify-tag \
-            dist/install.yaml
+            dist/install.yaml \
+            sbom.spdx.json
