@@ -1,0 +1,81 @@
+# Helm install and image verification
+
+The controller can be installed with Helm, and its image can be verified — both
+by you before you trust it, and by the cluster at admission time.
+
+## Install with Helm
+
+The chart lives in-repo at [`dist/chart`](../dist/chart) and deploys the signed
+release image (`ghcr.io/negativecycle/podpool-controller`) pinned to the chart's
+`appVersion`.
+
+```bash
+helm install podpool-controller ./dist/chart --namespace podpool-system --create-namespace
+```
+
+Useful values (see [`dist/chart/values.yaml`](../dist/chart/values.yaml) for the
+full set):
+
+| Value | Default | Purpose |
+|-------|---------|---------|
+| `controllerManager.container.image.tag` | `""` → `appVersion` | Pin a specific image tag or digest |
+| `crd.enable` / `crd.keep` | `true` / `true` | Install the CRD, and keep it on uninstall |
+| `metrics.enable` | `true` | Metrics service + RBAC |
+| `policy.kyverno.enabled` | `false` | Install the admission verification policy (below) |
+
+## Verify the image yourself
+
+Every released image is signed keyless with cosign and carries a signed SLSA
+provenance attestation, both bound to this repository's release workflow. Verify
+the signature:
+
+```bash
+cosign verify ghcr.io/negativecycle/podpool-controller:<version> \
+  --certificate-identity-regexp '^https://github.com/negativecycle/podpool-controller/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Verify the provenance and SBOM attestations, signed by the release workflow:
+
+```bash
+gh attestation verify oci://ghcr.io/negativecycle/podpool-controller:<version> \
+  --repo negativecycle/podpool-controller
+```
+
+## Enforce verification at admission (Kyverno)
+
+For clusters that run [Kyverno](https://kyverno.io), the repository ships a
+`ClusterPolicy` that refuses to admit a controller image which cannot prove the
+same lineage — checked by the cluster, not by the workflow that built it.
+
+It is **opt-in** and ships in **Audit** mode (reports violations, blocks
+nothing). Two ways to install it:
+
+**With the chart:**
+
+```bash
+helm upgrade podpool-controller ./dist/chart \
+  --reuse-values \
+  --set policy.kyverno.enabled=true \
+  --set policy.kyverno.validationFailureAction=Audit
+```
+
+**Standalone (kustomize), independent of how the controller was installed:**
+
+```bash
+kubectl apply -k https://github.com/negativecycle/podpool-controller/config/kyverno
+```
+
+The policy requires the image to carry:
+
+1. a cosign signature issued to `…/image.yml@refs/tags/v*` via GitHub OIDC, and
+2. a SLSA provenance attestation whose build type and source repository match
+   this project.
+
+Once the Kyverno policy report shows no unexpected violations, graduate to
+enforcement — set `validationFailureAction: Enforce` (chart value) or edit the
+`ClusterPolicy`. In Enforce mode an image that fails verification is rejected.
+
+> The verification the policy performs only succeeds against images produced by
+> the signing release pipeline. Build images from that pipeline (tagged
+> releases) before enabling Enforce.

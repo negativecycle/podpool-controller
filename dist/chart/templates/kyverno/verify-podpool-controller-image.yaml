@@ -1,0 +1,83 @@
+{{- if .Values.policy.kyverno.enabled }}
+{{- $repo := .Values.controllerManager.container.image.repository }}
+# Canonical copy lives at config/kyverno/verify-podpool-controller-image.yaml;
+# this is the Helm-gated form of the same policy. Installed only when
+# policy.kyverno.enabled is true, and requires Kyverno to be present.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-podpool-controller-image
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+  annotations:
+    policies.kyverno.io/title: Verify podpool-controller image
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Requires the podpool-controller image to carry a cosign signature and a
+      SLSA provenance attestation, both issued to this repository's release
+      workflow via keyless OIDC.
+spec:
+  background: false
+  # Audit reports violations; Enforce blocks them. Driven by the chart value so
+  # a cluster can adopt in Audit and graduate to Enforce without editing YAML.
+  validationFailureAction: {{ .Values.policy.kyverno.validationFailureAction }}
+  # Registry, Fulcio and Rekor round-trips outlast the 10s default.
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: require-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      verifyImages:
+        - imageReferences:
+            - "{{ $repo }}:*"
+            - "{{ $repo }}@sha256:*"
+          mutateDigest: true
+          verifyDigest: true
+          required: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subjectRegExp: "^https://github\\.com/negativecycle/podpool-controller/\\.github/workflows/image\\.yml@refs/tags/v"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+    - name: require-slsa-provenance
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      verifyImages:
+        - imageReferences:
+            - "{{ $repo }}:*"
+            - "{{ $repo }}@sha256:*"
+          mutateDigest: true
+          verifyDigest: true
+          required: true
+          # GitHub artifact attestations ride as sigstore bundles / OCI referrers.
+          type: SigstoreBundle
+          attestations:
+            - type: "https://slsa.dev/provenance/v1"
+              attestors:
+                - count: 1
+                  entries:
+                    - keyless:
+                        issuer: "https://token.actions.githubusercontent.com"
+                        subjectRegExp: "^https://github\\.com/negativecycle/podpool-controller/\\.github/workflows/image\\.yml@refs/tags/v"
+                        rekor:
+                          url: "https://rekor.sigstore.dev"
+              conditions:
+                - all:
+                    - key: "{{ `{{ buildDefinition.buildType }}` }}"
+                      operator: Equals
+                      value: "https://actions.github.io/buildtypes/workflow/v1"
+                    - key: "{{ `{{ buildDefinition.externalParameters.workflow.repository }}` }}"
+                      operator: Equals
+                      value: "https://github.com/negativecycle/podpool-controller"
+{{- end }}

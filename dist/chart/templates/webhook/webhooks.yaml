@@ -1,0 +1,67 @@
+{{- if .Values.webhook.enable }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: podpools-mutating-webhook-configuration
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    {{- if .Values.certmanager.enable }}
+    cert-manager.io/inject-ca-from: "{{ $.Release.Namespace }}/serving-cert"
+    {{- end }}
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+webhooks:
+  - name: mpodpool-v1alpha1.kb.io
+    clientConfig:
+      service:
+        name: podpools-webhook-service
+        namespace: {{ .Release.Namespace }}
+        path: /mutate-podpools-dev-v1alpha1-podpool
+    failurePolicy: Fail
+    sideEffects: None
+    admissionReviewVersions:
+      - v1
+    rules:
+      - operations:
+          - CREATE
+          - UPDATE
+        apiGroups:
+          - podpools.dev
+        apiVersions:
+          - v1alpha1
+        resources:
+          - podpools
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: podpools-validating-webhook-configuration
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    {{- if .Values.certmanager.enable }}
+    cert-manager.io/inject-ca-from: "{{ $.Release.Namespace }}/serving-cert"
+    {{- end }}
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+webhooks:
+  - name: vpodpool-v1alpha1.kb.io
+    clientConfig:
+      service:
+        name: podpools-webhook-service
+        namespace: {{ .Release.Namespace }}
+        path: /validate-podpools-dev-v1alpha1-podpool
+    failurePolicy: Fail
+    sideEffects: None
+    admissionReviewVersions:
+      - v1
+    rules:
+      - operations:
+          - CREATE
+          - UPDATE
+        apiGroups:
+          - podpools.dev
+        apiVersions:
+          - v1alpha1
+        resources:
+          - podpools
+{{- end }}

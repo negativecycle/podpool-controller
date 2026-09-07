@@ -1,0 +1,107 @@
+# Admission-time verification of this controller's own image, for clusters that
+# run Kyverno and choose to enforce it. It is opt-in: this manifest is not part
+# of the default install, and it ships in Audit mode so adopting it reports
+# violations without blocking a single workload. Flip to Enforce once the report
+# is clean -- see the note on validationFailureAction below.
+#
+# The build pipeline signs the image keyless with cosign and attaches a signed
+# SLSA provenance attestation, both bound to this repository's release workflow
+# (.github/workflows/image.yml on a tag). This policy is the other half: it
+# refuses to trust an image that cannot prove that lineage at admission, where
+# the check is run by the cluster rather than by the workflow that built it.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-podpool-controller-image
+  annotations:
+    policies.kyverno.io/title: Verify podpool-controller image
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Requires the podpool-controller image to carry a cosign signature and a
+      SLSA provenance attestation, both issued to this repository's release
+      workflow via keyless OIDC. Rejects images that cannot prove they were
+      built and signed by that workflow.
+spec:
+  # Image verification runs only at admission, against the incoming request --
+  # it cannot be evaluated in the background over existing resources.
+  background: false
+  # Audit reports violations; it does not block. This is the safe default for a
+  # policy someone is adopting into a running cluster. Change to Enforce (here,
+  # or per-cluster with validationFailureActionOverrides) once the policy report
+  # shows no unexpected violations.
+  validationFailureAction: Audit
+  # Reaching the registry, Fulcio and Rekor takes longer than the 10s default;
+  # too low a timeout fails admission on a slow network rather than on policy.
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: require-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      verifyImages:
+        # Only this repository's image is in scope. Everything else is ignored
+        # by this policy -- it is not a cluster-wide "all images must be signed"
+        # rule, which is a separate decision an operator makes for themselves.
+        - imageReferences:
+            - "ghcr.io/negativecycle/podpool-controller:*"
+            - "ghcr.io/negativecycle/podpool-controller@sha256:*"
+          # Kyverno rewrites a matched tag to the digest it verified, so what
+          # admits is the exact artifact that was checked, not whatever the tag
+          # points to later.
+          mutateDigest: true
+          verifyDigest: true
+          required: true
+          attestors:
+            - count: 1
+              entries:
+                # Keyless: trust is the OIDC identity of the release workflow on
+                # a tag, not a stored key. subjectRegExp pins the workflow file
+                # and restricts to tag refs, so a branch or workflow_dispatch
+                # build (a dev image) does not satisfy the policy.
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subjectRegExp: "^https://github\\.com/negativecycle/podpool-controller/\\.github/workflows/image\\.yml@refs/tags/v"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+    - name: require-slsa-provenance
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/negativecycle/podpool-controller:*"
+            - "ghcr.io/negativecycle/podpool-controller@sha256:*"
+          mutateDigest: true
+          verifyDigest: true
+          required: true
+          # GitHub artifact attestations (actions/attest-build-provenance) are
+          # stored as sigstore bundles / OCI referrers, which is the format this
+          # type selects -- distinct from the cosign signature verified above.
+          type: SigstoreBundle
+          attestations:
+            - type: "https://slsa.dev/provenance/v1"
+              attestors:
+                - count: 1
+                  entries:
+                    - keyless:
+                        issuer: "https://token.actions.githubusercontent.com"
+                        subjectRegExp: "^https://github\\.com/negativecycle/podpool-controller/\\.github/workflows/image\\.yml@refs/tags/v"
+                        rekor:
+                          url: "https://rekor.sigstore.dev"
+              # Beyond "a valid provenance exists", assert what it claims: that
+              # this workflow type built it, from this repository. The signature
+              # proves who signed; these prove what they signed is about us.
+              conditions:
+                - all:
+                    - key: "{{ buildDefinition.buildType }}"
+                      operator: Equals
+                      value: "https://actions.github.io/buildtypes/workflow/v1"
+                    - key: "{{ buildDefinition.externalParameters.workflow.repository }}"
+                      operator: Equals
+                      value: "https://github.com/negativecycle/podpool-controller"

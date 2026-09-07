@@ -1,0 +1,62 @@
+name: Chart
+
+on:
+  pull_request:
+    paths:
+      - 'dist/chart/**'
+      - '.github/workflows/test-chart.yml'
+  workflow_dispatch:
+
+# A force-push supersedes the run it interrupted; without this the obsolete
+# one keeps a runner busy to no purpose.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  lint:
+    name: Lint and template
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.3
+
+      - name: Lint the chart
+        run: helm lint dist/chart
+
+      # Rendering with the defaults, then again with the opt-in policy on, is
+      # what catches a template that only breaks in the path nobody renders by
+      # hand. --debug fails the step on any template error rather than printing
+      # it and moving on.
+      - name: Render the chart
+        run: |
+          helm template pp dist/chart --debug > /dev/null
+          helm template pp dist/chart --debug \
+            --set policy.kyverno.enabled=true \
+            --set policy.kyverno.validationFailureAction=Enforce > /dev/null
+
+      # The rendered policy must actually be a ClusterPolicy when enabled, and
+      # actually absent when not -- a gate that renders nothing still "passes".
+      - name: Assert the policy toggles
+        run: |
+          set -euo pipefail
+          if helm template pp dist/chart | grep -q 'kind: ClusterPolicy'; then
+            echo "::error::policy rendered while disabled by default"
+            exit 1
+          fi
+          if ! helm template pp dist/chart --set policy.kyverno.enabled=true | grep -q 'kind: ClusterPolicy'; then
+            echo "::error::policy did not render when enabled"
+            exit 1
+          fi

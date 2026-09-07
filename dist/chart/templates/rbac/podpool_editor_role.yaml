@@ -1,0 +1,43 @@
+{{- if .Values.rbac.enable }}
+# PodPool editor — grants create, update, delete, and scale on PodPools.
+#
+# Privilege equivalence: a PodPool editor can cause any workload the controller
+# supports to be created in their namespace, because the controller renders
+# spec.workloadTemplate under its own credentials. The validating webhook checks
+# (via SubjectAccessReview) that the requesting user also has "create" on the
+# target workload type, so this role alone is not sufficient without a matching
+# workload grant. See SECURITY.md for the full analysis.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+  name: podpool-editor-role
+rules:
+- apiGroups:
+  - podpools.dev
+  resources:
+  - podpools
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - podpools.dev
+  resources:
+  - podpools/scale
+  verbs:
+  - get
+  - update
+- apiGroups:
+  - podpools.dev
+  resources:
+  - podpools/status
+  verbs:
+  - get
+{{- end -}}

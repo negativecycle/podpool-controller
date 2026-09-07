@@ -638,3 +638,52 @@ func TestAssertionsAcceptPostFixConfig(t *testing.T) {
 		}
 	})
 }
+
+// TestKyvernoPolicyCopiesShareTheirSecurityInvariants keeps the two copies of
+// the verification policy honest about each other.
+//
+// The policy exists twice on purpose: config/kyverno holds the kustomize form,
+// and the Helm chart holds a templated form gated behind a value. Two copies is
+// two chances to drift, and drift in the parts that decide *what is trusted* is
+// the dangerous kind -- loosen the issuer or the workflow identity in one and
+// forget the other, and a cluster adopting that copy trusts something it should
+// not. Content-addressing cannot catch this; nothing makes the two agree except
+// a test that reads both and insists the load-bearing strings appear in each.
+func TestKyvernoPolicyCopiesShareTheirSecurityInvariants(t *testing.T) {
+	standalone := readRepoFile(t, "config/kyverno/verify-podpool-controller-image.yaml")
+	chart := readRepoFile(t, "dist/chart/templates/kyverno/verify-podpool-controller-image.yaml")
+
+	// The strings that decide trust: who signed (issuer + workflow identity on a
+	// tag), what the provenance must be (SLSA v1, this build type, this repo),
+	// and the transparency log it is checked against. If either copy stops
+	// asserting one of these, it stops being the same policy.
+	for _, invariant := range []string{
+		`https://token.actions.githubusercontent.com`,
+		`^https://github\\.com/negativecycle/podpool-controller/\\.github/workflows/image\\.yml@refs/tags/v`,
+		`https://rekor.sigstore.dev`,
+		`type: SigstoreBundle`,
+		`https://slsa.dev/provenance/v1`,
+		`https://actions.github.io/buildtypes/workflow/v1`,
+		`https://github.com/negativecycle/podpool-controller`,
+	} {
+		if !strings.Contains(standalone, invariant) {
+			t.Errorf("config/kyverno policy is missing trust invariant %q", invariant)
+		}
+
+		if !strings.Contains(chart, invariant) {
+			t.Errorf("chart Kyverno template is missing trust invariant %q", invariant)
+		}
+	}
+
+	// The standalone copy must stand alone: a Helm template expression in it
+	// would mean someone edited the chart form and pasted it back untemplated.
+	if strings.Contains(standalone, "{{ .Values") || strings.Contains(standalone, "{{ $repo") {
+		t.Error("config/kyverno policy contains Helm templating; it must be plain, appliable YAML")
+	}
+
+	// The chart copy must be gated, or enabling the chart installs a Kyverno
+	// policy on clusters that do not run Kyverno.
+	if !strings.Contains(chart, "{{- if .Values.policy.kyverno.enabled }}") {
+		t.Error("chart Kyverno template is not gated behind policy.kyverno.enabled")
+	}
+}

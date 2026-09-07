@@ -1,0 +1,11 @@
+# Opt-in. This is deliberately NOT referenced by config/default, so a normal
+# install never pulls in a policy that requires Kyverno to be present. Adopt it
+# on its own:
+#
+#   kubectl apply -k https://github.com/negativecycle/podpool-controller/config/kyverno
+#
+# or, with Helm, set policy.kyverno.enabled=true on the chart.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - verify-podpool-controller-image.yaml

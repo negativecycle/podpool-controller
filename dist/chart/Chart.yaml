@@ -1,0 +1,16 @@
+apiVersion: v2
+name: podpool-controller
+description: A Kubernetes controller that distributes replicas across scaling groups
+type: application
+# The chart's own version. Bump on any chart change; independent of the image.
+version: 0.1.0
+# The controller image version this chart deploys by default.
+appVersion: "0.1.1"
+home: https://github.com/negativecycle/podpool-controller
+sources:
+  - https://github.com/negativecycle/podpool-controller
+keywords:
+  - kubernetes
+  - operator
+  - controller
+  - scaling
