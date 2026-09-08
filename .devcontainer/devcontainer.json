@@ -2,12 +2,12 @@
   "name": "Kubebuilder DevContainer",
   "image": "golang:1.27@sha256:512690a5660563b57d37ecc31129e7f136e831db2aed24a1dbeb8ad7380dc0fa",
   "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2@sha256:25b9f05705ffba7dbe503230ac76081419306f8c8bc88e0ce78c4ecd99a0c78c": {
       "moby": false,
       "dockerDefaultAddressPool": "base=172.30.0.0/16,size=24"
     },
-    "ghcr.io/devcontainers/features/git:1": {},
-    "ghcr.io/devcontainers/features/common-utils:2": {
+    "ghcr.io/devcontainers/features/git:1@sha256:fd75977de13a9979000e0e78baf949adb0ca71d2398995fa22e0a36d7e7e7fe2": {},
+    "ghcr.io/devcontainers/features/common-utils:2@sha256:cb0c4d3c276f157eed17935747e364178d75fee17f55c4e129966f64633deb3a": {
       "upgradePackages": true
     }
   },
