@@ -1,8 +1,109 @@
-# podpools
-// TODO(user): Add simple overview of use/purpose
+# PodPool
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes controller that distributes pod replicas across groups with
+different infrastructure, scaling constraints, and scheduling behaviour —
+from a single resource.
+
+## Why
+
+A Deployment maps one pod template to one set of replicas. Splitting a
+workload across on-demand and spot nodes, or across zones with different
+capacity profiles, means maintaining separate Deployments with separate
+scaling policies and no shared replica count. PodPool replaces that fan-out
+with a single object whose groups share a total and fill in priority order:
+earlier groups are satisfied first, opportunistic groups take whatever the
+scheduler will accept, and the remainder overflows to the next group.
+
+The controller creates one child workload (Deployment, StatefulSet, or any
+CRD with a pod template at `.spec.template`) per group, applies
+group-specific overrides with server-side apply, and reports aggregated
+status back through the PodPool's conditions and scale subresource — so an
+HPA can target the pool directly.
+
+## Example
+
+```yaml
+apiVersion: podpools.dev/v1alpha1
+kind: PodPool
+metadata:
+  name: web
+spec:
+  replicas: 10
+  workloadTemplate:
+    apiVersion: apps/v1
+    kind: Deployment
+    spec:
+      template:
+        spec:
+          containers:
+          - name: app
+            image: nginx:1.27
+  groups:
+  - name: on-demand
+    scaling:
+      min: 3
+    overrides:
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              capacity-type: on-demand
+  - name: spot
+    scaling:
+      min: 0
+      opportunistic: true
+    overrides:
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              capacity-type: spot
+            tolerations:
+            - key: capacity-type
+              value: spot
+  - name: overflow
+    scaling:
+      min: 0
+```
+
+This creates three Deployments — `web-on-demand`, `web-spot`, and
+`web-overflow` — sharing 10 replicas. The on-demand group always gets at
+least 3. The spot group takes as many as the scheduler will place on spot
+nodes. Whatever remains lands in the overflow group.
+
+## Install
+
+Apply the installer from the latest release:
+
+```bash
+kubectl apply -f https://github.com/negativecycle/podpool-controller/releases/latest/download/install.yaml
+```
+
+Or pin to a specific version:
+
+```bash
+kubectl apply -f https://github.com/negativecycle/podpool-controller/releases/download/v0.1.0/install.yaml
+```
+
+The installer is rendered against the image digest, not the tag, so what
+you deploy is exactly what was signed.
+
+### Verify the image
+
+Every release image is signed with [cosign](https://github.com/sigstore/cosign)
+using keyless OIDC. To verify:
+
+```bash
+cosign verify ghcr.io/negativecycle/podpool-controller:<version> \
+  --certificate-identity-regexp '^https://github.com/negativecycle/podpool-controller/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+### Uninstall
+
+```bash
+kubectl delete -f https://github.com/negativecycle/podpool-controller/releases/latest/download/install.yaml
+```
 
 ## Annotations
 
@@ -19,140 +120,19 @@ The **value** is honoured, not just the annotation's presence:
 | annotation absent | no |
 | `true`, `True`, `1`, `t` | yes |
 | `false`, `False`, `0`, `f` | **no** |
-| `""` or anything else (`yes`, `paused`, ...) | yes |
+| `""` or anything else | yes |
 
-`false` really does mean "do not pause", so a chart rendering `paused: {{ .Values.paused }}` behaves the way the manifest reads. Anything that is not a recognisable boolean pauses: if you typed something meaning to pause, you get a pause rather than a pool that silently keeps running.
+## Status
 
-A paused pool does not stop reporting. It keeps publishing its metrics and its `status.selector`, and its `status.observedGeneration` deliberately stays at the last generation actually reconciled -- so a spec edit made during a pause is not reported as applied.
+**v1alpha1** — the API is under active development and may change between
+minor releases.
 
-Pause is an annotation rather than a spec field, and the validating webhook returns early on any update that does not change `spec`. Together these guarantee that a pool can be paused **regardless of whether its spec still passes validation** -- which is when you are most likely to want to. A pool admitted under an older ruleset, or one whose `workloadTemplate` the controller can no longer read, remains pausable. The same applies to every other metadata write: labels, annotations, and finalizers.
+## AI disclosure
 
-## Getting Started
-
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
-
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/podpools:tag
-```
-
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
-
-**Install the CRDs into the cluster:**
-
-```sh
-make install
-```
-
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
-
-```sh
-make deploy IMG=<some-registry>/podpools:tag
-```
-
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
-
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/podpools:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/podpools/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+This project was developed with the assistance of Claude, Anthropic's AI
+assistant. Claude contributed to code generation, test writing, CI/CD
+pipeline design, and documentation across the project's development.
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache License 2.0. See individual file headers.
