@@ -64,8 +64,6 @@ COLUMNS = ("min", "max", "target", "opportunistic")
 DEFAULT_GROUPS = [
     {"name": "base", "shape": "min+target",
      "scaling": {"min": 3, "max": None, "target": "30%", "opportunistic": None}},
-    {"name": "scav", "shape": "min+target",
-     "scaling": {"min": 0, "max": None, "target": "50%", "opportunistic": None}},
     {"name": "burst", "shape": "min",
      "scaling": {"min": 0, "max": None, "target": None, "opportunistic": None}},
 ]
