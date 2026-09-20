@@ -611,7 +611,7 @@ function runPreset(spec) {
   view = sim.rows.length - 1;
   activePreset = spec.key;
   $('s2-preset-blurb').textContent = spec.blurb;
-  ['tg-status', 'tg-unjudged', 'tg-hb'].forEach(function (id, ix) {
+  ['s2-tg-status', 's2-tg-unjudged', 's2-tg-hb'].forEach(function (id, ix) {
     $(id).classList.toggle('on', [$('s2-gate'), $('s2-unjudged'), $('s2-nohb')][ix].checked);
   });
   Array.prototype.forEach.call($('s2-presets').children, function (b) {
@@ -1142,7 +1142,7 @@ $('s2-xclock').onclick = function () { setXMode('clock'); };
 $('s2-xtick').onclick = function () { setXMode('reconcile'); };
 $('s2-total').oninput = function () { $('s2-totalv').textContent = this.value; if (sim) sim.total = +this.value; };
 $('s2-free').oninput = function () { $('s2-freev').textContent = this.value; if (sim) sim.free = +this.value; };
-['gate', 'unjudged', 'nohb'].forEach(function (id) { $(id).onchange = syncToggles; });
+['s2-gate', 's2-unjudged', 's2-nohb'].forEach(function (id) { $(id).onchange = syncToggles; });
 document.addEventListener('keydown', function (e) {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
   if (e.key === 'ArrowRight') { e.preventDefault(); stop(); advance(); }
@@ -1189,7 +1189,9 @@ document.querySelectorAll('[data-ev]').forEach(function (b) {
     b.className = 'badge ok';
     b.textContent = '✓ ports agree with all ' + FIX.rows + ' fixture rows read out of the Go tests';
   }
-  reset();
+  // Open on the first curated scenario so the chart shows data on load, rather
+  // than an empty view that only fills once you pick a scenario or step forward.
+  runPreset(FIX.scenarios[0]);
 })();
 """
 
